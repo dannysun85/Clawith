@@ -121,6 +121,31 @@ def _brief_contains_marker(brief: str, marker: str) -> bool:
 # unaffected.
 MINIMUM_PICTURE_COVERAGE_RATIO = 0.35
 
+# FR-P4: the v2 deck quality gates (font floor, information density band,
+# contrast floor, editability/fact policies) are server-owned numbers carried
+# by the visual policy — structural contract parameters, not prompt
+# conventions.  ``_presentation_visual_policy`` only attaches them to v2
+# requests; v1 slide_specs never see these keys and keep the v1 contract.
+DECK_QUALITY_POLICY_VERSION = "adaptive-v1"
+
+
+def deck_quality_policy() -> dict[str, float | int | str]:
+    """Server-owned v2 deck quality parameters (defaults; page-count stable)."""
+
+    return {
+        "minimum_body_font_size_px": 16,
+        "minimum_metadata_font_size_px": 10,
+        # The density band fixes the observed "information density too low"
+        # defect without punishing title/divider slides: the lower bound is a
+        # deck-wide mean, the upper bounds are per-slide hard stops.
+        "minimum_mean_text_chars_per_slide": 120,
+        "maximum_text_chars_per_slide": 900,
+        "maximum_shapes_per_slide": 40,
+        "minimum_contrast_ratio": 4.5,
+        "data_slide_editability": "editable_required",
+        "image_slide_fact_policy": "no_fact_assertions",
+    }
+
 
 def presentation_brief_is_image_led(
     goal: str,
@@ -155,7 +180,9 @@ def presentation_brief_is_image_led(
 
 
 __all__ = [
+    "DECK_QUALITY_POLICY_VERSION",
     "IMAGE_LED_BRIEF_KEYWORDS",
     "MINIMUM_PICTURE_COVERAGE_RATIO",
+    "deck_quality_policy",
     "presentation_brief_is_image_led",
 ]

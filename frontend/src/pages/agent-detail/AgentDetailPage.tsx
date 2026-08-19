@@ -53,6 +53,7 @@ import {
     deliverableLaunchMessage,
     deliverableLaunchUsesIsolatedInputs,
     deliverableRouteTier,
+    isDeliverableAwaitingContinuation,
     latestPendingDeliverable,
     latestTrackedDeliverables,
     nextDeliverableComposerText,
@@ -5722,21 +5723,67 @@ export default function AgentDetailPage() {
         ),
     });
     const trackedDeliverables = latestTrackedDeliverables(sessionDeliverableRequests);
+    const pendingRequestCardHidden = Boolean(
+        pendingDeliverable
+        && trackedDeliverables.some((item) => item.id === pendingDeliverable.request.id),
+    );
     useEffect(() => {
         if (!activeSession?.id) {
             setPendingDeliverable(null);
             return;
         }
-        if (pendingDeliverable?.request.session_id === String(activeSession.id)) return;
         const resumable = latestPendingDeliverable(
             sessionDeliverableRequests,
             dismissedDeliverableRequestIdsRef.current,
         );
-        setPendingDeliverable(resumable ? {
-            request: resumable,
-            launchable: requestCanLaunchFromComposer(resumable),
-        } : null);
-    }, [activeSession?.id, pendingDeliverable?.request.session_id, sessionDeliverableRequests]);
+        const nextPending = resumable
+            ? {
+                request: resumable,
+                launchable: requestCanLaunchFromComposer(resumable),
+            }
+            : null;
+        setPendingDeliverable((current) => {
+            if (!nextPending) {
+                if (
+                    current
+                    && current.request.session_id === String(activeSession.id)
+                    && current.request.status === 'ready'
+                    && current.request.agent_run_id === null
+                    && !dismissedDeliverableRequestIdsRef.current.has(current.request.id)
+                ) {
+                    return current;
+                }
+                return null;
+            }
+            if (
+                current
+                && current.request.id === nextPending.request.id
+                && current.request.version === nextPending.request.version
+                && current.request.current_stage === nextPending.request.current_stage
+                && current.launchable === nextPending.launchable
+            ) {
+                return current;
+            }
+            return nextPending;
+        });
+    }, [activeSession?.id, sessionDeliverableRequests]);
+    useEffect(() => {
+        if (!pendingDeliverable?.launchable) return;
+        if (!isDeliverableAwaitingContinuation(pendingDeliverable.request)) return;
+        const isZh = i18n.language?.startsWith('zh');
+        setChatInput((current) => nextDeliverableComposerText(
+            current,
+            pendingDeliverable.request,
+            null,
+            Boolean(isZh),
+        ));
+    }, [
+        i18n.language,
+        pendingDeliverable?.launchable,
+        pendingDeliverable?.request.id,
+        pendingDeliverable?.request.current_stage,
+        pendingDeliverable?.request.goal,
+    ]);
     const { data: mediaCapabilitiesData, isLoading: mediaCapabilitiesLoading } = useQuery({
         queryKey: ['agent-media-capabilities', id, effectiveChatTier],
         queryFn: () => fetchAuth<MediaCapabilitiesResponse>(
@@ -8436,7 +8483,7 @@ export default function AgentDetailPage() {
                                                             )}
                                                         </div>
                                                     ))}
-                                                    {pendingDeliverable && (
+                                                    {pendingDeliverable && !pendingRequestCardHidden && (
                                                         <DeliverableRequestCard
                                                             request={pendingDeliverable.request}
                                                             launchable={pendingDeliverable.launchable}

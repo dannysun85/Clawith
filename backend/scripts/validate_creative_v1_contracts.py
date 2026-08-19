@@ -21,6 +21,15 @@ V2_PIPELINE_TESTS = (
     "tests/test_creative_briefs.py",
     "tests/test_prompt_compiler.py",
     "tests/test_creative_brief_migration.py",
+    "tests/test_storyboard.py",
+    "tests/test_video_v2_pipeline.py",
+    "tests/test_video_post_production.py",
+    "tests/test_source_inventory.py",
+    "tests/test_presentation_v2_pipeline.py",
+    "tests/test_presentation_revision_and_fonts.py",
+    "tests/test_selection_receipts.py",
+    "tests/test_deliverable_selection_migration.py",
+    "tests/test_image_route_recommendation.py",
 )
 
 

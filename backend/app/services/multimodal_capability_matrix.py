@@ -94,11 +94,13 @@ CAPABILITY_MATRIX: tuple[CapabilitySpec, ...] = (
             "generate_video_minimax",
             "check_video_minimax",
             "compose_video_audio",
+            "concat_videos",
         ),
         expected_default_tools=(
             "generate_video_minimax",
             "check_video_minimax",
             "compose_video_audio",
+            "concat_videos",
         ),
         specialist_requirements=(
             SpecialistRequirement(
@@ -108,6 +110,7 @@ CAPABILITY_MATRIX: tuple[CapabilitySpec, ...] = (
                     "generate_video_minimax",
                     "check_video_minimax",
                     "compose_video_audio",
+                    "concat_videos",
                 ),
             ),
         ),

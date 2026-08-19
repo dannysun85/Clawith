@@ -109,12 +109,16 @@ def test_builtin_workflow_manifests_are_versioned_and_unique() -> None:
         "builtin.poster.v1",
         "builtin.video.v1",
         "builtin.poster.v2",
+        "builtin.video.v2",
+        "builtin.presentation.v2",
     ]
     assert len({workflow.workflow_id for workflow in workflows}) == len(workflows)
     assert [workflow.workflow_version for workflow in workflows] == [
         "1.0.0",
         "1.0.0",
         "1.0.0",
+        "2.0.0",
+        "2.0.0",
         "2.0.0",
     ]
     assert require_workflow("presentation").launch_policy == "agent_runtime"

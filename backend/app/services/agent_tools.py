@@ -813,6 +813,7 @@ RUNTIME_TYPED_APPLICATION_TOOL_NAMES = frozenset(
         "generate_speech_minimax",
         "generate_music_minimax",
         "compose_video_audio",
+        "concat_videos",
         "generate_video_minimax",
         "check_video_minimax",
         "publish_page",
@@ -3579,6 +3580,27 @@ async def execute_builtin_tool_outcome(
             ),
             sync_back=True,
         )
+    if tool_name == "concat_videos":
+        raw_concat_paths = arguments.get("video_paths")
+        return await _run_with_temp_workspace_outcome(
+            agent_id,
+            tenant_id,
+            lambda temp_ws: _concat_videos(
+                agent_id,
+                temp_ws,
+                arguments,
+                typed=True,
+            ),
+            paths=_media_workspace_input_paths(
+                *(
+                    raw_concat_paths
+                    if isinstance(raw_concat_paths, (list, tuple))
+                    else []
+                ),
+                arguments.get("save_path"),
+            ),
+            sync_back=True,
+        )
     if tool_name == "generate_video_minimax":
         return await _run_with_temp_workspace_outcome(
             agent_id,
@@ -4425,6 +4447,31 @@ async def _execute_tool_impl(
             result = _legacy_tool_outcome_text(
                 compose_outcome,
                 fallback="Video audio composition failed.",
+            )
+        elif tool_name == "concat_videos":
+            raw_concat_paths = arguments.get("video_paths")
+            concat_outcome = await _run_with_temp_workspace_outcome(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _concat_videos(
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    typed=True,
+                ),
+                paths=_media_workspace_input_paths(
+                    *(
+                        raw_concat_paths
+                        if isinstance(raw_concat_paths, (list, tuple))
+                        else []
+                    ),
+                    arguments.get("save_path"),
+                ),
+                sync_back=True,
+            )
+            result = _legacy_tool_outcome_text(
+                concat_outcome,
+                fallback="Video concatenation failed.",
             )
         elif tool_name == "generate_video_minimax":
             result = await _run_with_temp_workspace(
@@ -8617,6 +8664,7 @@ def _managed_presentation_contract_error(
     arguments: Mapping[str, Any],
     *,
     output_format: str,
+    allowed_render_modes: tuple[str, ...] = ("hybrid_editable",),
 ) -> str | None:
     """Require deterministic quality inputs for managed deliverable presentations."""
 
@@ -8642,10 +8690,16 @@ def _managed_presentation_contract_error(
             + ". Rebuild the deck plan and retry; title-and-bullets output is not deliverable-ready."
         )
 
-    if output_format == "pptx" and arguments.get("render_mode") != "hybrid_editable":
+    if output_format == "pptx" and arguments.get("render_mode") not in allowed_render_modes:
+        if allowed_render_modes == ("hybrid_editable",):
+            return (
+                "❌ Managed deliverable PPTX requires render_mode='hybrid_editable' "
+                "so complex visuals are preserved while important text remains editable."
+            )
         return (
-            "❌ Managed deliverable PPTX requires render_mode='hybrid_editable' "
-            "so complex visuals are preserved while important text remains editable."
+            "❌ This v2 deliverable PPTX requires render_mode="
+            + " or ".join(f"'{mode}'" for mode in allowed_render_modes)
+            + " from the approved editability contract."
         )
     if output_format == "pdf" and arguments.get("pdf_mode") != "pages":
         return (
@@ -8677,6 +8731,27 @@ async def _convert_html_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dict) -
 
     conversion_arguments = dict(arguments)
     conversion_arguments["_require_adaptive_visual_plan"] = True
+    # FR-P3/P2: v2 decks must pass the outline-approval gate before any PDF
+    # render, and the semantic gate reconciles slide copy against the
+    # registered source inventory.  Non-v2 paths skip the lookup entirely.
+    from app.services.media_assets import MediaContractError
+    from app.services.presentation_pipeline import resolve_presentation_v2_render_gate
+    from app.services.presentation_visual_policy import deck_quality_policy
+
+    try:
+        render_gate = await resolve_presentation_v2_render_gate(
+            agent_id=agent_id,
+            target_path=str(target_path),
+            output_format="pdf",
+        )
+    except MediaContractError as exc:
+        return f"❌ {exc}"
+    if render_gate is not None:
+        conversion_arguments["_semantic_gate"] = True
+        conversion_arguments["_source_inventory_entries"] = list(
+            render_gate.source_inventory_entries
+        )
+        conversion_arguments["_visual_quality_policy"] = deck_quality_policy()
     for argument_name, internal_name in (
         ("outline_path", "_outline_file_path"),
         ("slide_spec_path", "_slide_spec_file_path"),
@@ -8703,10 +8778,29 @@ async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) 
     target_path = arguments.get("target_path")
     if not source_path or not target_path:
         return "❌ Missing paths."
+    # FR-P3/P2: v2 decks must pass the outline-approval gate before any
+    # render, and the editability contract pins the render mode.  Non-v2
+    # paths keep the historical hybrid_editable-only contract untouched.
+    from app.services.media_assets import MediaContractError
+    from app.services.presentation_pipeline import resolve_presentation_v2_render_gate
+    from app.services.presentation_visual_policy import deck_quality_policy
+
+    try:
+        render_gate = await resolve_presentation_v2_render_gate(
+            agent_id=agent_id,
+            target_path=str(target_path),
+            output_format="pptx",
+        )
+    except MediaContractError as exc:
+        return f"❌ {exc}"
+    allowed_render_modes = ("hybrid_editable",)
+    if render_gate is not None:
+        allowed_render_modes = (render_gate.expected_render_mode,)
     contract_error = _managed_presentation_contract_error(
         str(target_path),
         arguments,
         output_format="pptx",
+        allowed_render_modes=allowed_render_modes,
     )
     if contract_error:
         return contract_error
@@ -8720,6 +8814,12 @@ async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) 
 
     conversion_arguments = dict(arguments)
     conversion_arguments["_require_adaptive_visual_plan"] = True
+    if render_gate is not None:
+        conversion_arguments["_semantic_gate"] = True
+        conversion_arguments["_source_inventory_entries"] = list(
+            render_gate.source_inventory_entries
+        )
+        conversion_arguments["_visual_quality_policy"] = deck_quality_policy()
     for argument_name, internal_name in (
         ("outline_path", "_outline_file_path"),
         ("slide_spec_path", "_slide_spec_file_path"),
@@ -28125,6 +28225,7 @@ async def _generate_image_minimax_durable(
     deliverable_request_id: uuid.UUID | None = None,
     expected_overlay_blocks_sha256: str | None = None,
     poster_v2_unit_binding=None,
+    video_v2_keyframe_binding=None,
 ) -> ToolExecutionOutcome | str:
     """Run one provider image attempt through the durable media state machine."""
 
@@ -28255,6 +28356,9 @@ async def _generate_image_minimax_durable(
                 "deliverable_candidate_unit_key": (
                     poster_v2_unit_binding.unit_key if poster_v2_unit_binding else None
                 ),
+                "deliverable_keyframe_unit_key": (
+                    video_v2_keyframe_binding.unit_key if video_v2_keyframe_binding else None
+                ),
                 "expected_overlay_blocks_sha256": expected_overlay_blocks_sha256,
                 "provider_size": agent_plan_size or provider_size,
                 # Provider-native image dimensions are not a customer
@@ -28266,10 +28370,14 @@ async def _generate_image_minimax_durable(
             },
             provider=provider,
             deliverable_execution_id=(
-                poster_v2_unit_binding.execution_id if poster_v2_unit_binding else None
+                poster_v2_unit_binding.execution_id if poster_v2_unit_binding
+                else video_v2_keyframe_binding.execution_id if video_v2_keyframe_binding
+                else None
             ),
             deliverable_unit_id=(
-                poster_v2_unit_binding.unit_id if poster_v2_unit_binding else None
+                poster_v2_unit_binding.unit_id if poster_v2_unit_binding
+                else video_v2_keyframe_binding.unit_id if video_v2_keyframe_binding
+                else None
             ),
         )
         recovery_key = str((created_task.request_metadata or {}).get("recovery_asset_storage_key") or "")
@@ -28279,6 +28387,14 @@ async def _generate_image_minimax_durable(
 
             await mark_poster_v2_candidate_submitted(
                 poster_v2_unit_binding,
+                tenant_id=tenant_id,
+                media_task_id=created_task.id,
+            )
+        if video_v2_keyframe_binding is not None:
+            from app.services.storyboard import mark_video_v2_unit_submitted
+
+            await mark_video_v2_unit_submitted(
+                video_v2_keyframe_binding,
                 tenant_id=tenant_id,
                 media_task_id=created_task.id,
             )
@@ -30517,7 +30633,52 @@ async def _compose_video_audio(
     music_path = _canonical_media_workspace_path(
         str(arguments.get("music_path") or "")
     )
-    if not video_path:
+    # v2 shot pipeline: an ordered list of approved shot clips is concatenated
+    # deterministically before any audio mix.  The single-video form keeps the
+    # v1 contract (voiceover/music required) unchanged.
+    raw_video_paths = arguments.get("video_paths")
+    video_paths: list[str] = []
+    if raw_video_paths is not None:
+        if not isinstance(raw_video_paths, (list, tuple)) or not raw_video_paths:
+            outcome = _typed_failure(
+                "compose_video_audio video_paths must be a non-empty list of workspace .mp4 paths.",
+                "invalid_tool_arguments",
+            )
+            return outcome if typed else _legacy_tool_outcome_text(
+                outcome,
+                fallback="Video audio composition failed.",
+            )
+        if len(raw_video_paths) > 12:
+            outcome = _typed_failure(
+                "compose_video_audio video_paths accepts at most 12 shot clips.",
+                "invalid_tool_arguments",
+            )
+            return outcome if typed else _legacy_tool_outcome_text(
+                outcome,
+                fallback="Video audio composition failed.",
+            )
+        for raw_entry in raw_video_paths:
+            canonical_entry = _canonical_media_workspace_path(str(raw_entry or ""))
+            if not canonical_entry or canonical_entry in video_paths:
+                outcome = _typed_failure(
+                    "compose_video_audio video_paths must contain distinct workspace paths.",
+                    "invalid_tool_arguments",
+                )
+                return outcome if typed else _legacy_tool_outcome_text(
+                    outcome,
+                    fallback="Video audio composition failed.",
+                )
+            video_paths.append(canonical_entry)
+    if video_path and video_paths:
+        outcome = _typed_failure(
+            "compose_video_audio accepts either video_path or video_paths, not both.",
+            "invalid_tool_arguments",
+        )
+        return outcome if typed else _legacy_tool_outcome_text(
+            outcome,
+            fallback="Video audio composition failed.",
+        )
+    if not video_path and not video_paths:
         outcome = _typed_failure(
             "compose_video_audio requires video_path.",
             "invalid_tool_arguments",
@@ -30526,7 +30687,7 @@ async def _compose_video_audio(
             outcome,
             fallback="Video audio composition failed.",
         )
-    if not voiceover_path and not music_path:
+    if not video_paths and not voiceover_path and not music_path:
         outcome = _typed_failure(
             "compose_video_audio requires voiceover_path or music_path.",
             "invalid_tool_arguments",
@@ -30537,9 +30698,30 @@ async def _compose_video_audio(
         )
 
     try:
-        source_video = _resolve_workspace_read_path(ws, video_path)
-        if not source_video.is_file() or source_video.suffix.lower() != ".mp4":
-            raise ValueError("video_path must point to an existing workspace .mp4 file")
+        concat_receipt: dict[str, Any] | None = None
+        if video_paths:
+            clip_bytes: list[bytes] = []
+            for entry in video_paths:
+                clip_source = _resolve_workspace_read_path(ws, entry)
+                if not clip_source.is_file() or clip_source.suffix.lower() != ".mp4":
+                    raise ValueError(
+                        "video_paths entries must point to existing workspace .mp4 files"
+                    )
+                clip_bytes.append(clip_source.read_bytes())
+            if len(clip_bytes) > 1:
+                from app.services.media_assets import concat_shots
+
+                source_bytes, concat_receipt = await concat_shots(clip_bytes)
+            else:
+                source_bytes = clip_bytes[0]
+            # The multi-clip form is the server-orchestrated v2 assembly path;
+            # keep_source_audio only matters once a mix actually runs.
+            source_video = None
+        else:
+            source_video = _resolve_workspace_read_path(ws, video_path)
+            if not source_video.is_file() or source_video.suffix.lower() != ".mp4":
+                raise ValueError("video_path must point to an existing workspace .mp4 file")
+            source_bytes = source_video.read_bytes()
 
         def audio_input(path_value: str, label: str) -> tuple[Path, str] | None:
             if not path_value:
@@ -30560,23 +30742,30 @@ async def _compose_video_audio(
             "workspace/videos",
             "composed_video",
             "mp4",
-            source_video.stem,
+            Path(video_paths[0]).stem if video_paths else source_video.stem,
         )
         from app.services.media_assets import compose_video_audio_tracks
 
-        result, receipt = await compose_video_audio_tracks(
-            source_video.read_bytes(),
-            voiceover_raw=voice_input[0].read_bytes() if voice_input else None,
-            voiceover_format=voice_input[1] if voice_input else None,
-            music_raw=music_input[0].read_bytes() if music_input else None,
-            music_format=music_input[1] if music_input else None,
-            voiceover_start_seconds=float(
-                arguments.get("voiceover_start_seconds") or 0
-            ),
-            voiceover_gain=float(arguments.get("voiceover_gain") or 1),
-            music_gain=float(arguments.get("music_gain") or 0.16),
-            keep_source_audio=bool(arguments.get("keep_source_audio", False)),
-        )
+        if voice_input or music_input:
+            result, receipt = await compose_video_audio_tracks(
+                source_bytes,
+                voiceover_raw=voice_input[0].read_bytes() if voice_input else None,
+                voiceover_format=voice_input[1] if voice_input else None,
+                music_raw=music_input[0].read_bytes() if music_input else None,
+                music_format=music_input[1] if music_input else None,
+                voiceover_start_seconds=float(
+                    arguments.get("voiceover_start_seconds") or 0
+                ),
+                voiceover_gain=float(arguments.get("voiceover_gain") or 1),
+                music_gain=float(arguments.get("music_gain") or 0.16),
+                keep_source_audio=bool(arguments.get("keep_source_audio", False)),
+            )
+            receipt_payload_data: dict[str, Any] = receipt.as_dict()
+        else:
+            # Silent concat/passthrough for the v2 shot pipeline: the clips are
+            # already browser-safe validated, so no re-encode is needed here.
+            result = source_bytes
+            receipt_payload_data = concat_receipt or {"mode": "passthrough"}
         output_path.write_bytes(result)
     except Exception as error:
         outcome = _typed_failure(
@@ -30593,7 +30782,7 @@ async def _compose_video_audio(
     receipt_payload = {
         "status": "succeeded",
         "workspace_path": output_rel,
-        **receipt.as_dict(),
+        **receipt_payload_data,
     }
     outcome = _typed_success(
         json.dumps(receipt_payload, ensure_ascii=False, sort_keys=True),
@@ -30603,12 +30792,130 @@ async def _compose_video_audio(
             "operation": "video_audio_composition",
             "modality": "video",
             "workspace_path": output_rel,
-            "audio_mix_receipt": receipt.as_dict(),
+            "audio_mix_receipt": receipt_payload_data,
         },
     )
     if typed:
         return outcome
     return f"✅ Composed video saved to {output_rel}"
+
+
+# Bounded package ceiling for one deterministic concat: 12 clips of at most the
+# longest reviewed single-shot duration keeps a chat quick-path merge well
+# inside local processing budgets while covering real commercial briefs.
+CONCAT_VIDEOS_MAX_CLIPS = 12
+CONCAT_VIDEOS_MAX_TOTAL_DURATION_SECONDS = 600.0
+
+
+async def _concat_videos(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    *,
+    typed: bool = False,
+) -> ToolExecutionOutcome | str:
+    """Concatenate same-canvas workspace shot clips into one browser-safe MP4."""
+
+    def fail(summary: str, error_code: str, metadata: dict | None = None):
+        outcome = _typed_failure(summary, error_code, metadata=metadata)
+        return outcome if typed else _legacy_tool_outcome_text(
+            outcome,
+            fallback="Video concatenation failed.",
+        )
+
+    raw_video_paths = arguments.get("video_paths")
+    if not isinstance(raw_video_paths, (list, tuple)) or not raw_video_paths:
+        return fail(
+            "concat_videos video_paths must be a non-empty list of workspace .mp4 paths.",
+            "invalid_tool_arguments",
+        )
+    if len(raw_video_paths) < 2:
+        return fail(
+            "concat_videos requires at least two shot clips; a single clip needs no merge.",
+            "invalid_tool_arguments",
+        )
+    if len(raw_video_paths) > CONCAT_VIDEOS_MAX_CLIPS:
+        return fail(
+            f"concat_videos video_paths accepts at most {CONCAT_VIDEOS_MAX_CLIPS} shot clips.",
+            "invalid_tool_arguments",
+        )
+    video_paths: list[str] = []
+    for raw_entry in raw_video_paths:
+        canonical_entry = _canonical_media_workspace_path(str(raw_entry or ""))
+        if not canonical_entry or canonical_entry in video_paths:
+            return fail(
+                "concat_videos video_paths must contain distinct workspace paths.",
+                "invalid_tool_arguments",
+            )
+        video_paths.append(canonical_entry)
+
+    try:
+        clip_bytes: list[bytes] = []
+        for entry in video_paths:
+            clip_source = _resolve_workspace_read_path(ws, entry)
+            if not clip_source.is_file() or clip_source.suffix.lower() != ".mp4":
+                raise ValueError(
+                    "video_paths entries must point to existing workspace .mp4 files"
+                )
+            clip_bytes.append(clip_source.read_bytes())
+        output_rel, output_path = _resolve_workspace_output_path(
+            ws,
+            arguments.get("save_path"),
+            "workspace/videos",
+            "concat_video",
+            "mp4",
+            Path(video_paths[0]).stem,
+        )
+        from app.services.media_assets import MediaContractError, concat_shots
+
+        try:
+            result, receipt = await concat_shots(clip_bytes)
+        except MediaContractError as exc:
+            return fail(
+                f"Video concatenation contract is invalid: {exc}",
+                "video_concat_media_contract_invalid",
+                metadata={"operation": "video_concat"},
+            )
+        output_duration = float(receipt.get("output_duration_seconds") or 0)
+        if output_duration > CONCAT_VIDEOS_MAX_TOTAL_DURATION_SECONDS:
+            return fail(
+                "Video concatenation result exceeds the "
+                f"{int(CONCAT_VIDEOS_MAX_TOTAL_DURATION_SECONDS)}s quick-path "
+                "package limit; split the brief into smaller packages.",
+                "video_concat_duration_exceeds_limit",
+                metadata={
+                    "operation": "video_concat",
+                    "output_duration_seconds": output_duration,
+                },
+            )
+        output_path.write_bytes(result)
+    except Exception as error:
+        return fail(
+            f"Video concatenation failed: {type(error).__name__}.",
+            "video_concat_failed",
+            metadata={"operation": "video_concat"},
+        )
+
+    artifact_ref = _workspace_artifact_ref(agent_id, output_rel)
+    receipt_payload = {
+        "status": "succeeded",
+        "workspace_path": output_rel,
+        **receipt,
+    }
+    outcome = _typed_success(
+        json.dumps(receipt_payload, ensure_ascii=False, sort_keys=True),
+        result_ref=artifact_ref,
+        artifact_refs=(artifact_ref,),
+        metadata={
+            "operation": "video_concat",
+            "modality": "video",
+            "workspace_path": output_rel,
+            "concat_receipt": receipt,
+        },
+    )
+    if typed:
+        return outcome
+    return f"✅ Concatenated video saved to {output_rel}"
 
 
 def _write_minimax_video_metadata_best_effort(
@@ -30890,19 +31197,81 @@ async def _generate_video_minimax(
             model=model,
             tier=tier,
         )
+    video_v2_unit_binding = None
+    formal_video_request_id = deliverable_request_scope_id.get().strip()
+    from app.services.storyboard import video_v2_shot_unit_key
+
+    if formal_video_request_id and video_v2_shot_unit_key(
+        str(arguments.get("save_path") or "")
+    ):
+        # v2 storyboard-gated shots bind to their execution unit before any
+        # provider is prepared: storyboard approval receipt, server-compiled
+        # verbatim prompt, and the non-16:9 first-frame contract are all
+        # checked fail-closed before a Credits reservation can exist.  Non-v2
+        # save paths skip the lookup entirely, keeping the v1 path untouched.
+        from app.services.storyboard import resolve_video_v2_shot_unit
+
+        raw_duration = arguments.get("duration")
+        try:
+            requested_shot_duration = (
+                int(raw_duration) if raw_duration not in (None, "") else None
+            )
+        except (TypeError, ValueError):
+            requested_shot_duration = None
+        try:
+            video_v2_unit_binding = await resolve_video_v2_shot_unit(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                request_id=formal_video_request_id,
+                save_path=str(arguments.get("save_path") or ""),
+                prompt=prompt,
+                duration_seconds=requested_shot_duration,
+                has_first_frame=bool(first_frame_image),
+            )
+        except MediaContractError as exc:
+            return _minimax_tool_result(
+                f"❌ v2 video shot contract is invalid: {exc}",
+                typed=typed,
+                status="failed",
+                error_code="deliverable_video_v2_shot_contract_mismatch",
+                agent_id=agent_id,
+                modality="video",
+                model=model,
+                tier=tier,
+                halt_run=True,
+            )
     from app.services.llm.load_balancer import NoCredentialAvailable
     from app.services.media_provider_routing import (
         media_provider_order_for_modality,
         minimax_video_requires_first_frame,
+        minimax_video_supported_durations,
         prepare_media_provider,
+        video_route_max_duration_seconds,
         volcengine_video_quota_model,
     )
+
+    # Duration-aware routing: an explicit duration must be honored exactly by
+    # the selected route or the request fails over before any Credits move.
+    # MiniMax bills fixed per-tier buckets (6s, or 10s on Pro/Ultra); the Agent
+    # Plan Seedance family admits a continuous 4s..max_duration_seconds range.
+    raw_requested_duration = arguments.get("duration")
+    try:
+        requested_duration: int | None = (
+            int(raw_requested_duration)
+            if raw_requested_duration not in (None, "")
+            else None
+        )
+    except (TypeError, ValueError):
+        requested_duration = None
+    if requested_duration is not None and requested_duration <= 0:
+        requested_duration = None
+    requested_resolution = arguments.get("resolution")
 
     credential = None
     provider_order = media_provider_order_for_modality("video")
     selected_provider_index = max(int(_provider_index), 0)
     provider_route_errors: list[str] = []
-    provider_route_statuses: list[dict[str, str]] = []
+    provider_route_statuses: list[dict[str, object]] = []
     for candidate_index in range(selected_provider_index, len(provider_order)):
         candidate = provider_order[candidate_index]
         try:
@@ -30913,25 +31282,51 @@ async def _generate_video_minimax(
                 minimax_model=billing_model,
                 reserve_daily_video_allowance=(candidate == "minimax"),
             )
+            route_skip_reason: str | None = None
+            route_max_duration: int | None = None
             if candidate == "minimax" and minimax_video_requires_first_frame(
                 video_ratio,
                 first_frame_image,
             ):
-                from app.services.media_daily_allowance import (
-                    release_daily_allowance_claim,
-                )
+                route_skip_reason = "first_frame_required"
+            elif requested_duration is not None:
+                if candidate == "minimax":
+                    supported = minimax_video_supported_durations(tier)
+                    if requested_duration not in supported:
+                        route_skip_reason = "duration_not_supported"
+                        route_max_duration = max(supported)
+                else:
+                    route_max_duration = video_route_max_duration_seconds(
+                        candidate,
+                        getattr(credential, "model", None),
+                    )
+                    if (
+                        route_max_duration is not None
+                        and requested_duration > route_max_duration
+                    ):
+                        route_skip_reason = "duration_not_supported"
+            if route_skip_reason is not None:
+                if candidate == "minimax":
+                    from app.services.media_daily_allowance import (
+                        release_daily_allowance_claim,
+                    )
 
-                await release_daily_allowance_claim(
-                    getattr(credential, "daily_allowance_claim_id", None),
-                    reason="request_shape_requires_first_frame",
-                )
-                provider_route_statuses.append(
-                    {
-                        "provider": candidate,
-                        "status": "incompatible_request_shape",
-                        "reason_code": "first_frame_required",
-                    }
-                )
+                    await release_daily_allowance_claim(
+                        getattr(credential, "daily_allowance_claim_id", None),
+                        reason=(
+                            "request_shape_requires_first_frame"
+                            if route_skip_reason == "first_frame_required"
+                            else f"request_shape_{route_skip_reason}"
+                        ),
+                    )
+                route_status: dict[str, object] = {
+                    "provider": candidate,
+                    "status": "incompatible_request_shape",
+                    "reason_code": route_skip_reason,
+                }
+                if route_max_duration is not None:
+                    route_status["max_duration_seconds"] = route_max_duration
+                provider_route_statuses.append(route_status)
                 credential = None
                 continue
             selected_provider_index = candidate_index
@@ -30965,6 +31360,44 @@ async def _generate_video_minimax(
             "[GenerateVideo] no platform media provider available routes={}",
             provider_route_errors,
         )
+        duration_limited_routes = [
+            status
+            for status in provider_route_statuses
+            if status.get("reason_code") == "duration_not_supported"
+        ]
+        if requested_duration is not None and duration_limited_routes:
+            max_supported = max(
+                (
+                    int(status["max_duration_seconds"])
+                    for status in duration_limited_routes
+                    if status.get("max_duration_seconds") is not None
+                ),
+                default=0,
+            )
+            guidance = (
+                f"Split the brief into shots of at most {max_supported}s and merge them with concat_videos."
+                if max_supported
+                else "Split the brief into shorter shots and merge them with concat_videos."
+            )
+            return _minimax_tool_result(
+                f"❌ No healthy video route can deliver the requested {requested_duration}s duration, and the "
+                "request was rejected before any Provider submission instead of being silently shortened. "
+                f"{guidance} No Credits were consumed. Do not call this tool again in the current run.",
+                typed=typed,
+                status="failed",
+                error_code="media_video_duration_exceeds_route_capability",
+                agent_id=agent_id,
+                modality="video",
+                model=billing_model,
+                tier=tier,
+                halt_run=True,
+                provider="platform_media",
+                runtime_metadata={
+                    "provider_routes": provider_route_statuses,
+                    "requested_duration_seconds": requested_duration,
+                    "max_supported_duration_seconds": max_supported or None,
+                },
+            )
         return _minimax_tool_result(
             "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed. "
             "Do not call this tool again in the current run.",
@@ -30982,7 +31415,6 @@ async def _generate_video_minimax(
     media_provider = credential.provider
     model = credential.model
 
-    requested_resolution = arguments.get("resolution")
     duration, resolution = constrain_minimax_video_request(
         tier,
         profile,
@@ -30990,6 +31422,12 @@ async def _generate_video_minimax(
         requested_resolution,
     )
     if media_provider == "volcengine_agent_plan":
+        # An explicit duration that survived route selection is within the
+        # model's reviewed capability envelope; honor it exactly instead of
+        # forcing it into a MiniMax billing bucket.  The Agent Plan adapter
+        # re-validates the 4s..max range before submission.
+        if requested_duration is not None:
+            duration = requested_duration
         # Enforce the commercial profile at execution time as well as in the
         # admin route.  A stale credential/config row must never silently
         # promote an ordinary Ultra request to the substantially dearer 1080p
@@ -31122,6 +31560,9 @@ async def _generate_video_minimax(
             "brand_scale": brand_scale,
             "sanitize_generated_background": sanitize_generated_background,
             "degraded_fallback_allowed": allow_degraded_fallback,
+            "deliverable_shot_unit_key": (
+                video_v2_unit_binding.unit_key if video_v2_unit_binding else None
+            ),
             # Runtime waits on the durable async operation and emits the one
             # terminal Agent message. Legacy callers keep the media daemon's
             # existing completion delivery behavior.
@@ -31153,8 +31594,22 @@ async def _generate_video_minimax(
             output_path=output_path,
             request_metadata=request_metadata,
             provider=media_provider,
+            deliverable_execution_id=(
+                video_v2_unit_binding.execution_id if video_v2_unit_binding else None
+            ),
+            deliverable_unit_id=(
+                video_v2_unit_binding.unit_id if video_v2_unit_binding else None
+            ),
         )
         reservation_id = created_task.reservation_id
+        if video_v2_unit_binding is not None:
+            from app.services.storyboard import mark_video_v2_unit_submitted
+
+            await mark_video_v2_unit_submitted(
+                video_v2_unit_binding,
+                tenant_id=tenant_id,
+                media_task_id=created_task.id,
+            )
         if brand_asset and frozen_brand_key:
             await _finish_durable_media_side_effect(
                 get_storage_backend().write_bytes(
@@ -33212,6 +33667,7 @@ async def _generate_image(
     minimax_tenant_id: uuid.UUID | None = None
     formal_poster_contract: _FormalPosterCopyContract | None = None
     poster_v2_unit_binding = None
+    video_v2_keyframe_binding = None
     minimax_credit_cost = 0
     image_bytes = b""
 
@@ -33275,6 +33731,35 @@ async def _generate_image(
                     save_path=save_path,
                     prompt=str(prompt or ""),
                 )
+            if formal_poster_contract is None and deliverable_request_scope_id.get().strip():
+                # FR-V6: v2 video keyframes reuse the M1 managed image seam;
+                # non-video-v2 save paths skip the lookup entirely.
+                from app.services.storyboard import (
+                    resolve_video_v2_keyframe_unit,
+                    video_v2_keyframe_unit_key,
+                )
+
+                if video_v2_keyframe_unit_key(save_path):
+                    video_v2_keyframe_binding = await resolve_video_v2_keyframe_unit(
+                        tenant_id=minimax_tenant_id,
+                        agent_id=agent_id,
+                        request_id=deliverable_request_scope_id.get().strip(),
+                        save_path=save_path,
+                        prompt=str(prompt or ""),
+                    )
+                # FR-P3: v2 deck imagery is paid work and stays gated on the
+                # approved outline; the check runs before any credit hold or
+                # Provider submission.  Non-v2 decks skip the lookup entirely.
+                from app.services.presentation_pipeline import (
+                    presentation_v2_image_request_id,
+                    resolve_presentation_v2_image_gate,
+                )
+
+                if presentation_v2_image_request_id(save_path):
+                    await resolve_presentation_v2_image_gate(
+                        agent_id=agent_id,
+                        save_path=save_path,
+                    )
             await _check_minimax_credit_amount(minimax_tenant_id, minimax_credit_cost)
         except MediaContractError as exc:
             return _minimax_tool_result(
@@ -33400,6 +33885,7 @@ async def _generate_image(
                         else None
                     ),
                     poster_v2_unit_binding=poster_v2_unit_binding,
+                    video_v2_keyframe_binding=video_v2_keyframe_binding,
                 )
             except MediaProviderSafeFallback as exc:
                 provider_errors.append(f"{candidate}:{type(exc.error).__name__}")

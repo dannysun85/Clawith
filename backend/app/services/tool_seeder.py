@@ -1530,7 +1530,12 @@ BUILTIN_TOOLS = [
             "properties": {
                 "video_path": {
                     "type": "string",
-                    "description": "Required workspace path to the completed MP4 video.",
+                    "description": "Workspace path to the completed MP4 video. Required for a single-clip compose.",
+                },
+                "video_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ordered workspace .mp4 shot clips for the server-orchestrated multi-shot assembly. The clips are concatenated deterministically before any audio mix; voiceover/music stay optional in this form.",
                 },
                 "voiceover_path": {
                     "type": "string",
@@ -1561,11 +1566,37 @@ BUILTIN_TOOLS = [
                     "description": "Output workspace .mp4 path. Default: auto.",
                 },
             },
-            "required": ["video_path"],
             "anyOf": [
-                {"required": ["voiceover_path"]},
-                {"required": ["music_path"]},
+                {"required": ["video_path"]},
+                {"required": ["video_paths"]},
             ],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "concat_videos",
+        "display_name": "Concat Videos",
+        "description": "Deterministically concatenate several same-canvas workspace MP4 shot clips, in order, into one finished browser-safe MP4. Typical use: a brief longer than one shot is generated as separate same-aspect clips with generate_video_minimax, then merged here into a single deliverable. This is local post-production only: it never submits a generative provider job and never reserves Credits. Every clip must be decodable and share one canvas; mismatched resolutions fail closed instead of being rescaled. Audio is retained only when every clip carries a track; add narration or music afterwards with compose_video_audio. Returns a structured receipt confirming the durable workspace path, shot count, per-shot hashes, output duration, dimensions, and browser safety. Trust that receipt instead of trying to read the binary MP4 with read_file or read_document.",
+        "category": "media",
+        "icon": "🎞️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "video_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 12,
+                    "description": "Ordered list of 2-12 distinct workspace .mp4 shot clips to concatenate, in playback order.",
+                },
+                "save_path": {
+                    "type": "string",
+                    "description": "Output workspace .mp4 path. Default: auto.",
+                },
+            },
+            "required": ["video_paths"],
         },
         "config": {},
         "config_schema": {},
@@ -1573,7 +1604,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_video_minimax",
         "display_name": "Generate Video",
-        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. Quick generation always uses the server-owned safe provider failover policy; the model cannot disable it. A formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
+        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. Request the target duration directly: routing picks a healthy route whose model supports it, fails closed with an actionable error and zero Credits when no route does, and never silently shortens the video. For a brief longer than any available single-shot duration, generate same-canvas shots and merge them with concat_videos. Quick generation always uses the server-owned safe provider failover policy; the model cannot disable it. A formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
         "category": "media",
         "icon": "🎬",
         "is_default": True,
@@ -1581,7 +1612,7 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "Text description of the video."},
-                "duration": {"type": "integer", "description": "Video duration in seconds. Default: 6."},
+                "duration": {"type": "integer", "description": "Video duration in seconds. Default: 6. Routing honors the requested value when a healthy route supports it (for example longer Seedance durations); when no route does, the call fails closed instead of shortening the video.",},
                 "resolution": {"type": "string", "description": "Video resolution, e.g. 1080P or 768P. Default: 1080P."},
                 "aspect_ratio": {
                     "type": "string",

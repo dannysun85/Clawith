@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import re
 import posixpath
 from datetime import UTC, datetime
 from typing import Any, Literal, Mapping, Sequence
@@ -20,34 +21,60 @@ from app.models.agent_run import AgentRun
 from app.models.deliverable import (
     DeliverableExecution,
     DeliverableExecutionUnit,
+    DeliverablePromptCompilation,
     DeliverableRequest,
 )
 from app.models.tool import AgentTool, Tool
 from app.services.creative_briefs import (
     POSTER_V2_WORKFLOW_ID,
+    PRESENTATION_V2_WORKFLOW_ID,
+    VIDEO_V2_WORKFLOW_ID,
     brief_projection,
     candidate_count_for_policy,
     compile_creative_brief,
+    compile_presentation_brief,
+    compile_video_brief,
     poster_v2_rollout_allowed,
+    presentation_brief_projection,
     upsert_request_creative_brief,
+    video_brief_projection,
 )
 from app.services.deliverable_artifacts import reconcile_runtime_deliverable_artifacts
 from app.services.deliverable_executions import (
     bind_artifacts_to_current_execution,
     current_execution,
+    execution_units,
     project_execution_lifecycle,
     record_execution_preflight,
 )
 from app.services.entitlements import get_tenant_entitlements
-from app.services.media_capabilities import get_agent_media_capabilities
-from app.services.media_provider_routing import media_provider_order_for_image_strategy
+from app.services.media_capabilities import (
+    get_agent_media_capabilities,
+    video_providers_with_native_audio,
+)
+from app.services.media_provider_routing import (
+    media_provider_order_for_image_strategy,
+    media_provider_order_for_modality,
+)
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.model_router import resolve_route
 from app.services.provider_pricing import minimax_image_credits, minimax_video_credits
 from app.services.quota_guard import QuotaExceeded
 from app.services.presentation_visual_policy import (
     MINIMUM_PICTURE_COVERAGE_RATIO,
+    deck_quality_policy,
     presentation_brief_is_image_led,
+)
+from app.services.presentation_pipeline import (
+    advance_presentation_v2_after_run,
+    load_latest_outline,
+    load_presentation_v2_inventory_projection,
+    outline_approved,
+)
+from app.services.storyboard import (
+    advance_video_v2_after_run,
+    load_latest_storyboard,
+    storyboard_approved,
 )
 from app.services.tool_visibility import tool_enabled_for_agent
 
@@ -291,6 +318,133 @@ _WORKFLOWS = (
         required_capability="image",
         launch_policy="agent_runtime",
     ),
+    WorkflowManifest(
+        workflow_id="builtin.video.v2",
+        workflow_version="2.0.0",
+        work_type="video",
+        label_zh="短视频（分镜审批）",
+        label_en="Short video (storyboard-gated)",
+        description_zh="结构化工作说明驱动，分镜批准前零付费，逐镜头独立生成与 QA。",
+        description_en="Structured-brief driven, storyboard approval before any paid work, per-shot generation and QA.",
+        fields=[
+            WorkflowField(
+                key="channel", label_zh="发布渠道", label_en="Channel", kind="select", required=True,
+                default="social", options=["social", "ecommerce", "presentation"],
+            ),
+            WorkflowField(
+                key="aspect_ratio", label_zh="画面比例", label_en="Aspect ratio", kind="select", required=True,
+                default="9:16", options=["9:16", "16:9", "1:1"],
+            ),
+            WorkflowField(
+                key="duration", label_zh="总时长（秒）", label_en="Total duration (seconds)", kind="select", required=True,
+                default="10", options=["6", "10"],
+            ),
+            WorkflowField(
+                key="audience", label_zh="目标受众", label_en="Audience", kind="text", required=True,
+                default="潜在消费者", placeholder_zh="例如：25–35 岁都市白领",
+                placeholder_en="e.g. urban professionals aged 25–35",
+            ),
+            WorkflowField(
+                key="language", label_zh="语言", label_en="Language", kind="select", required=True,
+                default="zh-CN", options=["zh-CN", "en-US"],
+            ),
+            WorkflowField(
+                key="style", label_zh="视觉风格", label_en="Visual style", kind="text",
+                default="commercial", placeholder_zh="例如：高端商业广告",
+                placeholder_en="e.g. premium commercial campaign",
+            ),
+            WorkflowField(
+                key="audio_mode", label_zh="声音模式", label_en="Audio mode", kind="select", required=True,
+                default="voiceover", options=["in_scene_dialogue", "voiceover", "silent"],
+            ),
+            WorkflowField(
+                key="story", label_zh="故事与镜头要求", label_en="Story and shots", kind="textarea", required=True,
+                placeholder_zh="产品、场景、镜头运动、字幕和声音要求", placeholder_en="Product, scene, camera, captions, and audio",
+            ),
+            WorkflowField(
+                key="shot_count", label_zh="镜头数量", label_en="Shots", kind="number",
+                minimum=1, maximum=4,
+                placeholder_zh="逐镜头独立生成，费用按镜头分解", placeholder_en="Per-shot generation with per-shot pricing",
+            ),
+            WorkflowField(
+                key="cta", label_zh="行动号召", label_en="Call to action", kind="text",
+                placeholder_zh="例如：立即了解更多", placeholder_en="e.g. Learn more today",
+            ),
+            WorkflowField(
+                key="caption_spec", label_zh="字幕要求", label_en="Caption spec", kind="textarea",
+                placeholder_zh="逐镜头字幕或整体字幕规范", placeholder_en="Per-shot captions or an overall caption spec",
+            ),
+            WorkflowField(
+                key="dialogue_script", label_zh="对白脚本", label_en="Dialogue script", kind="textarea",
+                placeholder_zh="镜头内同步对白模式必填", placeholder_en="Required for in-scene dialogue",
+            ),
+            WorkflowField(
+                key="prohibitions", label_zh="禁止项", label_en="Prohibitions", kind="textarea",
+                placeholder_zh="每行一条禁止出现的元素", placeholder_en="One prohibited element per line",
+            ),
+            _fallback_policy_field(),
+        ],
+        approval_policy=["storyboard", "final"],
+        output_contract=["mp4"],
+        required_capability="video",
+        launch_policy="agent_runtime",
+    ),
+    WorkflowManifest(
+        workflow_id="builtin.presentation.v2",
+        workflow_version="2.0.0",
+        work_type="presentation",
+        label_zh="PPT 演示文稿（大纲审批）",
+        label_en="Presentation (outline-gated)",
+        description_zh="结构化工作说明 + 来源清单驱动，大纲批准前零付费，事实断言必须可溯源。",
+        description_en="Structured brief and source inventory driven, zero spend before outline approval, traceable fact assertions.",
+        fields=[
+            WorkflowField(
+                key="audience", label_zh="目标受众", label_en="Audience", kind="text", required=True,
+                placeholder_zh="例如：潜在投资人", placeholder_en="e.g. prospective investors",
+            ),
+            WorkflowField(
+                key="scenario", label_zh="演示场景", label_en="Scenario", kind="select", required=True,
+                options=["client_proposal", "investor_pitch", "internal_review", "training", "launch_review"],
+                placeholder_zh="选择演示的实际使用场景", placeholder_en="Choose the real presentation scenario",
+            ),
+            WorkflowField(
+                key="page_count", label_zh="页数", label_en="Slides", kind="number", required=True,
+                default=8, minimum=5, maximum=15,
+            ),
+            WorkflowField(
+                key="language", label_zh="语言", label_en="Language", kind="select", required=True,
+                default="zh-CN", options=["zh-CN", "en-US"],
+            ),
+            WorkflowField(
+                key="style", label_zh="视觉风格", label_en="Visual style", kind="text", required=True,
+                default="professional", placeholder_zh="例如：专业、简洁、科技感", placeholder_en="e.g. professional and concise",
+            ),
+            WorkflowField(
+                key="key_points", label_zh="必须覆盖", label_en="Required points", kind="textarea", required=True,
+                placeholder_zh="逐条写出必须出现的数据、观点或文案；这些会登记为可引用来源",
+                placeholder_en="List required data, claims, or copy; these register as citable sources",
+            ),
+            WorkflowField(
+                key="brand_theme", label_zh="品牌主题", label_en="Brand theme", kind="text",
+                placeholder_zh="品牌色/字体/语气要求", placeholder_en="Brand colors, fonts, tone",
+            ),
+            WorkflowField(
+                key="source_urls", label_zh="来源链接", label_en="Source URLs", kind="json",
+                placeholder_zh='[{"url":"https://…","facts":["可引用事实"]}]',
+                placeholder_en='[{"url":"https://…","facts":["citable fact"]}]',
+            ),
+            WorkflowField(
+                key="editability_contract", label_zh="可编辑性合同", label_en="Editability contract", kind="select",
+                default="editable", options=["editable", "hybrid", "visual_fidelity"],
+                placeholder_zh="默认全文字/图表可编辑", placeholder_en="Fully editable text/charts by default",
+            ),
+            _fallback_policy_field(),
+        ],
+        approval_policy=["outline", "final"],
+        output_contract=["pptx"],
+        required_capability="presentation",
+        launch_policy="agent_runtime",
+    ),
 )
 
 # The first manifest registered for a work type stays the default for that
@@ -323,6 +477,28 @@ def poster_v2_workflow_allowed(tenant_id: uuid.UUID, agent_id: uuid.UUID) -> boo
     )
 
 
+def video_v2_workflow_allowed(tenant_id: uuid.UUID, agent_id: uuid.UUID) -> bool:
+    settings = get_settings()
+    return poster_v2_rollout_allowed(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        enabled=settings.DELIVERABLE_VIDEO_V2_ENABLED,
+        tenant_ids=settings.DELIVERABLE_VIDEO_V2_TENANT_IDS,
+        agent_ids=settings.DELIVERABLE_VIDEO_V2_AGENT_IDS,
+    )
+
+
+def presentation_v2_workflow_allowed(tenant_id: uuid.UUID, agent_id: uuid.UUID) -> bool:
+    settings = get_settings()
+    return poster_v2_rollout_allowed(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        enabled=settings.DELIVERABLE_PRESENTATION_V2_ENABLED,
+        tenant_ids=settings.DELIVERABLE_PRESENTATION_V2_TENANT_IDS,
+        agent_ids=settings.DELIVERABLE_PRESENTATION_V2_AGENT_IDS,
+    )
+
+
 async def list_agent_launchable_workflows(
     db: AsyncSession,
     *,
@@ -341,6 +517,8 @@ async def list_agent_launchable_workflows(
 
     available: list[WorkflowManifest] = []
     poster_v2_allowed = poster_v2_workflow_allowed(tenant_id, agent_id)
+    video_v2_allowed = video_v2_workflow_allowed(tenant_id, agent_id)
+    presentation_v2_allowed = presentation_v2_workflow_allowed(tenant_id, agent_id)
     for workflow in _WORKFLOWS:
         # The v2 poster pipeline replaces the v1 manifest for allowlisted
         # tenants/Agents only; by default the v1 contract is the only poster
@@ -348,6 +526,16 @@ async def list_agent_launchable_workflows(
         if workflow.workflow_id == POSTER_V2_WORKFLOW_ID and not poster_v2_allowed:
             continue
         if workflow.workflow_id == "builtin.poster.v1" and poster_v2_allowed:
+            continue
+        # Same canary discipline for the v2 storyboard-gated video pipeline.
+        if workflow.workflow_id == VIDEO_V2_WORKFLOW_ID and not video_v2_allowed:
+            continue
+        if workflow.workflow_id == "builtin.video.v1" and video_v2_allowed:
+            continue
+        # Same canary discipline for the v2 outline-gated presentation pipeline.
+        if workflow.workflow_id == PRESENTATION_V2_WORKFLOW_ID and not presentation_v2_allowed:
+            continue
+        if workflow.workflow_id == "builtin.presentation.v1" and presentation_v2_allowed:
             continue
         if workflow.launch_policy != "agent_runtime":
             continue
@@ -599,7 +787,7 @@ def _presentation_visual_policy(
 
     page_count = int((request.spec or {}).get("page_count") or 8)
     minimum_distinct_images = len(media_roles)
-    return {
+    policy: dict[str, float | int | str] = {
         "version": "adaptive-v1",
         "minimum_distinct_layouts": min(page_count, max(3, math.ceil(page_count / 2))),
         "minimum_distinct_images": minimum_distinct_images,
@@ -624,9 +812,25 @@ def _presentation_visual_policy(
         ),
         "minimum_editable_compositions": max(1, page_count // 4),
     }
+    if request.workflow_id == PRESENTATION_V2_WORKFLOW_ID:
+        # FR-P4: v2 extends adaptive-v1 with structural font/density/contrast
+        # parameters.  Legacy slide_specs without visual_plan_version keep the
+        # v1 validation path; only v2 decks carry and honor these keys.
+        policy.update(deck_quality_policy())
+    return policy
 
 
-def build_deliverable_prompt(request: DeliverableRequest) -> str:
+def build_deliverable_prompt(
+    request: DeliverableRequest,
+    *,
+    video_v2_stage: str | None = None,
+    video_v2_storyboard: Any | None = None,
+    video_v2_shot_clips: Sequence[Mapping[str, Any]] = (),
+    presentation_v2_stage: str | None = None,
+    presentation_v2_source_inventory: Sequence[Mapping[str, Any]] = (),
+    presentation_v2_target_units: Sequence[str] = (),
+    presentation_v2_revision_instruction: str | None = None,
+) -> str:
     """Build server-owned execution context; provider/model choice is intentionally absent."""
 
     from app.services.poster_contract import (
@@ -739,6 +943,15 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             "success until the registered artifact contract confirms it.\n"
             f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
         )
+    if request.work_type == "video" and request.workflow_id == VIDEO_V2_WORKFLOW_ID:
+        return _video_v2_prompt(
+            request,
+            contract=contract,
+            stage=video_v2_stage or "storyboard_draft",
+            storyboard=video_v2_storyboard,
+            shot_clips=video_v2_shot_clips,
+            allow_degraded_literal=allow_degraded_literal,
+        )
     if request.work_type == "video":
         first_frame_path = f"workspace/deliverables/{request.id}/first_frame.png"
         return (
@@ -778,6 +991,16 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             "The final response must report the exact final.mp4 workspace path. A provider task id, "
             "storyboard, prompt, visual-only intermediate, or voiceover-only file is not the final deliverable.\n"
             f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+    if request.work_type == "presentation" and request.workflow_id == PRESENTATION_V2_WORKFLOW_ID:
+        return _presentation_v2_prompt(
+            request,
+            contract=contract,
+            stage=presentation_v2_stage or "outline_draft",
+            source_inventory=presentation_v2_source_inventory,
+            allow_degraded_literal=allow_degraded_literal,
+            target_units=presentation_v2_target_units,
+            revision_instruction=presentation_v2_revision_instruction,
         )
     (
         presentation_media_roles,
@@ -990,6 +1213,334 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
     )
 
 
+def _presentation_v2_prompt(
+    request: DeliverableRequest,
+    *,
+    contract: Mapping[str, Any],
+    stage: str,
+    source_inventory: Sequence[Mapping[str, Any]],
+    allow_degraded_literal: str,
+    target_units: Sequence[str] = (),
+    revision_instruction: str | None = None,
+) -> str:
+    """Server-owned v2 presentation stage prompts; the Agent never invents facts."""
+
+    from app.services.presentation_pipeline import EDITABILITY_RENDER_MODES
+
+    spec = request.spec if isinstance(request.spec, Mapping) else {}
+    page_count = int(spec.get("page_count") or 8)
+    editability = str(spec.get("editability_contract") or "editable").strip().lower()
+    render_mode = EDITABILITY_RENDER_MODES.get(editability, "hybrid_editable")
+    outline_path = f"workspace/deliverables/{request.id}/outline.json"
+    slide_spec_path = f"workspace/deliverables/{request.id}/slide_spec.json"
+    inventory_payload = {
+        "schema_version": "source-inventory-v1",
+        "entries": list(source_inventory),
+    }
+
+    if stage == "outline_draft":
+        return (
+            "You are executing a persisted Astra Deliverable Request under the v2 outline-gated "
+            "presentation pipeline. Treat the following JSON as the authoritative product brief. Do not "
+            "choose or reveal a provider/model. In this run you only plan the deck: write exactly two "
+            "files and call no generation or conversion Tool — no image, PPTX, or PDF calls. Paid work "
+            "starts only after the customer approves the outline. "
+            f"First write '{outline_path}' with deck_title, audience, core_message, one_sentence_claim, "
+            "a storyline array of ordered narrative beats, and exactly "
+            f"{page_count} slides. Every outline slide must contain slide_id (slide-01..slide-"
+            f"{page_count:02d} in order), purpose, headline, evidence, and visual_intent; evidence may be "
+            "one non-empty sentence or an array of evidence sentences. "
+            f"Then write '{slide_spec_path}' with the same ordered slide_ids and a headline, layout, "
+            "body_points, visual_asset, source_refs, slide_type, visual_kind, data_slide, and asset_ref "
+            "for every slide. The top-level slide_spec must include visual_plan_version='adaptive-v1' and "
+            "visual_policy exactly matching PRESENTATION_VISUAL_POLICY. visual_kind must be one of "
+            "generated_image, supplied_image, editable_chart, editable_diagram, editable_table, or "
+            "editable_typography. Image slides declare asset_ref and must leave data_slide=false; "
+            "editable compositions use an empty asset_ref. Any slide carrying charts, tables, process "
+            "flows, or key numbers must set data_slide=true and use an editable_* visual_kind. "
+            "SOURCE_INVENTORY below is the authoritative evidence registry. Every source_refs entry must "
+            "cite a registered source_id, workspace path, URL, or SHA-256 from SOURCE_INVENTORY; never "
+            "invent a reference and never cite an internal workflow id. Every quantified or ranking claim "
+            "(numbers, percentages, durations, rankings, superlatives) in headline or body_points must be "
+            "traceable to facts registered in the cited source; if a claim has no registered evidence, "
+            "rewrite it as an explicitly labelled assumption (prefix it with 假设 or 'assumption:') or "
+            "remove it. Fabricating a fact is a hard delivery failure. "
+            "Do not invent a brand, organization, team, author, or internal-use label that is absent from "
+            "the brief. After writing both files, end your turn and report the two paths.\n"
+            f"SOURCE_INVENTORY={json.dumps(inventory_payload, ensure_ascii=False, sort_keys=True)} "
+            f"PRESENTATION_VISUAL_POLICY="
+            f"{json.dumps(_presentation_visual_policy(request, _presentation_media_roles(request)), ensure_ascii=False, sort_keys=True)} "
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    if stage == "slide_revision":
+        # FR-P6: a page-targeted revision re-renders only the named slides and
+        # reassembles the deck; every other page carries forward unchanged.
+        targets = [item for item in target_units if re.fullmatch(r"slide-\d{2}", item)]
+        if not targets or not str(revision_instruction or "").strip():
+            raise DeliverableWorkflowError(
+                "deliverable_revision_target_invalid",
+                "A page-targeted presentation revision requires slide targets and an instruction",
+            )
+        targets_listing = ", ".join(targets)
+        presentation_outputs = {
+            str(value or "").strip().lower() for value in request.output_contract
+        }
+        revision_pdf_instructions = ""
+        if "pdf" in presentation_outputs:
+            revision_pdf_instructions = (
+                " Then convert the same source to PDF using convert_html_to_pdf with "
+                "design_width=1280, design_height=720, pdf_mode='pages', scale=1, "
+                "paper_width=13.333333, paper_height=7.5, "
+                f"expected_page_count={page_count}, outline_path='{outline_path}', and "
+                f"slide_spec_path='{slide_spec_path}'."
+            )
+        return (
+            "You are executing a page-targeted revision of an approved deck for a persisted Astra "
+            "Deliverable Request under the v2 outline-gated presentation pipeline. Do not choose or "
+            "reveal a provider/model. The customer approved the outline and reviewed the produced "
+            "deck; only these slides are in scope for this revision: "
+            f"{targets_listing}. The customer's revision instruction is: "
+            f"{str(revision_instruction or '').strip()}. "
+            f"Read the approved '{outline_path}', '{slide_spec_path}', and the current "
+            f"workspace/deliverables/{request.id}/presentation.html back first. Apply the "
+            "instruction only to the in-scope slides; every other slide's text, data, layout, and "
+            "assets must carry forward unchanged — never reflow, restyle, or rewrite an out-of-scope "
+            "slide, and never add a new unsourced number or fact anywhere. Reuse every existing deck "
+            "asset as-is; call generate_image_minimax only when the instruction explicitly changes an "
+            "in-scope image slide's visual, at most once per such role with "
+            f"save_path='workspace/deliverables/{request.id}/assets/<role>.png' and "
+            f"allow_degraded_fallback={allow_degraded_literal}. Keep the font, density, contrast, and "
+            "editability contracts exactly as in the approved deck: data slides stay editable "
+            "shapes/charts/tables. Write the updated presentation.html back, then convert with "
+            f"convert_html_to_pptx using design_width=1280, design_height=720, "
+            f"render_mode='{render_mode}', render_scale=2, expected_page_count={page_count}, "
+            f"outline_path='{outline_path}', and slide_spec_path='{slide_spec_path}'. The render_mode "
+            f"'{render_mode}' comes from the approved editability contract; never substitute another "
+            f"mode.{revision_pdf_instructions} Create only formats explicitly listed in "
+            "output_contract. The final response must report the exact versioned workspace path of "
+            "every regenerated contract file.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    if stage == "slide_render":
+        (
+            presentation_media_roles,
+            presentation_supplied_assets,
+            presentation_generation_roles,
+        ) = _presentation_media_plan(request)
+        presentation_visual_policy = _presentation_visual_policy(
+            request,
+            presentation_media_roles,
+        )
+        media_instructions = ""
+        if presentation_media_roles:
+            role_instructions: list[str] = []
+            for role in presentation_generation_roles:
+                role_instructions.append(
+                    f"For {role}, call generate_image_minimax exactly once with a polished 16:9 "
+                    "commercial prompt, no generated words/logos/watermarks/numbers, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/{role}.png', and "
+                    f"allow_degraded_fallback={allow_degraded_literal}."
+                )
+            supplied_instructions = ""
+            if presentation_supplied_assets:
+                supplied_instructions = (
+                    "PRESENTATION_MEDIA_CONTRACT.supplied_assets is authoritative. Use every mapped "
+                    "workspace image without regenerating, redrawing, moving, or replacing it. "
+                )
+            generation_instructions = (
+                " ".join(role_instructions)
+                if presentation_generation_roles
+                else (
+                    "All required media roles are satisfied by supplied assets. Do not call "
+                    "generate_image_minimax for this presentation."
+                )
+            )
+            media_instructions = (
+                "The approved outline requires real imagery. Complete every required asset role before "
+                "writing presentation.html. "
+                + supplied_instructions
+                + generation_instructions
+                + " Generated images are decorative only: they must never carry facts, numbers, or "
+                "claims, and image slides must not state fact assertions in their text. "
+                "Call each generation Tool at most once per role and never manually retry. If any "
+                "required image Tool call fails or is unavailable, stop without converting; report the "
+                "missing asset role. "
+            )
+        presentation_outputs = {
+            str(value or "").strip().lower() for value in request.output_contract
+        }
+        pdf_instructions = ""
+        if "pdf" in presentation_outputs:
+            pdf_instructions = (
+                " Then convert the same source to PDF using convert_html_to_pdf with "
+                "design_width=1280, design_height=720, pdf_mode='pages', scale=1, "
+                "paper_width=13.333333, paper_height=7.5, "
+                f"expected_page_count={page_count}, outline_path='{outline_path}', and "
+                f"slide_spec_path='{slide_spec_path}'."
+            )
+        return (
+            "You are producing an approved deck for a persisted Astra Deliverable Request under the v2 "
+            "outline-gated presentation pipeline. The customer has approved the outline; do not rewrite "
+            "it. Do not choose or reveal a provider/model. "
+            + media_instructions
+            + f"Read the approved '{outline_path}' and '{slide_spec_path}' back, then write "
+            f"workspace/deliverables/{request.id}/presentation.html implementing exactly the approved "
+            f"{page_count} slides at 1280x720 each, keeping every slide title, data_slide flag, and "
+            "source-backed claim consistent with the approved slide_spec. Keep every quantified or "
+            "ranking statement exactly as sourced in the approved slide_spec; never add a new unsourced "
+            "number. Use CSS/HTML charts, tables, timelines, comparison matrices, and process lanes for "
+            "every data slide so all data stays editable; only decorative pages may be image-led. "
+            "Every visible text node must stay inside its slide with at least 24px bottom safety, use at "
+            "least 16px computed font size for body/title/table/caption text, keep strong text/background "
+            "contrast, and respect the density band in PRESENTATION_VISUAL_POLICY — neither sparse "
+            "near-empty content slides nor overstuffed ones. "
+            f"Then convert with convert_html_to_pptx using design_width=1280, design_height=720, "
+            f"render_mode='{render_mode}', render_scale=2, expected_page_count={page_count}, "
+            f"outline_path='{outline_path}', and slide_spec_path='{slide_spec_path}'. "
+            f"The render_mode '{render_mode}' comes from the approved editability contract "
+            f"('{editability}'); never substitute another mode."
+            + pdf_instructions
+            + " Create only formats explicitly listed in output_contract. The final response must report "
+            "the exact versioned workspace path of every contract file, and never claim success until "
+            "the registered artifact contract confirms it.\n"
+            f"PRESENTATION_VISUAL_POLICY="
+            f"{json.dumps(presentation_visual_policy, ensure_ascii=False, sort_keys=True)} "
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    raise DeliverableWorkflowError(
+        "deliverable_continuation_not_ready",
+        f"Unknown v2 presentation stage: {stage}",
+    )
+
+
+def _video_v2_prompt(
+    request: DeliverableRequest,
+    *,
+    contract: Mapping[str, Any],
+    stage: str,
+    storyboard: Any | None,
+    shot_clips: Sequence[Mapping[str, Any]],
+    allow_degraded_literal: str,
+) -> str:
+    """Server-owned v2 video stage prompts; the Agent never authors prompts."""
+
+    spec = request.spec if isinstance(request.spec, Mapping) else {}
+    duration = int(spec.get("duration") or 10)
+    shot_count = spec.get("shot_count")
+    if not isinstance(shot_count, int) or isinstance(shot_count, bool):
+        shot_count = max(1, min(math.ceil(duration / 4), 12))
+    shot_count = max(1, min(shot_count, 12))
+    audio_mode = str(spec.get("audio_mode") or "voiceover").strip()
+    storyboard_path = f"workspace/deliverables/{request.id}/storyboard.json"
+
+    if stage == "storyboard_draft":
+        audio_rules = {
+            "voiceover": (
+                "Every shot's dialogue field must be empty, and the top-level "
+                "voiceover_script must contain the full narration to synthesize later."
+            ),
+            "silent": (
+                "Every shot's dialogue field must be empty and voiceover_script must be empty."
+            ),
+            "in_scene_dialogue": (
+                "Speaking shots must carry their exact spoken lines in the dialogue field, and "
+                "voiceover_script must be empty. The dialogue must come from the approved "
+                "dialogue_script in the brief."
+            ),
+        }[audio_mode if audio_mode in {"voiceover", "silent", "in_scene_dialogue"} else "voiceover"]
+        return (
+            "You are executing a persisted Astra Deliverable Request under the v2 storyboard-gated "
+            "video pipeline. Treat the following JSON as the authoritative product brief. Do not "
+            "choose or reveal a provider/model. In this run you only draft the storyboard: write "
+            f"exactly one file '{storyboard_path}' containing a JSON object with a 'shots' array "
+            f"of exactly {shot_count} entries and a top-level 'voiceover_script' string. Each shot "
+            "is an object with keys shot_id, duration_seconds, visual, camera, subject_refs, "
+            "first_frame_ref, last_frame_ref, dialogue, caption, transition. Hard contract: shot_id "
+            f"values must be exactly shot-01..shot-{shot_count:02d} in order; duration_seconds are "
+            f"positive integers summing to exactly {duration}; no shot may exceed 15 seconds; every "
+            "shot must describe real on-camera action consistent with the brief story, audience, and "
+            f"channel. Audio mode is '{audio_mode}': {audio_rules} Do not call any generation Tool "
+            "in this run — no image, video, speech, music, or compose calls. Paid generation starts "
+            "only after the customer approves this storyboard. After writing the file, end your turn "
+            "and report the storyboard path.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    if stage == "shot_generation":
+        shots = tuple(storyboard.shots) if storyboard is not None else ()
+        require_audio = "true" if audio_mode == "in_scene_dialogue" else "false"
+        per_shot_instructions: list[str] = []
+        for shot in shots:
+            unit_key = shot.shot_id
+            per_shot_instructions.append(
+                f"For {unit_key} ({shot.duration_seconds}s): first call generate_image_minimax "
+                "exactly once with the prompt read verbatim from "
+                f"'workspace/deliverables/{request.id}/prompts/keyframe-{unit_key}.txt' via read_file "
+                f"and save_path='workspace/deliverables/{request.id}/keyframes/{unit_key}.png', "
+                f"aspect_ratio=spec.aspect_ratio, execution_strategy='commercial_quality', "
+                f"allow_degraded_fallback={allow_degraded_literal}. Then call generate_video_minimax "
+                "exactly once with the prompt read verbatim from "
+                f"'workspace/deliverables/{request.id}/prompts/{unit_key}.txt', "
+                f"save_path='workspace/deliverables/{request.id}/shots/{unit_key}.mp4', "
+                f"aspect_ratio=spec.aspect_ratio, duration={shot.duration_seconds}, "
+                f"first_frame_image=<the exact versioned workspace path returned by that shot's "
+                f"keyframe call>, require_audio={require_audio}, wait_for_completion=false, and "
+                f"allow_degraded_fallback={allow_degraded_literal}."
+            )
+        return (
+            "You are executing the approved storyboard of a persisted Astra Deliverable Request "
+            "under the v2 storyboard-gated video pipeline. The customer has approved the storyboard; "
+            "the server has compiled one provider prompt per shot and per keyframe. Your job is "
+            "managed submission only, never prompt authorship: read each compiled prompt file with "
+            "read_file and pass its content verbatim (never write, rewrite, extend, translate, or "
+            "summarize it). Execute these shot steps in order: "
+            + " ".join(per_shot_instructions)
+            + " wait_for_completion=false is mandatory: the media daemon drives provider polling and "
+            "Credits settlement, so never poll a submitted shot and never call a generation Tool "
+            "twice for the same shot. If one shot's submission is rejected, record it and continue "
+            "with the remaining shots. After submitting every shot, end your turn without composing "
+            "anything and without claiming delivery.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    if stage == "compose":
+        clip_paths = [str(clip.get("clip_path") or "") for clip in shot_clips]
+        clip_listing = ", ".join(
+            f"'{path}'" for path in clip_paths if path
+        )
+        if audio_mode == "voiceover":
+            narration = str(getattr(storyboard, "voiceover_script", "") or "").strip()
+            compose_instruction = (
+                "Your only paid step is the voiceover: call generate_speech_minimax exactly once "
+                f"with the approved narration and save_path='workspace/deliverables/{request.id}/voiceover.mp3'. "
+                f"The approved narration is: {narration}. "
+            )
+        else:
+            compose_instruction = ""
+        return (
+            "You are finishing a persisted Astra Deliverable Request under the v2 storyboard-gated "
+            "video pipeline. Every approved shot clip is complete: "
+            f"{clip_listing}. "
+            + compose_instruction
+            + "Assembly is server-owned and deterministic: Astra concatenates the versioned shot "
+            "clips, applies the approved captions and CTA, mixes the voiceover with loudness "
+            "control, and extracts the cover frame without any further generation. Never call "
+            "compose_video_audio, never regenerate or resubmit a shot, and never edit the clips "
+            "yourself. After the voiceover step (or immediately, when the audio mode needs no "
+            "voiceover), end your turn; the server assembles and quality-checks the final package. "
+            "Never claim delivery yourself.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    raise DeliverableWorkflowError(
+        "deliverable_continuation_not_ready",
+        f"Unknown v2 video continuation stage: {stage}",
+    )
+
+
 async def _agent_tool_available(
     db: AsyncSession,
     *,
@@ -1107,6 +1658,35 @@ def _credit_estimate(workflow: WorkflowManifest, tier: str, spec: dict[str, Any]
             duration = 6
         elif tier == "ultra" and duration == 10:
             resolution = "768P"
+        if workflow.workflow_id == VIDEO_V2_WORKFLOW_ID:
+            # FR-C2: per-shot estimate with the managed keyframe chain.  The
+            # storyboard is approved before any spend, so minimum == maximum.
+            shot_count = spec.get("shot_count")
+            if not isinstance(shot_count, int) or isinstance(shot_count, bool):
+                shot_count = max(1, min(math.ceil(duration / 4), 12))
+            shot_count = max(1, min(shot_count, 12))
+            per_shot_duration = max(1, math.ceil(duration / shot_count))
+            # MiniMax bills clips in 6s/10s buckets; the estimate uses the
+            # billed bucket so preflight never understates per-shot cost.
+            billed_shot_duration = 6 if per_shot_duration <= 6 else 10
+            per_shot_video = minimax_video_credits(
+                profile.model,
+                duration=billed_shot_duration,
+                resolution=resolution,
+            )
+            per_shot_keyframe = minimax_image_credits("image-01", images=1)
+            per_shot = per_shot_video + per_shot_keyframe
+            total = per_shot * shot_count
+            return {
+                "mode": "estimate",
+                "minimum": total,
+                "maximum": total,
+                "billing_unit": f"{shot_count}_keyframed_shots",
+                "shots": shot_count,
+                "per_shot_credits": per_shot,
+                "per_shot_video_credits": per_shot_video,
+                "per_shot_keyframe_credits": per_shot_keyframe,
+            }
         first_frame_credits = minimax_image_credits("image-01", images=1)
         video_credits = minimax_video_credits(profile.model, duration=duration, resolution=resolution)
         credits = first_frame_credits + video_credits
@@ -1171,6 +1751,33 @@ async def preflight_workflow(
         )
         creative_brief_projection = brief_projection(brief, missing_fields)
         reasons.extend(f"brief_missing:{field}" for field in missing_fields)
+    if workflow.workflow_id == VIDEO_V2_WORKFLOW_ID:
+        # FR-V1: same clarification seam for the structured video brief.
+        if not video_v2_workflow_allowed(tenant_id, agent_id):
+            reasons.append("deliverable_video_v2_not_allowlisted")
+        video_brief, video_missing = compile_video_brief(
+            goal,
+            normalized_spec,
+            inputs,
+            tier=normalized_tier,
+        )
+        creative_brief_projection = video_brief_projection(video_brief, video_missing)
+        reasons.extend(f"brief_missing:{field}" for field in video_missing)
+    if workflow.workflow_id == PRESENTATION_V2_WORKFLOW_ID:
+        # FR-P1: same clarification seam for the structured presentation brief.
+        if not presentation_v2_workflow_allowed(tenant_id, agent_id):
+            reasons.append("deliverable_presentation_v2_not_allowlisted")
+        presentation_brief, presentation_missing = compile_presentation_brief(
+            goal,
+            normalized_spec,
+            inputs,
+            output_contract=workflow.output_contract,
+        )
+        creative_brief_projection = presentation_brief_projection(
+            presentation_brief,
+            presentation_missing,
+        )
+        reasons.extend(f"brief_missing:{field}" for field in presentation_missing)
 
     try:
         await resolve_route(tenant_id, normalized_tier, "text")
@@ -1306,6 +1913,27 @@ async def preflight_workflow(
                 tool_name="generate_image_minimax",
             ):
                 reasons.append("video_first_frame_image_tool_unavailable")
+            if (
+                workflow.workflow_id == VIDEO_V2_WORKFLOW_ID
+                and str(normalized_spec.get("audio_mode") or "").strip()
+                == "in_scene_dialogue"
+            ):
+                # FR-V1: in-scene synchronized dialogue needs a provider-native
+                # audio track.  Without one the route can only offer
+                # voiceover/silent, so the request must never launch promising
+                # dialogue it cannot honor.
+                video_providers = (
+                    row.get("available_providers", ())
+                    if row is not None and row.get("available")
+                    else ()
+                )
+                if not video_providers_with_native_audio(video_providers):
+                    reasons.append("audio_mode_route_mismatch")
+                    capability_status = "unavailable"
+                    next_action = (
+                        "镜头内同步对白需要具备原生音轨能力的线路；当前没有可用线路。"
+                        "请改用旁白或静音模式后重新确认，或保留工作说明等待线路恢复。"
+                    )
 
     if workflow.launch_policy == "dry_run":
         reasons.append("workflow_execution_not_enabled")
@@ -1408,6 +2036,417 @@ async def _prepare_poster_v2_compilations(
     await db.flush()
 
 
+async def _prepare_video_v2_shot_compilations(
+    db: AsyncSession,
+    *,
+    request: DeliverableRequest,
+    execution: DeliverableExecution,
+    storyboard,
+) -> None:
+    """Compile every approved shot/keyframe prompt before a v2 shot run.
+
+    Idempotent: an existing receipt for the same unit and compiler version is
+    kept, so a resumed continuation never double-writes compilation facts.
+    """
+
+    from app.services.prompt_compiler import (
+        TIER_QUALITY_SIZE,
+        VIDEO_KEYFRAME_COMPILER_VERSION,
+        VIDEO_SHOT_COMPILER_VERSION,
+        compile_video_keyframe_prompt,
+        compile_video_shot_prompt,
+        record_prompt_compilation,
+        store_compiled_prompt,
+    )
+
+    brief, missing_fields = compile_video_brief(
+        request.goal,
+        request.spec,
+        request.inputs,
+        tier=request.tier,
+    )
+    if brief is None:
+        raise DeliverableWorkflowError(
+            "deliverable_brief_incomplete",
+            "Video brief is incomplete: " + ", ".join(missing_fields),
+        )
+    unit_result = await db.execute(
+        select(DeliverableExecutionUnit)
+        .where(
+            DeliverableExecutionUnit.tenant_id == request.tenant_id,
+            DeliverableExecutionUnit.execution_id == execution.id,
+            DeliverableExecutionUnit.stage_key.in_(("shot_generate", "keyframe_pack")),
+        )
+        .order_by(DeliverableExecutionUnit.unit_key)
+    )
+    units = tuple(unit_result.scalars().all())
+    shots_by_id = {shot.shot_id: shot for shot in storyboard.shots}
+    video_target = next(iter(media_provider_order_for_modality("video")), "minimax")
+    image_target = next(
+        iter(media_provider_order_for_image_strategy("commercial_quality")),
+        "volcengine_agent_plan",
+    )
+    quality_size = TIER_QUALITY_SIZE.get(request.tier, "2K")
+    for unit in units:
+        shot = shots_by_id.get(unit.unit_key)
+        if shot is None:
+            raise DeliverableWorkflowError(
+                "deliverable_storyboard_missing",
+                f"The approved storyboard has no spec for unit {unit.unit_key}",
+            )
+        if unit.stage_key == "shot_generate":
+            compiler_version = VIDEO_SHOT_COMPILER_VERSION
+            prompt_unit_key = unit.unit_key
+            compiled = compile_video_shot_prompt(
+                brief,
+                shot,
+                provider_target=video_target,
+            )
+        else:
+            compiler_version = VIDEO_KEYFRAME_COMPILER_VERSION
+            prompt_unit_key = f"keyframe-{unit.unit_key}"
+            compiled = compile_video_keyframe_prompt(
+                brief,
+                shot,
+                provider_target=image_target,
+                quality_size=quality_size,
+            )
+        existing_result = await db.execute(
+            select(DeliverablePromptCompilation).where(
+                DeliverablePromptCompilation.tenant_id == request.tenant_id,
+                DeliverablePromptCompilation.execution_id == execution.id,
+                DeliverablePromptCompilation.unit_id == unit.id,
+                DeliverablePromptCompilation.compiler_version == compiler_version,
+            )
+        )
+        if existing_result.scalar_one_or_none() is not None:
+            continue
+        prompt_path = await store_compiled_prompt(
+            agent_id=request.agent_id,
+            request_id=request.id,
+            unit_key=prompt_unit_key,
+            content=compiled.neutral_prompt,
+        )
+        await record_prompt_compilation(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+            execution_id=execution.id,
+            unit_id=unit.id,
+            compiled=compiled,
+            compiled_prompt_path=prompt_path,
+        )
+    await db.flush()
+
+
+def _video_v2_run_is_active(run: AgentRun | None) -> bool:
+    return run is not None and str(run.status or "") not in {
+        "completed",
+        "failed",
+        "cancelled",
+    }
+
+
+async def _prepare_video_v2_continuation(
+    db: AsyncSession,
+    *,
+    request: DeliverableRequest,
+    message_id: uuid.UUID,
+) -> PreparedDeliverableLaunch:
+    """FR-V2/V3: short stage runs after storyboard approval or shot completion.
+
+    A continuation only ever submits shots or assembles the final package and
+    then returns; provider polling stays with the media daemon, so the direct
+    lane is never held by a long video wait.
+    """
+
+    if request.status not in {"ready", "running"}:
+        raise DeliverableWorkflowError(
+            "deliverable_invalid_status",
+            f"Deliverable request cannot continue from status {request.status}",
+        )
+    stage = str(request.current_stage or "")
+    execution = (
+        await current_execution(db, request, lock=True)
+        if request.current_execution_id is not None
+        else None
+    )
+    if execution is None:
+        raise DeliverableWorkflowError(
+            "deliverable_execution_missing",
+            "v2 video continuation requires an active execution",
+        )
+    if stage in {"storyboard_draft", "shot_generation", "compose"}:
+        # Resume is only safe once the previous short run is terminal.
+        last_run_id = execution.coordinator_run_id or execution.intake_run_id
+        if last_run_id is not None:
+            last_run = await db.get(AgentRun, last_run_id)
+            if _video_v2_run_is_active(last_run):
+                raise DeliverableWorkflowError(
+                    "deliverable_continuation_not_ready",
+                    "The previous stage run is still active",
+                )
+    if stage == "storyboard_draft":
+        # The intake run ended without a compiled storyboard (crash or sync
+        # gap): re-run the same draft stage; no paid work exists at this stage.
+        prompt = build_deliverable_prompt(request, video_v2_stage="storyboard_draft")
+        request.launch_message_id = message_id
+        request.agent_run_id = None
+        request.status = "running"
+        request.current_stage = "storyboard_draft"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    if stage in {"storyboard_approved", "shot_generation"}:
+        # Hard gate: no paid shot without an approved storyboard receipt.
+        if not await storyboard_approved(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        ):
+            raise DeliverableWorkflowError(
+                "deliverable_storyboard_approval_required",
+                "The storyboard must be approved before any paid shot is submitted",
+            )
+        storyboard = await load_latest_storyboard(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        if storyboard is None:
+            raise DeliverableWorkflowError(
+                "deliverable_storyboard_missing",
+                "No approved storyboard is recorded for this request",
+            )
+        await _prepare_video_v2_shot_compilations(
+            db,
+            request=request,
+            execution=execution,
+            storyboard=storyboard,
+        )
+        prompt = build_deliverable_prompt(
+            request,
+            video_v2_stage="shot_generation",
+            video_v2_storyboard=storyboard,
+        )
+        request.launch_message_id = message_id
+        request.agent_run_id = None
+        request.status = "running"
+        request.current_stage = "shot_generation"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    if stage in {"compose_ready", "compose"}:
+        unit_result = await db.execute(
+            select(DeliverableExecutionUnit)
+            .where(
+                DeliverableExecutionUnit.tenant_id == request.tenant_id,
+                DeliverableExecutionUnit.execution_id == execution.id,
+                DeliverableExecutionUnit.stage_key == "shot_generate",
+                DeliverableExecutionUnit.status == "succeeded",
+            )
+            .order_by(DeliverableExecutionUnit.unit_key)
+        )
+        clips = [
+            {
+                "unit_key": unit.unit_key,
+                "clip_path": str((unit.result_snapshot or {}).get("clip_path") or ""),
+            }
+            for unit in unit_result.scalars().all()
+            if str((unit.result_snapshot or {}).get("clip_path") or "")
+        ]
+        expected_shots = sum(
+            1
+            for unit in (await execution_units(db, execution.id))
+            if unit.stage_key == "shot_generate"
+        )
+        if not clips or len(clips) != expected_shots:
+            raise DeliverableWorkflowError(
+                "deliverable_shot_clips_missing",
+                "Every approved shot clip must be complete before assembly",
+            )
+        storyboard = await load_latest_storyboard(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        prompt = build_deliverable_prompt(
+            request,
+            video_v2_stage="compose",
+            video_v2_storyboard=storyboard,
+            video_v2_shot_clips=clips,
+        )
+        request.launch_message_id = message_id
+        request.agent_run_id = None
+        request.status = "running"
+        request.current_stage = "compose"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    raise DeliverableWorkflowError(
+        "deliverable_continuation_not_ready",
+        f"The v2 video pipeline cannot continue from stage {stage or 'unknown'}",
+    )
+
+
+async def _prepare_presentation_v2_continuation(
+    db: AsyncSession,
+    *,
+    request: DeliverableRequest,
+    message_id: uuid.UUID,
+) -> PreparedDeliverableLaunch:
+    """FR-P3: short stage runs after outline approval or a crashed draft.
+
+    The outline draft run produces only planning files; the production run
+    renders locally and converts with the approved editability render mode.
+    No Provider polling exists in this pipeline, so runs stay short and the
+    direct lane is never held.
+    """
+
+    if request.status not in {"ready", "running"}:
+        raise DeliverableWorkflowError(
+            "deliverable_invalid_status",
+            f"Deliverable request cannot continue from status {request.status}",
+        )
+    stage = str(request.current_stage or "")
+    execution = (
+        await current_execution(db, request, lock=True)
+        if request.current_execution_id is not None
+        else None
+    )
+    if execution is None:
+        raise DeliverableWorkflowError(
+            "deliverable_execution_missing",
+            "v2 presentation continuation requires an active execution",
+        )
+    if stage in {"outline_draft", "slide_render", "slide_revision"}:
+        # Resume is only safe once the previous short run is terminal.
+        last_run_id = execution.coordinator_run_id or execution.intake_run_id
+        if last_run_id is not None:
+            last_run = await db.get(AgentRun, last_run_id)
+            if _video_v2_run_is_active(last_run):
+                raise DeliverableWorkflowError(
+                    "deliverable_continuation_not_ready",
+                    "The previous stage run is still active",
+                )
+    if stage == "slide_revision":
+        # FR-P6 resume: the revision run crashed before converting; rebuild the
+        # same page-targeted prompt from the frozen revision contract.
+        snapshot = (
+            execution.contract_snapshot
+            if isinstance(execution.contract_snapshot, Mapping)
+            else {}
+        )
+        raw_targets = snapshot.get("target_units")
+        revision_targets = tuple(
+            str(item) for item in raw_targets if str(item).strip()
+        ) if isinstance(raw_targets, (list, tuple)) else ()
+        if not revision_targets:
+            raise DeliverableWorkflowError(
+                "deliverable_revision_target_invalid",
+                "The revision execution has no page targets",
+            )
+        inventory = await load_presentation_v2_inventory_projection(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        prompt = build_deliverable_prompt(
+            request,
+            presentation_v2_stage="slide_revision",
+            presentation_v2_source_inventory=inventory,
+            presentation_v2_target_units=revision_targets,
+            presentation_v2_revision_instruction=execution.revision_instruction,
+        )
+        request.launch_message_id = message_id
+        request.agent_run_id = None
+        request.status = "running"
+        request.current_stage = "slide_revision"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    if stage == "outline_draft":
+        # The intake run ended without a validated outline (crash or sync
+        # gap): re-run the same draft stage; no paid work exists at this stage.
+        inventory = await load_presentation_v2_inventory_projection(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        prompt = build_deliverable_prompt(
+            request,
+            presentation_v2_stage="outline_draft",
+            presentation_v2_source_inventory=inventory,
+        )
+        request.launch_message_id = message_id
+        request.agent_run_id = None
+        request.status = "running"
+        request.current_stage = "outline_draft"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    if stage in {"outline_approved", "slide_render"}:
+        # Hard gate: no rendering or paid imagery without an approved outline.
+        if not await outline_approved(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        ):
+            raise DeliverableWorkflowError(
+                "deliverable_outline_approval_required",
+                "The outline must be approved before any rendering starts",
+            )
+        outline = await load_latest_outline(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        if outline is None:
+            raise DeliverableWorkflowError(
+                "deliverable_outline_missing",
+                "No approved outline is recorded for this request",
+            )
+        inventory = await load_presentation_v2_inventory_projection(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        prompt = build_deliverable_prompt(
+            request,
+            presentation_v2_stage="slide_render",
+            presentation_v2_source_inventory=inventory,
+        )
+        request.launch_message_id = message_id
+        request.agent_run_id = None
+        request.status = "running"
+        request.current_stage = "slide_render"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    raise DeliverableWorkflowError(
+        "deliverable_continuation_not_ready",
+        f"The v2 presentation pipeline cannot continue from stage {stage or 'unknown'}",
+    )
+
+
 @dataclass(slots=True)
 class PreparedDeliverableLaunch:
     request: DeliverableRequest
@@ -1447,6 +2486,22 @@ async def prepare_deliverable_launch(
             "This deliverable workflow is currently available for planning only",
         )
     if request.launch_message_id is not None and request.launch_message_id != message_id:
+        if workflow.workflow_id == VIDEO_V2_WORKFLOW_ID:
+            # FR-V2/V3: storyboard approval and shot completion drive short
+            # continuation runs instead of one long foreground wait.
+            return await _prepare_video_v2_continuation(
+                db,
+                request=request,
+                message_id=message_id,
+            )
+        if workflow.workflow_id == PRESENTATION_V2_WORKFLOW_ID:
+            # FR-P3: outline approval drives a short production continuation;
+            # rendering is local so no run ever parks on a Provider.
+            return await _prepare_presentation_v2_continuation(
+                db,
+                request=request,
+                message_id=message_id,
+            )
         raise DeliverableWorkflowError(
             "deliverable_already_launched",
             "Deliverable request has already been launched",
@@ -1455,6 +2510,162 @@ async def prepare_deliverable_launch(
         raise DeliverableWorkflowError(
             "deliverable_invalid_status",
             f"Deliverable request cannot be launched from status {request.status}",
+        )
+    if workflow.workflow_id == VIDEO_V2_WORKFLOW_ID:
+        # v2 video first launch drafts the storyboard; a shot-targeted revision
+        # launch re-enters the approved shot stage directly.
+        preflight = await preflight_workflow(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            workflow=workflow,
+            tier=request.tier,
+            spec=request.spec,
+            goal=request.goal,
+            inputs=request.inputs,
+        )
+        execution = None
+        if request.current_execution_id is not None:
+            execution = await current_execution(db, request, lock=True)
+            if execution is not None:
+                record_execution_preflight(request, execution, preflight)
+        if not preflight["launchable"]:
+            reason = next(iter(preflight["reasons"]), "deliverable_capability_unavailable")
+            raise DeliverableWorkflowError(
+                "deliverable_preflight_failed",
+                f"Deliverable capability check failed: {reason}",
+            )
+        shot_units = (
+            [
+                unit
+                for unit in await execution_units(db, execution.id)
+                if unit.stage_key == "shot_generate"
+            ]
+            if execution is not None
+            else []
+        )
+        if execution is not None and execution.kind == "revision" and shot_units:
+            if not await storyboard_approved(
+                db,
+                tenant_id=request.tenant_id,
+                request_id=request.id,
+            ):
+                raise DeliverableWorkflowError(
+                    "deliverable_storyboard_approval_required",
+                    "The storyboard must be approved before any paid shot is submitted",
+                )
+            storyboard = await load_latest_storyboard(
+                db,
+                tenant_id=request.tenant_id,
+                request_id=request.id,
+            )
+            if storyboard is None:
+                raise DeliverableWorkflowError(
+                    "deliverable_storyboard_missing",
+                    "No approved storyboard is recorded for this request",
+                )
+            await _prepare_video_v2_shot_compilations(
+                db,
+                request=request,
+                execution=execution,
+                storyboard=storyboard,
+            )
+            prompt = build_deliverable_prompt(
+                request,
+                video_v2_stage="shot_generation",
+                video_v2_storyboard=storyboard,
+            )
+            next_stage = "shot_generation"
+        else:
+            prompt = build_deliverable_prompt(
+                request,
+                video_v2_stage="storyboard_draft",
+            )
+            next_stage = "storyboard_draft"
+        request.launch_message_id = message_id
+        request.status = "running"
+        request.current_stage = next_stage
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
+        )
+    if workflow.workflow_id == PRESENTATION_V2_WORKFLOW_ID:
+        # FR-P1/P3: the v2 first launch only drafts the outline and slide_spec;
+        # the customer approves the outline before any rendering or imagery.
+        preflight = await preflight_workflow(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            workflow=workflow,
+            tier=request.tier,
+            spec=request.spec,
+            goal=request.goal,
+            inputs=request.inputs,
+        )
+        execution = None
+        if request.current_execution_id is not None:
+            execution = await current_execution(db, request, lock=True)
+            if execution is not None:
+                record_execution_preflight(request, execution, preflight)
+        if not preflight["launchable"]:
+            reason = next(iter(preflight["reasons"]), "deliverable_capability_unavailable")
+            raise DeliverableWorkflowError(
+                "deliverable_preflight_failed",
+                f"Deliverable capability check failed: {reason}",
+            )
+        inventory = await load_presentation_v2_inventory_projection(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+        )
+        # FR-P6: a page-targeted revision execution re-renders only its target
+        # slides; the outline stays approved and every other page carries
+        # forward.  A full-deck revision (no targets) re-drafts the outline.
+        revision_targets: tuple[str, ...] = ()
+        revision_instruction: str | None = None
+        if execution is not None and execution.kind == "revision":
+            snapshot = (
+                execution.contract_snapshot
+                if isinstance(execution.contract_snapshot, Mapping)
+                else {}
+            )
+            raw_targets = snapshot.get("target_units")
+            revision_targets = tuple(
+                str(item) for item in raw_targets if str(item).strip()
+            ) if isinstance(raw_targets, (list, tuple)) else ()
+            revision_instruction = execution.revision_instruction
+        if revision_targets:
+            prompt = build_deliverable_prompt(
+                request,
+                presentation_v2_stage="slide_revision",
+                presentation_v2_source_inventory=inventory,
+                presentation_v2_target_units=revision_targets,
+                presentation_v2_revision_instruction=revision_instruction,
+            )
+            request.launch_message_id = message_id
+            request.status = "running"
+            request.current_stage = "slide_revision"
+            request.version += 1
+            return PreparedDeliverableLaunch(
+                request=request,
+                prompt=prompt,
+                execution=execution,
+            )
+        prompt = build_deliverable_prompt(
+            request,
+            presentation_v2_stage="outline_draft",
+            presentation_v2_source_inventory=inventory,
+        )
+        request.launch_message_id = message_id
+        request.status = "running"
+        request.current_stage = "outline_draft"
+        request.version += 1
+        return PreparedDeliverableLaunch(
+            request=request,
+            prompt=prompt,
+            execution=execution,
         )
     # Prompt compilation performs exact-copy/font/layout validation. It must
     # complete before status or launch ownership is mutated so a malformed
@@ -1519,20 +2730,31 @@ def attach_deliverable_run(
             "deliverable_run_mismatch",
             "Deliverable request is already linked to another run",
         )
+    is_video_v2 = request.workflow_id == VIDEO_V2_WORKFLOW_ID
+    # v2 stage pipelines (video storyboard, presentation outline) park at
+    # explicit stages between short runs; the run attach must preserve the
+    # stage instead of stomping it with a generic "running".
+    is_stage_v2 = is_video_v2 or request.workflow_id == PRESENTATION_V2_WORKFLOW_ID
     request.agent_run_id = run_id
     request.launched_at = launched_at
-    request.current_stage = "running"
+    if not is_stage_v2:
+        request.current_stage = "running"
     execution = getattr(prepared, "execution", None)
     if isinstance(execution, DeliverableExecution):
         if execution.intake_run_id is not None and execution.intake_run_id != run_id:
-            raise DeliverableWorkflowError(
-                "deliverable_execution_run_mismatch",
-                "Deliverable execution is already linked to another run",
-            )
-        execution.intake_run_id = run_id
+            if not is_stage_v2:
+                raise DeliverableWorkflowError(
+                    "deliverable_execution_run_mismatch",
+                    "Deliverable execution is already linked to another run",
+                )
+            # v2 continuation runs are short stage runs; the latest one is the
+            # coordinator, and earlier runs stay traceable through the units.
+            execution.coordinator_run_id = run_id
+        else:
+            execution.intake_run_id = run_id
         execution.launch_message_id = request.launch_message_id
         execution.status = "running"
-        execution.current_stage = "running"
+        execution.current_stage = request.current_stage if is_stage_v2 else "running"
         execution.launched_at = launched_at
 
 
@@ -1616,6 +2838,27 @@ async def sync_deliverable_lifecycle(
                 from app.services.candidate_qa import evaluate_poster_v2_candidates
 
                 await evaluate_poster_v2_candidates(db, request=candidate, run_id=run_id)
+            if candidate.workflow_id == VIDEO_V2_WORKFLOW_ID and await advance_video_v2_after_run(
+                db,
+                request=candidate,
+                run_id=run_id,
+                lifecycle_status=normalized_lifecycle_status,
+                now=now,
+            ):
+                # Storyboard drafting and shot submission stages never reach
+                # artifact reconciliation; their terminal projection is owned
+                # by the v2 stage machine above.
+                return await finish(candidate)
+            if candidate.workflow_id == PRESENTATION_V2_WORKFLOW_ID and await advance_presentation_v2_after_run(
+                db,
+                request=candidate,
+                run_id=run_id,
+                lifecycle_status=normalized_lifecycle_status,
+                now=now,
+            ):
+                # The outline draft stage never reaches artifact
+                # reconciliation; its terminal projection is owned above.
+                return await finish(candidate)
             reconciliation = await reconcile_runtime_deliverable_artifacts(
                 db,
                 request=candidate,
@@ -1687,6 +2930,22 @@ async def sync_deliverable_lifecycle(
             from app.services.candidate_qa import evaluate_poster_v2_candidates
 
             await evaluate_poster_v2_candidates(db, request=request, run_id=run_id)
+        if request.workflow_id == VIDEO_V2_WORKFLOW_ID and await advance_video_v2_after_run(
+            db,
+            request=request,
+            run_id=run_id,
+            lifecycle_status=normalized_lifecycle_status,
+            now=now,
+        ):
+            return await finish(request)
+        if request.workflow_id == PRESENTATION_V2_WORKFLOW_ID and await advance_presentation_v2_after_run(
+            db,
+            request=request,
+            run_id=run_id,
+            lifecycle_status=normalized_lifecycle_status,
+            now=now,
+        ):
+            return await finish(request)
         reconciliation = await reconcile_runtime_deliverable_artifacts(
             db,
             request=request,

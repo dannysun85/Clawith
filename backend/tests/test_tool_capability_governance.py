@@ -81,6 +81,7 @@ def test_image_speech_and_video_are_global_defaults_with_agent_opt_out() -> None
         "check_image_generation",
         "generate_speech_minimax",
         "compose_video_audio",
+        "concat_videos",
         "generate_video_minimax",
         "check_video_minimax",
     }

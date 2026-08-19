@@ -29,6 +29,7 @@ from app.models.deliverable import (
     DeliverableQualityReviewAssignment,
     DeliverableQualityReviewEvidence,
     DeliverableRequest,
+    DeliverableSelectionReceipt,
 )
 from app.models.user import User
 from app.models.task import Task
@@ -53,19 +54,30 @@ from app.schemas.deliverable import (
     DeliverableRequestCreate,
     DeliverableRequestOut,
     DeliverableRequestUpdate,
+    DeliverableSelectionReceiptOut,
 )
 from app.services.candidate_qa import qa_summary_from_evaluation
+from app.services.selection_receipts import apply_user_selection
 from app.services.creative_briefs import (
     CREATIVE_BRIEF_SCHEMA_VERSION,
     POSTER_V2_WORKFLOW_ID,
+    PRESENTATION_BRIEF_SCHEMA_VERSION,
+    PRESENTATION_V2_WORKFLOW_ID,
+    VIDEO_BRIEF_SCHEMA_VERSION,
+    VIDEO_V2_WORKFLOW_ID,
     brief_projection,
     compile_creative_brief,
+    compile_presentation_brief,
+    compile_video_brief,
     current_request_brief,
-    upsert_request_creative_brief,
+    presentation_brief_projection,
+    upsert_request_structured_brief,
+    video_brief_projection,
 )
 from app.services.deliverable_artifacts import (
     DeliverableArtifactError,
     approve_deliverable_artifacts,
+    rebind_poster_selection_artifact,
     read_deliverable_artifact_snapshot,
 )
 from app.services.deliverable_executions import (
@@ -147,12 +159,21 @@ async def _execution_out(
         )
     )
     approvals = tuple(receipt_result.scalars().all())
+    selection_result = await db.execute(
+        select(DeliverableSelectionReceipt)
+        .where(DeliverableSelectionReceipt.execution_id == execution.id)
+        .order_by(
+            DeliverableSelectionReceipt.created_at,
+            DeliverableSelectionReceipt.id,
+        )
+    )
+    selections = tuple(selection_result.scalars().all())
     return DeliverableExecutionOut.model_validate(
         {
             **{
                 field: getattr(execution, field)
                 for field in DeliverableExecutionOut.model_fields
-                if field not in {"units", "approvals"}
+                if field not in {"units", "approvals", "selections"}
             },
             "units": [
                 DeliverableExecutionUnitOut.model_validate(
@@ -173,6 +194,10 @@ async def _execution_out(
                 DeliverableApprovalReceiptOut.model_validate(receipt)
                 for receipt in approvals
             ],
+            "selections": [
+                DeliverableSelectionReceiptOut.model_validate(receipt)
+                for receipt in selections
+            ],
         }
     )
 
@@ -190,7 +215,7 @@ async def _apply_brief_projection(
     ``brief_missing:<field>`` reason so no Provider task can be created.
     """
 
-    brief_row = await upsert_request_creative_brief(db, request)
+    brief_row = await upsert_request_structured_brief(db, request)
     if brief_row is None:
         return None
     if execution is None and request.current_execution_id is not None:
@@ -970,7 +995,22 @@ async def record_deliverable_approval(
             status_code=409,
             detail="Deliverable request changed; reload before acting",
         )
-    if data.stage != "final":
+    settings = get_settings()
+    # FR-V2/FR-P3: non-final stage approvals are a v2-only, flag-gated
+    # capability; v1 requests keep the final-only 409 compatibility branch.
+    stage_flow = bool(
+        settings.DELIVERABLE_STAGE_APPROVALS_ENABLED
+        and request.workflow_id == VIDEO_V2_WORKFLOW_ID
+    )
+    outline_stage_flow = bool(
+        settings.DELIVERABLE_STAGE_APPROVALS_ENABLED
+        and request.workflow_id == PRESENTATION_V2_WORKFLOW_ID
+    )
+    if (
+        data.stage != "final"
+        and not (stage_flow and data.stage == "storyboard")
+        and not (outline_stage_flow and data.stage == "outline")
+    ):
         raise HTTPException(
             status_code=409,
             detail={
@@ -978,7 +1018,34 @@ async def record_deliverable_approval(
                 "message": "Only final delivery approval is enabled in this compatibility release",
             },
         )
-    if request.status != "waiting_approval" or request.current_stage != "output_review":
+    if stage_flow and data.stage == "storyboard":
+        if request.status != "waiting_approval" or request.current_stage != "storyboard_review":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "deliverable_stage_approval_not_ready",
+                    "message": "The storyboard is not awaiting a decision",
+                },
+            )
+    elif outline_stage_flow and data.stage == "outline":
+        if request.status != "waiting_approval" or request.current_stage != "outline_review":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "deliverable_stage_approval_not_ready",
+                    "message": "The deck outline is not awaiting a decision",
+                },
+            )
+    elif (
+        stage_flow
+        and data.action == "request_changes"
+        and request.status == "ready"
+        and request.current_stage == "shot_review"
+    ):
+        # FR-V4: a failed shot is redone through a targeted revision without
+        # dragging the whole request back through the storyboard.
+        pass
+    elif request.status != "waiting_approval" or request.current_stage != "output_review":
         raise HTTPException(
             status_code=409,
             detail={
@@ -992,22 +1059,79 @@ async def record_deliverable_approval(
     next_execution_id: uuid.UUID | None = None
     superseded_review_ids: tuple[uuid.UUID, ...] = ()
     if data.action == "approve":
-        try:
-            artifacts = await approve_deliverable_artifacts(db, request=request)
-        except DeliverableArtifactError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": exc.code, "message": str(exc)},
-            ) from exc
-        for artifact in artifacts:
-            artifact.status = "approved"
-            artifact.approved_by_user_id = current_user.id
-            artifact.approved_at = now
-        request.status = "succeeded"
-        request.current_stage = "delivered"
-        request.completed_at = now
-        request.last_error_code = None
-        request.version += 1
+        if stage_flow and data.stage == "storyboard":
+            # The storyboard approval releases the paid-work gate; the follow-up
+            # shot run is a fresh short continuation, so the intake run pointer
+            # is released and history stays on the execution.
+            request.status = "ready"
+            request.current_stage = "storyboard_approved"
+            request.agent_run_id = None
+            request.completed_at = None
+            request.last_error_code = None
+            request.version += 1
+        elif outline_stage_flow and data.stage == "outline":
+            # The outline approval releases the render gate; the follow-up
+            # production run is a fresh short continuation, so the intake run
+            # pointer is released and history stays on the execution.
+            request.status = "ready"
+            request.current_stage = "outline_approved"
+            request.agent_run_id = None
+            request.completed_at = None
+            request.last_error_code = None
+            request.version += 1
+        else:
+            # FR-I6: a v2 poster final approval may carry one candidate unit
+            # key in target_units to re-select the delivered candidate.  The
+            # selection receipt and artifact rebind are recorded before the
+            # standard artifact approval runs; v1 requests never take this
+            # branch and keep their final-only semantics untouched.
+            if request.workflow_id == POSTER_V2_WORKFLOW_ID and data.target_units:
+                if len(data.target_units) != 1:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "deliverable_selection_target_invalid",
+                            "message": "Select exactly one candidate unit for delivery",
+                        },
+                    )
+                try:
+                    await apply_user_selection(
+                        db,
+                        request=request,
+                        selected_unit_key=data.target_units[0],
+                        actor_user_id=current_user.id,
+                        client_selection_id=data.client_action_id,
+                        now=now,
+                    )
+                    await rebind_poster_selection_artifact(
+                        db,
+                        request=request,
+                        selected_unit_key=data.target_units[0],
+                        now=now,
+                    )
+                except DeliverableExecutionError as exc:
+                    raise _execution_error(exc) from exc
+                except DeliverableArtifactError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": exc.code, "message": str(exc)},
+                    ) from exc
+            try:
+                artifacts = await approve_deliverable_artifacts(db, request=request)
+            except DeliverableArtifactError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            for artifact in artifacts:
+                artifact.status = "approved"
+                artifact.approved_by_user_id = current_user.id
+                artifact.approved_at = now
+            request.status = "succeeded"
+            request.current_stage = "delivered"
+            request.completed_at = now
+            request.last_error_code = None
+            request.version += 1
     elif data.action == "request_changes":
         if normalized_instruction is None:
             raise HTTPException(
@@ -1809,6 +1933,43 @@ async def get_deliverable_brief(
     brief_row = await current_request_brief(db, request)
     if brief_row is not None:
         return _brief_out_from_row(brief_row)
+    if request.workflow_id == VIDEO_V2_WORKFLOW_ID:
+        video_brief, video_missing = compile_video_brief(
+            request.goal,
+            request.spec,
+            request.inputs,
+            tier=request.tier,
+        )
+        projection = video_brief_projection(video_brief, video_missing)
+        return DeliverableBriefOut(
+            schema_version=VIDEO_BRIEF_SCHEMA_VERSION,
+            status=projection["status"],
+            missing_fields=list(projection["missing_fields"]),
+            brief_sha256=projection.get("brief_sha256"),
+            brief=video_brief.model_dump(mode="json") if video_brief is not None else None,
+        )
+    if request.workflow_id == PRESENTATION_V2_WORKFLOW_ID:
+        presentation_brief, presentation_missing = compile_presentation_brief(
+            request.goal,
+            request.spec,
+            request.inputs,
+            output_contract=request.output_contract or ("pptx",),
+        )
+        projection = presentation_brief_projection(
+            presentation_brief,
+            presentation_missing,
+        )
+        return DeliverableBriefOut(
+            schema_version=PRESENTATION_BRIEF_SCHEMA_VERSION,
+            status=projection["status"],
+            missing_fields=list(projection["missing_fields"]),
+            brief_sha256=projection.get("brief_sha256"),
+            brief=(
+                presentation_brief.model_dump(mode="json")
+                if presentation_brief is not None
+                else None
+            ),
+        )
     if request.workflow_id != POSTER_V2_WORKFLOW_ID:
         raise HTTPException(
             status_code=404,
@@ -1845,7 +2006,7 @@ async def submit_deliverable_clarifications(
     if request.version != data.expected_version:
         raise HTTPException(status_code=409, detail="Deliverable request changed; reload before editing")
     workflow = require_workflow(request.work_type, request.workflow_id, request.workflow_version)
-    if workflow.workflow_id != POSTER_V2_WORKFLOW_ID:
+    if workflow.workflow_id not in {POSTER_V2_WORKFLOW_ID, VIDEO_V2_WORKFLOW_ID, PRESENTATION_V2_WORKFLOW_ID}:
         raise HTTPException(
             status_code=422,
             detail={

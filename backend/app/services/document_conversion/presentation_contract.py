@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import json
 import math
 from pathlib import Path
@@ -12,6 +13,10 @@ from urllib.parse import unquote, urlparse
 from bs4 import BeautifulSoup
 
 from app.services.presentation_visual_policy import MINIMUM_PICTURE_COVERAGE_RATIO
+from app.services.source_inventory import (
+    SourceInventoryEntry,
+    reconcile_slide_semantics,
+)
 
 
 _UNRESOLVED_PLACEHOLDER_PATTERNS = (
@@ -234,12 +239,85 @@ def validate_presentation_visible_text(visible_text: str) -> None:
         )
 
 
+def _css_color_rgb(value: Any) -> tuple[int, int, int] | None:
+    """Parse a computed CSS color; unparseable values carry no evidence."""
+
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    match = re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})", normalized)
+    if match:
+        raw = match.group(1)
+        if len(raw) == 3:
+            raw = "".join(character * 2 for character in raw)
+        return tuple(int(raw[index : index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+    match = re.fullmatch(
+        r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*[\d.]+\s*)?\)",
+        normalized,
+    )
+    if match:
+        channels = tuple(int(match.group(index)) for index in (1, 2, 3))
+        if all(channel <= 255 for channel in channels):
+            return channels  # type: ignore[return-value]
+    return None
+
+
+def _relative_luminance(rgb: tuple[int, int, int]) -> float:
+    def channel(value: int) -> float:
+        scaled = value / 255
+        return scaled / 12.92 if scaled <= 0.03928 else ((scaled + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = rgb
+    return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+
+
+def contrast_ratio(foreground: tuple[int, int, int], background: tuple[int, int, int]) -> float:
+    lighter = max(_relative_luminance(foreground), _relative_luminance(background))
+    darker = min(_relative_luminance(foreground), _relative_luminance(background))
+    return round((lighter + 0.05) / (darker + 0.05), 4)
+
+
+def _text_contrast_failure(
+    item: Any,
+    slide: Any,
+    *,
+    minimum_contrast_ratio: float,
+) -> float | None:
+    """Return the measured ratio when it violates the floor, else ``None``.
+
+    Unparseable or missing colors carry no evidence and are skipped rather
+    than guessed.
+    """
+
+    style = item.get("style") or {}
+    foreground = _css_color_rgb(style.get("color"))
+    if foreground is None:
+        return None
+    background = (
+        _css_color_rgb(style.get("backgroundColor"))
+        or _css_color_rgb(slide.get("backgroundColor"))
+        or (255, 255, 255)
+    )
+    ratio = contrast_ratio(foreground, background)
+    if ratio + 1e-9 < minimum_contrast_ratio:
+        return ratio
+    return None
+
+
 def validate_browser_slide_text_bounds(
     layout: dict[str, Any],
     *,
     tolerance_px: float = 2.0,
+    minimum_body_font_size_px: float | None = None,
+    minimum_metadata_font_size_px: float | None = None,
+    minimum_contrast_ratio: float | None = None,
 ) -> None:
-    """Reject editable text that is clipped by a fixed presentation canvas."""
+    """Reject editable text that is clipped by a fixed presentation canvas.
+
+    FR-P4: the v2 deck policy can additionally parameterize font-size floors
+    and a contrast floor.  Defaults keep the historical bounds-only behavior
+    so v1 decks and unmanaged callers are unchanged.
+    """
 
     failures: list[str] = []
     for slide_index, slide in enumerate(layout.get("slides") or [], start=1):
@@ -266,11 +344,45 @@ def validate_browser_slide_text_bounds(
                 )
                 if len(failures) >= 5:
                     break
+            excerpt = " ".join(str(item.get("text") or "").split())[:60]
+            style = item.get("style") or {}
+            font_size_px = _css_pixel_value(style.get("fontSize"))
+            if font_size_px is not None and (
+                minimum_body_font_size_px is not None
+                or minimum_metadata_font_size_px is not None
+            ):
+                is_metadata = (
+                    str(item.get("textRole") or "").strip().lower()
+                    == _METADATA_TEXT_ROLE
+                )
+                floor = (
+                    minimum_metadata_font_size_px
+                    if is_metadata and minimum_metadata_font_size_px is not None
+                    else minimum_body_font_size_px
+                )
+                if floor is not None and font_size_px + 0.01 < floor:
+                    failures.append(
+                        f"slide {slide_index} text is {font_size_px:g}px; "
+                        f"minimum is {floor:g}px: {excerpt}"
+                    )
+            if minimum_contrast_ratio is not None:
+                ratio = _text_contrast_failure(
+                    item,
+                    slide,
+                    minimum_contrast_ratio=minimum_contrast_ratio,
+                )
+                if ratio is not None:
+                    failures.append(
+                        f"slide {slide_index} text contrast {ratio:g}:1 below "
+                        f"{minimum_contrast_ratio:g}:1: {excerpt}"
+                    )
+            if len(failures) >= 5:
+                break
         if len(failures) >= 5:
             break
     if failures:
         raise ValueError(
-            "Presentation browser layout contains clipped editable text: "
+            "Presentation browser layout contains clipped or unreadable editable text: "
             + "; ".join(failures)
         )
 
@@ -280,8 +392,27 @@ def validate_browser_slide_visual_quality(
     *,
     screenshot_key: str | None = None,
     tolerance_px: float = 2.0,
+    minimum_body_font_size_px: float | None = None,
+    minimum_metadata_font_size_px: float | None = None,
+    minimum_contrast_ratio: float | None = None,
 ) -> dict[str, Any]:
-    """Reject known commercial-render defects using measured browser geometry."""
+    """Reject known commercial-render defects using measured browser geometry.
+
+    FR-P4: v2 decks parameterize the font-size floors and add a contrast
+    floor through the server-owned visual policy; defaults preserve the v1
+    behavior exactly.
+    """
+
+    body_font_floor = (
+        _MINIMUM_BODY_FONT_SIZE_PX
+        if minimum_body_font_size_px is None
+        else float(minimum_body_font_size_px)
+    )
+    metadata_font_floor = (
+        _MINIMUM_METADATA_FONT_SIZE_PX
+        if minimum_metadata_font_size_px is None
+        else float(minimum_metadata_font_size_px)
+    )
 
     failures: list[dict[str, Any]] = []
     slides = list(layout.get("slides") or [])
@@ -347,9 +478,9 @@ def validate_browser_slide_visual_quality(
                 )
             if font_size_px is not None:
                 minimum_font_size_px = (
-                    _MINIMUM_METADATA_FONT_SIZE_PX
+                    metadata_font_floor
                     if is_edge_metadata
-                    else _MINIMUM_BODY_FONT_SIZE_PX
+                    else body_font_floor
                 )
                 if font_size_px + 0.01 < minimum_font_size_px:
                     failures.append(
@@ -363,6 +494,27 @@ def validate_browser_slide_visual_quality(
                             "message": (
                                 f"slide {slide_index} text is {font_size_px:g}px; "
                                 f"minimum is {minimum_font_size_px:g}px: {text[:60]}"
+                            ),
+                        }
+                    )
+            if minimum_contrast_ratio is not None:
+                observed_ratio = _text_contrast_failure(
+                    item,
+                    slide,
+                    minimum_contrast_ratio=float(minimum_contrast_ratio),
+                )
+                if observed_ratio is not None:
+                    failures.append(
+                        {
+                            "code": "text_contrast_below_minimum",
+                            "slide": slide_index,
+                            "item": item_index,
+                            "excerpt": text[:80],
+                            "contrast_ratio": observed_ratio,
+                            "minimum_contrast_ratio": float(minimum_contrast_ratio),
+                            "message": (
+                                f"slide {slide_index} text contrast {observed_ratio:g}:1 is below "
+                                f"{float(minimum_contrast_ratio):g}:1: {text[:60]}"
                             ),
                         }
                     )
@@ -495,19 +647,22 @@ def validate_browser_slide_visual_quality(
 
     if failures:
         raise PresentationVisualQualityError(failures)
+    checks = (
+        "render_evidence",
+        "canvas_bounds",
+        "minimum_readable_font_size",
+        "text_container_overflow",
+        "title_orphan_line",
+        "text_overlap",
+    )
+    if minimum_contrast_ratio is not None:
+        checks = (*checks, "text_contrast")
     return {
         "version": 1,
         "gate": "presentation_render_quality",
         "status": "passed",
         "slide_count": len(slides),
-        "checks": (
-            "render_evidence",
-            "canvas_bounds",
-            "minimum_readable_font_size",
-            "text_container_overflow",
-            "title_orphan_line",
-            "text_overlap",
-        ),
+        "checks": checks,
     }
 
 
@@ -632,6 +787,8 @@ def _validate_adaptive_visual_plan(
     expected_page_count: int | None,
     required: bool,
     failures: list[str],
+    source_inventory_entries: Sequence[Mapping[str, Any]] | None = None,
+    semantic_gate: bool = False,
 ) -> None:
     """Validate page-level visual variety without prescribing a fixed template."""
 
@@ -727,6 +884,53 @@ def _validate_adaptive_visual_plan(
         minimum=0,
         failures=failures,
     )
+    # FR-P4 extended adaptive-v1 fields: only validated when present, so
+    # legacy slide_specs without them keep the v1 contract untouched.
+    if raw_policy.get("minimum_body_font_size_px") is not None:
+        _required_float(
+            raw_policy.get("minimum_body_font_size_px"),
+            field="slide_spec.visual_policy.minimum_body_font_size_px",
+            minimum=8.0,
+            maximum=72.0,
+            failures=failures,
+        )
+    if raw_policy.get("minimum_metadata_font_size_px") is not None:
+        _required_float(
+            raw_policy.get("minimum_metadata_font_size_px"),
+            field="slide_spec.visual_policy.minimum_metadata_font_size_px",
+            minimum=6.0,
+            maximum=32.0,
+            failures=failures,
+        )
+    if raw_policy.get("minimum_mean_text_chars_per_slide") is not None:
+        _required_int(
+            raw_policy.get("minimum_mean_text_chars_per_slide"),
+            field="slide_spec.visual_policy.minimum_mean_text_chars_per_slide",
+            minimum=0,
+            failures=failures,
+        )
+    if raw_policy.get("maximum_text_chars_per_slide") is not None:
+        _required_int(
+            raw_policy.get("maximum_text_chars_per_slide"),
+            field="slide_spec.visual_policy.maximum_text_chars_per_slide",
+            minimum=1,
+            failures=failures,
+        )
+    if raw_policy.get("maximum_shapes_per_slide") is not None:
+        _required_int(
+            raw_policy.get("maximum_shapes_per_slide"),
+            field="slide_spec.visual_policy.maximum_shapes_per_slide",
+            minimum=1,
+            failures=failures,
+        )
+    if raw_policy.get("minimum_contrast_ratio") is not None:
+        _required_float(
+            raw_policy.get("minimum_contrast_ratio"),
+            field="slide_spec.visual_policy.minimum_contrast_ratio",
+            minimum=1.0,
+            maximum=21.0,
+            failures=failures,
+        )
     if page_count >= 5:
         required_layouts = min(page_count, max(3, math.ceil(page_count / 2)))
         if minimum_layouts < required_layouts:
@@ -845,6 +1049,23 @@ def _validate_adaptive_visual_plan(
             f"visual_policy requires {minimum_editable_compositions}"
         )
 
+    if semantic_gate:
+        # FR-P2/P5 hard gate (v2 only): every source_ref must resolve to the
+        # registered, hash-bound inventory; every un-labelled fact assertion
+        # must be traceable to it.  A violation fails the conversion before
+        # any PPTX/PDF artifact can exist.
+        entries: list[SourceInventoryEntry] = []
+        for raw_entry in source_inventory_entries or ():
+            if not isinstance(raw_entry, Mapping):
+                continue
+            try:
+                entries.append(SourceInventoryEntry.model_validate(dict(raw_entry)))
+            except ValueError:
+                continue
+        reconciliation = reconcile_slide_semantics(spec_slides, entries)
+        for finding in reconciliation.findings[:10]:
+            failures.append(f"semantic gate: {finding.message}")
+
 
 def _planning_slides(
     value: Any,
@@ -917,6 +1138,8 @@ def _validate_planning_contract(
     slide_spec_file: Path | None,
     require_adaptive_visual_plan: bool,
     failures: list[str],
+    source_inventory_entries: Sequence[Mapping[str, Any]] | None = None,
+    semantic_gate: bool = False,
 ) -> None:
     if (outline_file is None) != (slide_spec_file is None):
         failures.append("outline_path and slide_spec_path must be provided together")
@@ -954,6 +1177,8 @@ def _validate_planning_contract(
         expected_page_count=expected_page_count,
         required=require_adaptive_visual_plan,
         failures=failures,
+        source_inventory_entries=source_inventory_entries,
+        semantic_gate=semantic_gate,
     )
     if expected_page_count is not None and expected_page_count >= 5:
         layouts = {
@@ -1019,8 +1244,14 @@ def validate_presentation_html_contract(
     outline_file: Path | None = None,
     slide_spec_file: Path | None = None,
     require_adaptive_visual_plan: bool = False,
+    source_inventory_entries: Sequence[Mapping[str, Any]] | None = None,
+    semantic_gate: bool = False,
 ) -> None:
-    """Reject incomplete or structurally invalid presentation source files."""
+    """Reject incomplete or structurally invalid presentation source files.
+
+    ``semantic_gate``/``source_inventory_entries`` are the v2-only FR-P2
+    seams; v1 callers never pass them and keep the historical contract.
+    """
 
     if expected_page_count is not None and expected_page_count < 1:
         raise ValueError("expected_page_count must be at least 1")
@@ -1055,6 +1286,8 @@ def validate_presentation_html_contract(
         slide_spec_file=slide_spec_file,
         require_adaptive_visual_plan=require_adaptive_visual_plan,
         failures=failures,
+        source_inventory_entries=source_inventory_entries,
+        semantic_gate=semantic_gate,
     )
 
     missing_images: list[str] = []

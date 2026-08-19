@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import hashlib
 import hmac
 from io import BytesIO
+import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -29,11 +31,17 @@ from app.services.deliverable_quality_gate import (
     creative_quality_gate_required_for_request,
     enforce_deliverable_quality_gate,
 )
+from app.services.document_conversion.font_report import (
+    available_font_families,
+    font_substitution_report,
+    requested_font_families_from_pptx,
+)
 from app.services.document_conversion.presentation_contract import (
     validate_presentation_visible_text,
 )
 from app.services.presentation_visual_policy import (
     MINIMUM_PICTURE_COVERAGE_RATIO,
+    deck_quality_policy,
     presentation_brief_is_image_led,
 )
 from app.services.poster_contract import poster_exact_copy_contract
@@ -93,7 +101,7 @@ class _VerifiedArtifact:
     data: bytes
 
 
-def _pptx_facts(data: bytes) -> dict[str, int | float]:
+def _pptx_facts(data: bytes) -> dict[str, Any]:
     with zipfile.ZipFile(BytesIO(data)) as archive:
         root = ElementTree.fromstring(archive.read("ppt/presentation.xml"))
         slide_names = sorted(
@@ -107,12 +115,15 @@ def _pptx_facts(data: bytes) -> dict[str, int | float]:
         slide_roots = [
             ElementTree.fromstring(archive.read(name)) for name in slide_names
         ]
-        slide_text = " ".join(
-            node.text or ""
+        slide_texts = [
+            " ".join(
+                node.text or ""
+                for node in slide_root.iter()
+                if node.tag.endswith("}t")
+            )
             for slide_root in slide_roots
-            for node in slide_root.iter()
-            if node.tag.endswith("}t")
-        )
+        ]
+        slide_text = " ".join(slide_texts)
     validate_presentation_visible_text(slide_text)
     namespace = {"p": "http://schemas.openxmlformats.org/presentationml/2006/main"}
     slide_ids = root.findall("./p:sldIdLst/p:sldId", namespace)
@@ -130,9 +141,16 @@ def _pptx_facts(data: bytes) -> dict[str, int | float]:
         "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     }
     slide_area = width * height
-    for slide_root in slide_roots:
+    text_chars_by_slide: list[int] = []
+    shape_count_by_slide: list[int] = []
+    for slide_root, slide_text_entry in zip(slide_roots, slide_texts, strict=False):
         picture_count = 0
         picture_area = 0
+        shape_count = 0
+        for element in slide_root.iter():
+            tag = element.tag.rsplit("}", 1)[-1]
+            if tag in {"sp", "pic", "graphicFrame", "grpSp"}:
+                shape_count += 1
         for picture in slide_root.findall(".//p:pic", picture_namespace):
             transform = picture.find("./p:spPr/a:xfrm", picture_namespace)
             if transform is None:
@@ -164,13 +182,19 @@ def _pptx_facts(data: bytes) -> dict[str, int | float]:
         picture_coverage_ratio_by_slide.append(
             round(min(picture_area / slide_area, 1.0), 6)
         )
+        text_chars_by_slide.append(len("".join(slide_text_entry.split())))
+        shape_count_by_slide.append(shape_count)
     while len(picture_count_by_slide) < len(slide_ids):
         # A structurally minimal fixture may declare slide ids without
         # shipping slide XML.  Preserve the existing page-count facts while
         # treating its unobservable picture area as zero.
         picture_count_by_slide.append(0)
         picture_coverage_ratio_by_slide.append(0.0)
+        text_chars_by_slide.append(0)
+        shape_count_by_slide.append(0)
     slide_count = len(slide_ids)
+    # FR-P7: make viewer-side font substitution explicit and auditable.
+    requested_families = requested_font_families_from_pptx(data)
     return {
         "page_count": len(slide_ids),
         "width": width,
@@ -190,6 +214,18 @@ def _pptx_facts(data: bytes) -> dict[str, int | float]:
         "picture_coverage_ratio_mean": round(
             sum(picture_coverage_ratio_by_slide) / slide_count,
             6,
+        ),
+        # FR-P4 density facts: per-slide editable text volume and shape count.
+        "text_chars_by_slide": text_chars_by_slide,
+        "shape_count_by_slide": shape_count_by_slide,
+        "mean_text_chars_per_slide": round(
+            sum(text_chars_by_slide) / slide_count,
+            6,
+        ),
+        "font_families_requested": list(requested_families),
+        "font_substitutions": font_substitution_report(
+            requested_families,
+            available_font_families(),
         ),
     }
 
@@ -216,11 +252,144 @@ def _pdf_facts(data: bytes) -> dict[str, int | float]:
     }
 
 
+def _pptx_slide_texts(data: bytes) -> list[str]:
+    """Per-slide visible text, in slide order, for consistency spot checks."""
+
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        slide_names = sorted(
+            (
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+            ),
+            key=lambda name: int(re.search(r"(\d+)", name).group(1)),
+        )
+        return [
+            " ".join(
+                node.text or ""
+                for node in ElementTree.fromstring(archive.read(name)).iter()
+                if node.tag.endswith("}t")
+            ).strip()
+            for name in slide_names
+        ]
+
+
+def _pdf_blank_page_flags(data: bytes) -> list[bool]:
+    """FR-P8 spot check: a rendered PDF page must not be visually blank.
+
+    Managed presentation PDFs are screenshot pages, so a blank page means the
+    render broke (white/empty capture), not an intentionally quiet slide — the
+    corresponding PPTX slide's text is the cross-check evidence.
+    """
+
+    import fitz
+
+    flags: list[bool] = []
+    with fitz.open(stream=data, filetype="pdf") as document:
+        for page in document:
+            scale = fitz.Matrix(64 / page.rect.width, 36 / page.rect.height)
+            pixmap = page.get_pixmap(matrix=scale, alpha=False)
+            samples = pixmap.samples
+            if not samples:
+                flags.append(True)
+                continue
+            mean = sum(samples) / len(samples)
+            variance = sum((value - mean) ** 2 for value in samples) / len(samples)
+            flags.append(variance < 4.0)
+    return flags
+
+
+def _apply_presentation_v2_deck_gates(
+    request: DeliverableRequest,
+    verified_by_type: Mapping[str, _VerifiedArtifact],
+    facts: dict[str, dict[str, Any]],
+    invalid_types: set[str],
+    deck_slide_spec: Mapping[str, Any] | None,
+) -> None:
+    """FR-P4/P5/P8 v2-only artifact gates; v1 decks never enter this branch.
+
+    All thresholds come from the server-owned deck quality policy, never from
+    agent-authored slide_spec values.
+    """
+
+    if request.workflow_id != "builtin.presentation.v2" or "pptx" not in facts:
+        return
+    pptx_facts = facts["pptx"]
+    if not isinstance(deck_slide_spec, Mapping):
+        # The approved plan is required evidence for every v2 gate.
+        pptx_facts["slide_spec_gate"] = 0
+        invalid_types.add("pptx")
+        return
+    pptx_facts["slide_spec_gate"] = 1
+    policy = deck_quality_policy()
+
+    # FR-P4 information density band: the lower bound is a deck-wide mean (so
+    # title/divider slides stay legal); the upper bounds are per-slide stops.
+    text_chars = [int(value) for value in pptx_facts.get("text_chars_by_slide") or ()]
+    shape_counts = [int(value) for value in pptx_facts.get("shape_count_by_slide") or ()]
+    mean_chars = float(pptx_facts.get("mean_text_chars_per_slide") or 0.0)
+    minimum_mean = float(policy["minimum_mean_text_chars_per_slide"])
+    maximum_chars = int(policy["maximum_text_chars_per_slide"])
+    maximum_shapes = int(policy["maximum_shapes_per_slide"])
+    density_ok = mean_chars + 1e-9 >= minimum_mean
+    density_ok = density_ok and all(chars <= maximum_chars for chars in text_chars)
+    density_ok = density_ok and all(count <= maximum_shapes for count in shape_counts)
+    pptx_facts["density_gate"] = int(density_ok)
+    pptx_facts["minimum_mean_text_chars_per_slide"] = minimum_mean
+    if not density_ok:
+        invalid_types.add("pptx")
+
+    # FR-P5 data pages must stay editable: a data slide may not be a full-page
+    # rasterized picture in the final PPTX.
+    coverage = [float(value) for value in pptx_facts.get("picture_coverage_ratio_by_slide") or ()]
+    spec_slides = deck_slide_spec.get("slides")
+    data_slide_editability_ok = True
+    if isinstance(spec_slides, list):
+        for index, spec_slide in enumerate(spec_slides):
+            if not isinstance(spec_slide, Mapping) or spec_slide.get("data_slide") is not True:
+                continue
+            observed = coverage[index] if index < len(coverage) else 0.0
+            if observed >= 0.9:
+                data_slide_editability_ok = False
+                break
+    pptx_facts["data_slide_editability_gate"] = int(data_slide_editability_ok)
+    if not data_slide_editability_ok:
+        invalid_types.add("pptx")
+
+    # FR-P8: PPTX/PDF consistency spot check, only when the PDF is a verified
+    # contract artifact.  A page with real PPTX text must not render blank in
+    # the PDF; page-count parity above already covers sequence drift.  A
+    # PPTX-only contract never enters this branch, so PDF rendering issues can
+    # never block the default delivery.
+    if "pdf" in facts:
+        pptx_verified = verified_by_type.get("pptx")
+        pdf_verified = verified_by_type.get("pdf")
+        consistency_ok = True
+        if pptx_verified is not None and pdf_verified is not None:
+            try:
+                slide_texts = _pptx_slide_texts(pptx_verified.data)
+                blank_flags = _pdf_blank_page_flags(pdf_verified.data)
+            except Exception:
+                consistency_ok = False
+            else:
+                for index, slide_text in enumerate(slide_texts):
+                    if not slide_text:
+                        continue
+                    if index < len(blank_flags) and blank_flags[index]:
+                        consistency_ok = False
+                        break
+        facts["pdf"]["visual_consistency_gate"] = int(consistency_ok)
+        if not consistency_ok:
+            invalid_types.update(("pptx", "pdf"))
+
+
 def _presentation_contract_facts(
     request: DeliverableRequest,
     verified_by_type: Mapping[str, _VerifiedArtifact],
-) -> tuple[dict[str, dict[str, int | float]], set[str]]:
-    facts: dict[str, dict[str, int | float]] = {}
+    *,
+    deck_slide_spec: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    facts: dict[str, dict[str, Any]] = {}
     invalid_types: set[str] = set()
     inspectors = {"pptx": _pptx_facts, "pdf": _pdf_facts}
     for artifact_type, inspector in inspectors.items():
@@ -261,12 +430,76 @@ def _presentation_contract_facts(
             invalid_types.add("pptx")
             if "pdf" in facts:
                 invalid_types.add("pdf")
+    _apply_presentation_v2_deck_gates(
+        request,
+        verified_by_type,
+        facts,
+        invalid_types,
+        deck_slide_spec,
+    )
     return facts, invalid_types
+
+
+async def _load_presentation_v2_slide_spec(
+    storage: StorageBackend,
+    request: DeliverableRequest,
+) -> Mapping[str, Any] | None:
+    """Read the approved slide_spec evidence for v2 deck acceptance gates."""
+
+    if request.workflow_id != "builtin.presentation.v2":
+        return None
+    path = f"workspace/deliverables/{request.id}/slide_spec.json"
+    try:
+        raw = await storage.read_text(
+            agent_storage_key(request.agent_id, path),
+            encoding="utf-8",
+        )
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+async def _video_v2_first_frame_facts(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    storage: StorageBackend,
+) -> dict[str, tuple[int, int]] | None:
+    """Read approved keyframe dimensions for the v2 first-frame aspect gate."""
+
+    if request.workflow_id != "builtin.video.v2" or request.current_execution_id is None:
+        return None
+    result = await db.execute(
+        select(DeliverableExecutionUnit).where(
+            DeliverableExecutionUnit.tenant_id == request.tenant_id,
+            DeliverableExecutionUnit.execution_id == request.current_execution_id,
+            DeliverableExecutionUnit.stage_key == "keyframe_pack",
+            DeliverableExecutionUnit.status == "succeeded",
+        )
+    )
+    facts: dict[str, tuple[int, int]] = {}
+    from PIL import Image
+
+    for unit in result.scalars().all():
+        keyframe_path = str((unit.result_snapshot or {}).get("keyframe_path") or "")
+        if not keyframe_path:
+            continue
+        try:
+            data = await storage.read_bytes(
+                agent_storage_key(request.agent_id, keyframe_path)
+            )
+            with Image.open(BytesIO(data)) as image:
+                facts[unit.unit_key] = (int(image.width), int(image.height))
+        except Exception:
+            continue
+    return facts
 
 
 async def _video_contract_facts(
     request: DeliverableRequest,
     verified_by_type: Mapping[str, _VerifiedArtifact],
+    *,
+    first_frame_facts: Mapping[str, tuple[int, int]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], set[str]]:
     verified = verified_by_type.get("mp4")
     if verified is None:
@@ -292,21 +525,38 @@ async def _video_contract_facts(
         )
     except (OSError, TypeError, ValueError):
         return {}, {"mp4"}
-    return (
-        {
-            "mp4": {
-                "width": info.width,
-                "height": info.height,
-                "duration_seconds": info.duration_seconds,
-                "video_codec": info.codec_name,
-                "pixel_format": info.pixel_format,
-                "audio_codec": info.audio_codec_name,
-                "fast_start": info.fast_start,
-                "audio_mode": audio_mode,
+    facts: dict[str, Any] = {
+        "width": info.width,
+        "height": info.height,
+        "duration_seconds": info.duration_seconds,
+        "video_codec": info.codec_name,
+        "pixel_format": info.pixel_format,
+        "audio_codec": info.audio_codec_name,
+        "fast_start": info.fast_start,
+        "audio_mode": audio_mode,
+    }
+    if request.workflow_id == "builtin.video.v2":
+        # FR-V6: the managed first-frame chain must be measurable on the final
+        # MP4.  A non-16:9 delivery without an approved same-aspect keyframe is
+        # exactly the "landscape fallback impersonating portrait" failure, so
+        # it fails closed here even when the codec contract passed.
+        aspect_ratio = str(spec.get("aspect_ratio") or "").strip()
+        frame_checks: dict[str, Any] = {}
+        mismatch = False
+        for unit_key, frame_size in (first_frame_facts or {}).items():
+            frame_ratio = frame_size[0] / frame_size[1]
+            video_ratio = info.width / info.height
+            matched = abs(frame_ratio - video_ratio) / video_ratio <= 0.03
+            frame_checks[unit_key] = {
+                "width": frame_size[0],
+                "height": frame_size[1],
+                "aspect_match": matched,
             }
-        },
-        set(),
-    )
+            mismatch = mismatch or not matched
+        facts["first_frame_aspect_match"] = frame_checks
+        if mismatch or (aspect_ratio != "16:9" and not frame_checks):
+            return {"mp4": facts}, {"mp4"}
+    return ({"mp4": facts}, set())
 
 
 def deliverable_artifact_snapshot_key(artifact: DeliverableArtifactRevision) -> str:
@@ -703,6 +953,10 @@ async def reconcile_runtime_deliverable_artifacts(
     # registered as the final artifact.  Shadow mode records reports without
     # changing reconciliation; v1 requests never take this branch.
     poster_v2_failed_candidates: set[str] = set()
+    # FR-I6: once a selection receipt exists, the selected candidate is the
+    # only png this reconciliation may register; other candidates stay
+    # reviewable on the candidate wall but never become the deliverable.
+    poster_v2_selected_candidate: str | None = None
     if (
         request.work_type == "poster"
         and request.workflow_id == "builtin.poster.v2"
@@ -719,6 +973,16 @@ async def reconcile_runtime_deliverable_artifacts(
         poster_v2_failed_candidates = {
             unit.unit_key for unit in failed_qa_result.scalars().all()
         }
+        from app.services.selection_receipts import latest_selection
+
+        selection = await latest_selection(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+            execution_id=request.current_execution_id,
+        )
+        if selection is not None:
+            poster_v2_selected_candidate = selection.selected_unit_key
     verified_by_type: dict[str, _VerifiedArtifact] = {}
     poster_receipt_facts: dict[str, dict[str, str]] = {}
     observed_errors: dict[str, set[str]] = {artifact_type: set() for artifact_type in required_types}
@@ -786,12 +1050,20 @@ async def reconcile_runtime_deliverable_artifacts(
                     )
                     if workspace_path is None:
                         continue
-                    if poster_v2_failed_candidates:
+                    candidate_unit_key: str | None = None
+                    if poster_v2_failed_candidates or poster_v2_selected_candidate:
                         from app.services.prompt_compiler import (
                             poster_v2_candidate_unit_key,
                         )
 
-                        failed_unit_key = poster_v2_candidate_unit_key(workspace_path)
+                        candidate_unit_key = poster_v2_candidate_unit_key(workspace_path)
+                    if candidate_unit_key is not None and poster_v2_selected_candidate:
+                        if candidate_unit_key != poster_v2_selected_candidate:
+                            # A recorded selection makes every other candidate
+                            # ineligible for delivery without marking an error.
+                            continue
+                    if poster_v2_failed_candidates:
+                        failed_unit_key = candidate_unit_key
                         if (
                             failed_unit_key is not None
                             and failed_unit_key in poster_v2_failed_candidates
@@ -892,6 +1164,10 @@ async def reconcile_runtime_deliverable_artifacts(
         contract_facts, contract_invalid_types = _presentation_contract_facts(
             request,
             verified_by_type,
+            deck_slide_spec=await _load_presentation_v2_slide_spec(
+                storage_backend,
+                request,
+            ),
         )
         if (
             contract_facts.get("pptx", {}).get("picture_coverage_gate") == 0
@@ -901,6 +1177,20 @@ async def reconcile_runtime_deliverable_artifacts(
                     artifact_type,
                     "presentation_picture_coverage_below_minimum",
                 )
+        for gate_key, gate_code in (
+            ("slide_spec_gate", "presentation_slide_spec_missing"),
+            ("density_gate", "presentation_density_out_of_band"),
+            ("data_slide_editability_gate", "presentation_data_slide_rasterized"),
+        ):
+            if contract_facts.get("pptx", {}).get(gate_key) == 0:
+                for artifact_type in contract_invalid_types:
+                    failure_codes.setdefault(artifact_type, gate_code)
+        if contract_facts.get("pdf", {}).get("visual_consistency_gate") == 0:
+            for artifact_type in contract_invalid_types:
+                failure_codes.setdefault(
+                    artifact_type,
+                    "presentation_pdf_render_mismatch",
+                )
         for artifact_type in contract_invalid_types:
             observed_errors.setdefault(artifact_type, set()).add("invalid")
             verified_by_type.pop(artifact_type, None)
@@ -908,6 +1198,11 @@ async def reconcile_runtime_deliverable_artifacts(
         contract_facts, contract_invalid_types = await _video_contract_facts(
             request,
             verified_by_type,
+            first_frame_facts=await _video_v2_first_frame_facts(
+                db,
+                request,
+                storage_backend,
+            ),
         )
         for artifact_type in contract_invalid_types:
             observed_errors.setdefault(artifact_type, set()).add("invalid")
@@ -1129,7 +1424,14 @@ async def approve_deliverable_artifacts(
                 f"Artifact {artifact.artifact_key} immutable snapshot is unavailable or invalid",
             )
     if request.work_type == "presentation":
-        _, invalid_types = _presentation_contract_facts(request, verified_by_type)
+        _, invalid_types = _presentation_contract_facts(
+            request,
+            verified_by_type,
+            deck_slide_spec=await _load_presentation_v2_slide_spec(
+                storage_backend,
+                request,
+            ),
+        )
         if invalid_types:
             raise DeliverableArtifactError(
                 "deliverable_artifact_contract_invalid",
@@ -1137,7 +1439,15 @@ async def approve_deliverable_artifacts(
                 + ", ".join(sorted(invalid_types)),
             )
     elif request.work_type == "video":
-        _, invalid_types = await _video_contract_facts(request, verified_by_type)
+        _, invalid_types = await _video_contract_facts(
+            request,
+            verified_by_type,
+            first_frame_facts=await _video_v2_first_frame_facts(
+                db,
+                request,
+                storage_backend,
+            ),
+        )
         if invalid_types:
             raise DeliverableArtifactError(
                 "deliverable_artifact_contract_invalid",
@@ -1151,11 +1461,183 @@ async def approve_deliverable_artifacts(
     return selected
 
 
+async def rebind_poster_selection_artifact(
+    db: AsyncSession,
+    *,
+    request: DeliverableRequest,
+    selected_unit_key: str,
+    now: datetime | None = None,
+    storage: StorageBackend | None = None,
+) -> DeliverableArtifactRevision:
+    """FR-I6: re-point the deliverable png at a user-selected QA-passed candidate.
+
+    The candidate bytes are re-verified from storage and must match the
+    QA-bound SHA-256 recorded on the candidate unit; the rebound artifact is a
+    new immutable revision in the same lineage, never an in-place rewrite.
+    """
+
+    if request.workflow_id != "builtin.poster.v2" or request.current_execution_id is None:
+        raise DeliverableArtifactError(
+            "deliverable_selection_not_available",
+            "Candidate re-selection requires a v2 poster request",
+        )
+    unit_result = await db.execute(
+        select(DeliverableExecutionUnit).where(
+            DeliverableExecutionUnit.tenant_id == request.tenant_id,
+            DeliverableExecutionUnit.execution_id == request.current_execution_id,
+            DeliverableExecutionUnit.stage_key == "candidate_generate",
+            DeliverableExecutionUnit.unit_key == selected_unit_key,
+        )
+    )
+    unit = unit_result.scalar_one_or_none()
+    snapshot = (
+        dict(unit.result_snapshot)
+        if unit is not None and isinstance(unit.result_snapshot, Mapping)
+        else {}
+    )
+    candidate_path = str(snapshot.get("candidate_artifact_path") or "")
+    expected_sha256 = str(snapshot.get("artifact_sha256") or "")
+    if not candidate_path or len(expected_sha256) != 64:
+        raise DeliverableArtifactError(
+            "deliverable_selection_artifact_missing",
+            f"Candidate {selected_unit_key} has no verified artifact to select",
+        )
+    revisions_result = await db.execute(
+        select(DeliverableArtifactRevision)
+        .where(
+            DeliverableArtifactRevision.tenant_id == request.tenant_id,
+            DeliverableArtifactRevision.request_id == request.id,
+            DeliverableArtifactRevision.artifact_key == "png",
+        )
+        .order_by(DeliverableArtifactRevision.revision_number.desc())
+        .with_for_update()
+    )
+    revisions = tuple(revisions_result.scalars().all())
+    latest = revisions[0] if revisions else None
+    if (
+        latest is not None
+        and latest.status == "candidate"
+        and latest.workspace_path == candidate_path
+        and latest.content_hash == expected_sha256
+    ):
+        return latest
+
+    storage_backend = storage or get_storage_backend()
+    verified, error = await _verify_storage_artifact(
+        storage_backend,
+        agent_id=request.agent_id,
+        artifact_type="png",
+        workspace_path=candidate_path,
+        tool_call_id="selection_rebind",
+    )
+    if error is not None or verified is None or verified.content_hash != expected_sha256:
+        raise DeliverableArtifactError(
+            "deliverable_selection_artifact_changed",
+            f"Candidate {selected_unit_key} artifact changed or became unavailable",
+        )
+    # The selected candidate's own tool execution carries the poster-v3 copy
+    # receipt; re-derive the facts instead of trusting another candidate's.
+    receipt_facts: dict[str, Any] = {}
+    _blocks, expected_digest = poster_exact_copy_contract(request.spec)
+    tool_result = await db.execute(
+        select(AgentToolExecution)
+        .where(
+            AgentToolExecution.tenant_id == request.tenant_id,
+            AgentToolExecution.agent_id == request.agent_id,
+            AgentToolExecution.tool_name == "generate_image_minimax",
+            AgentToolExecution.status == "succeeded",
+        )
+        .order_by(AgentToolExecution.completed_at.desc().nullslast())
+        .limit(50)
+    )
+    for tool_execution in tool_result.scalars().all():
+        refs = _artifact_refs(tool_execution)
+        if not any(
+            _workspace_artifact_path(
+                reference,
+                agent_id=request.agent_id,
+                request_id=request.id,
+                artifact_type="png",
+            )
+            == candidate_path
+            for reference in refs
+        ):
+            continue
+        derived = _poster_copy_receipt_facts(
+            request,
+            tool_execution,
+            expected_digest=expected_digest,
+        )
+        if derived is None:
+            raise DeliverableArtifactError(
+                "deliverable_poster_copy_receipt_mismatch",
+                "Selected candidate has no receipt for the persisted exact-copy contract",
+            )
+        receipt_facts = derived
+        break
+    else:
+        if expected_digest:
+            raise DeliverableArtifactError(
+                "deliverable_poster_copy_receipt_mismatch",
+                "Selected candidate has no receipt for the persisted exact-copy contract",
+            )
+
+    timestamp = now or datetime.now(UTC)
+    artifact = DeliverableArtifactRevision(
+        id=uuid.uuid4(),
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        parent_revision_id=latest.id if latest is not None else None,
+        execution_id=request.current_execution_id,
+        unit_id=unit.id if unit is not None else None,
+        artifact_key="png",
+        artifact_type="png",
+        stage_key="selection",
+        unit_key=selected_unit_key,
+        workspace_path=verified.workspace_path,
+        mime_type=MIME_BY_TYPE.get("png"),
+        content_hash=verified.content_hash,
+        size_bytes=verified.size_bytes,
+        revision_number=(latest.revision_number + 1) if latest is not None else 1,
+        status="candidate",
+        evaluation={
+            "version": 1,
+            "verified": True,
+            "verification_level": "contract",
+            "source": "candidate_selection_rebind",
+            "tool_call_id": "selection_rebind",
+            "checks": [
+                "tenant_scope",
+                "agent_scope",
+                "request_path",
+                "storage_file",
+                "file_signature",
+                "aspect_ratio",
+                "immutable_snapshot",
+                "selection_hash_binding",
+            ],
+            "facts": receipt_facts,
+            "selection": {
+                "selected_unit_key": selected_unit_key,
+                "rebound_at": timestamp.isoformat(),
+            },
+        },
+    )
+    await _ensure_immutable_snapshot(storage_backend, artifact=artifact, data=verified.data)
+    for prior in revisions:
+        if prior.status == "candidate":
+            prior.status = "superseded"
+    db.add(artifact)
+    await db.flush()
+    return artifact
+
+
 __all__ = [
     "DeliverableArtifactError",
     "DeliverableArtifactReconciliation",
     "approve_deliverable_artifacts",
     "deliverable_artifact_snapshot_key",
+    "rebind_poster_selection_artifact",
     "read_deliverable_artifact_snapshot",
     "reconcile_runtime_deliverable_artifacts",
 ]

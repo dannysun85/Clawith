@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 import hashlib
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from typing import Any
 import unicodedata
 import warnings
 
@@ -2207,6 +2209,159 @@ async def compose_video_audio_tracks(
         ),
         fast_start=output_info.fast_start,
     )
+
+
+async def concat_shots(
+    clips: Sequence[bytes],
+    *,
+    label: str = "Shot clip",
+) -> tuple[bytes, dict[str, Any]]:
+    """Concatenate approved shot clips into one browser-safe MP4.
+
+    This is deterministic post-production, not another generative provider
+    request.  Every clip must share the same canvas; audio is kept only when
+    every clip carries a track (the in-scene-dialogue chain), otherwise the
+    package stays silent and a later compose step adds voiceover/music.
+    """
+
+    clips = tuple(clips)
+    if len(clips) < 2:
+        raise MediaContractError("Shot concatenation requires at least two clips")
+    infos = []
+    for index, clip in enumerate(clips, start=1):
+        infos.append(
+            await validate_generated_video(
+                clip,
+                label=f"{label} {index}",
+                require_browser_safe=False,
+            )
+        )
+    canvases = {(info.width, info.height) for info in infos}
+    if len(canvases) != 1:
+        raise MediaContractError(
+            "Shot clips must share one canvas before concatenation: "
+            + ", ".join(sorted(f"{width}x{height}" for width, height in canvases))
+        )
+    with_audio = all(info.audio_codec_name for info in infos)
+    total_duration = sum(info.duration_seconds for info in infos)
+
+    with tempfile.TemporaryDirectory(prefix="astra-video-concat-") as temp_dir:
+        root = Path(temp_dir)
+        list_path = root / "concat.txt"
+        entries: list[str] = []
+        for index, clip in enumerate(clips):
+            clip_path = root / f"shot_{index:02d}.mp4"
+            clip_path.write_bytes(clip)
+            entries.append(f"file '{clip_path.name}'")
+        list_path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+        output_path = root / "output.mp4"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-map",
+            "0:v:0",
+        ]
+        if with_audio:
+            command.extend(["-map", "0:a:0"])
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if with_audio:
+            command.extend(["-c:a", "aac", "-b:a", "192k"])
+        else:
+            command.append("-an")
+        command.extend(["-movflags", "+faststart", str(output_path)])
+        await _run_process(
+            *command,
+            timeout=600,
+            label="Shot concatenation",
+        )
+        if not output_path.is_file():
+            raise MediaContractError("Shot concatenation did not create an output")
+        result = output_path.read_bytes()
+
+    output_info = await validate_generated_video(
+        result,
+        label="Shot concatenation output",
+    )
+    receipt: dict[str, Any] = {
+        "mode": "concat",
+        "shot_count": len(clips),
+        "shot_sha256": [hashlib.sha256(clip).hexdigest() for clip in clips],
+        "audio_retained": with_audio,
+        "output_duration_seconds": output_info.duration_seconds,
+        "expected_duration_seconds": round(total_duration, 3),
+        "output_width": output_info.width,
+        "output_height": output_info.height,
+        "fast_start": output_info.fast_start,
+    }
+    return result, receipt
+
+
+async def extract_video_cover_frame(
+    raw: bytes,
+    *,
+    label: str = "Video cover frame",
+) -> tuple[bytes, dict[str, Any]]:
+    """Extract the first frame of a finished MP4 as a deterministic JPEG cover.
+
+    Purely local post-production: no Provider call, and the input must already
+    be a valid browser-safe MP4 (the composed package).
+    """
+
+    info = await validate_generated_video(raw, label=f"{label} source")
+    with tempfile.TemporaryDirectory(prefix="astra-video-cover-") as temp_dir:
+        root = Path(temp_dir)
+        input_path = root / "input.mp4"
+        output_path = root / "cover.jpg"
+        input_path.write_bytes(raw)
+        await _run_process(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vf",
+            "select=eq(n\\,0)",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            str(output_path),
+            timeout=120,
+            label=label,
+        )
+        if not output_path.is_file():
+            raise MediaContractError(f"{label} extraction did not create an output")
+        cover = output_path.read_bytes()
+    receipt: dict[str, Any] = {
+        "mode": "first_frame",
+        "source_duration_seconds": info.duration_seconds,
+        "source_width": info.width,
+        "source_height": info.height,
+        "cover_sha256": hashlib.sha256(cover).hexdigest(),
+    }
+    return cover, receipt
 
 
 async def apply_video_brand_overlays(

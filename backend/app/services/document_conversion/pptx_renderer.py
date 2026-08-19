@@ -68,6 +68,12 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             require_adaptive_visual_plan=bool(
                 arguments.get("_require_adaptive_visual_plan")
             ),
+            source_inventory_entries=(
+                arguments.get("_source_inventory_entries")
+                if isinstance(arguments.get("_source_inventory_entries"), list)
+                else None
+            ),
+            semantic_gate=bool(arguments.get("_semantic_gate")),
         )
         soup = BeautifulSoup(html_content, "html.parser")
 
@@ -667,9 +673,16 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                 if render_mode == "hybrid_editable"
                 else None
             )
+            # FR-P4: v2 decks thread the server-owned font/contrast floors
+            # through conversion arguments; unmanaged calls keep the v1 floors.
+            quality_policy = arguments.get("_visual_quality_policy")
+            quality_policy = quality_policy if isinstance(quality_policy, dict) else {}
             validate_browser_slide_visual_quality(
                 browser_layout or {},
                 screenshot_key=screenshot_key,
+                minimum_body_font_size_px=quality_policy.get("minimum_body_font_size_px"),
+                minimum_metadata_font_size_px=quality_policy.get("minimum_metadata_font_size_px"),
+                minimum_contrast_ratio=quality_policy.get("minimum_contrast_ratio"),
             )
         if browser_layout:
             for value in browser_layout.get("screenshots") or []:

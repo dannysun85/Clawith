@@ -57,6 +57,7 @@ from app.services.media_assets import (
     validate_video_delivery_contract,
 )
 from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
+from app.services.storyboard import reconcile_pending_video_v2_deliverables
 
 
 ACTIVE_MEDIA_STATUSES = (
@@ -1455,6 +1456,8 @@ async def create_minimax_video_task_record(
     output_path: str,
     request_metadata: dict,
     provider: str = "minimax",
+    deliverable_execution_id: uuid.UUID | None = None,
+    deliverable_unit_id: uuid.UUID | None = None,
 ) -> MediaGenerationTask:
     """Create the durable row before asking the paid provider to start work."""
     normalized_provider = _media_provider_slug(provider)
@@ -1499,6 +1502,8 @@ async def create_minimax_video_task_record(
             credential_id=credential_id,
             reservation_id=reservation.id if reservation else None,
             origin_session_id=validated_session_id,
+            deliverable_execution_id=deliverable_execution_id,
+            deliverable_unit_id=deliverable_unit_id,
             provider=normalized_provider,
             modality="video",
             model=model,
@@ -4342,21 +4347,24 @@ async def start_media_generation_daemon() -> None:
             backfilled = await backfill_legacy_minimax_video_tasks()
             reconciled = await reconcile_pending_media_generation_tasks()
             published = await publish_pending_media_completion_events()
+            video_v2_units = await reconcile_pending_video_v2_deliverables()
             expired_brand_assets = await cleanup_expired_video_brand_assets()
             expired_sync_assets = await cleanup_expired_sync_recovery_assets()
             if (
                 backfilled
                 or reconciled
                 or published
+                or video_v2_units
                 or expired_brand_assets
                 or expired_sync_assets
             ):
                 logger.info(
                     "[media] reconciliation complete backfilled={} reconciled={} published={} "
-                    "expired_brand_assets={} expired_sync_assets={}",
+                    "video_v2_units={} expired_brand_assets={} expired_sync_assets={}",
                     backfilled,
                     reconciled,
                     published,
+                    video_v2_units,
                     expired_brand_assets,
                     expired_sync_assets,
                 )

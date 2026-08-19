@@ -6,6 +6,7 @@ import io
 import json
 import sys
 import types
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,7 @@ async def _render_managed_presentation_pdf(
     design_width_px: int,
     design_height_px: int,
     expected_page_count: int,
+    visual_quality_policy: Mapping[str, Any] | None = None,
 ) -> None:
     """Render managed slide decks from screen-layout screenshots.
 
@@ -101,9 +103,13 @@ async def _render_managed_presentation_pdf(
         "visual",
         1.0,
     )
+    policy = visual_quality_policy or {}
     validate_browser_slide_visual_quality(
         layout or {},
         screenshot_key="screenshots",
+        minimum_body_font_size_px=policy.get("minimum_body_font_size_px"),
+        minimum_metadata_font_size_px=policy.get("minimum_metadata_font_size_px"),
+        minimum_contrast_ratio=policy.get("minimum_contrast_ratio"),
     )
     screenshot_paths = [
         Path(str(path))
@@ -194,11 +200,18 @@ async def convert_html_to_pdf(src_file: Path, tgt_file: Path, target_path: str, 
             require_adaptive_visual_plan=bool(
                 arguments.get("_require_adaptive_visual_plan")
             ),
+            source_inventory_entries=(
+                arguments.get("_source_inventory_entries")
+                if isinstance(arguments.get("_source_inventory_entries"), list)
+                else None
+            ),
+            semantic_gate=bool(arguments.get("_semantic_gate")),
         )
         tgt_file.parent.mkdir(parents=True, exist_ok=True)
         design_w_px = int(arguments.get("design_width") or 1280)
         design_h_px = int(arguments.get("design_height") or 720)
         mode = str(arguments.get("pdf_mode") or "pages").lower()
+        quality_policy = arguments.get("_visual_quality_policy")
         if expected_page_count is not None and mode == "pages":
             await _render_managed_presentation_pdf(
                 src_file,
@@ -206,6 +219,9 @@ async def convert_html_to_pdf(src_file: Path, tgt_file: Path, target_path: str, 
                 design_width_px=design_w_px,
                 design_height_px=design_h_px,
                 expected_page_count=expected_page_count,
+                visual_quality_policy=(
+                    quality_policy if isinstance(quality_policy, Mapping) else None
+                ),
             )
             _validate_pdf_page_count(tgt_file, expected_page_count)
             return (

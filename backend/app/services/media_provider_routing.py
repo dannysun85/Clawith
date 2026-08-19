@@ -14,6 +14,7 @@ from app.services.media_daily_allowance import (
     DailyMediaAllowanceExhausted,
     claim_minimax_video_allowance,
 )
+from app.services.minimax_media_profiles import MINIMAX_VIDEO_ALLOWED_QUALITY
 from app.services.volcengine_agent_plan import (
     PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
     RETIRING_VIDEO_MODELS,
@@ -23,6 +24,7 @@ from app.services.volcengine_agent_plan import (
     normalize_base_url as normalize_volcengine_agent_plan_base_url,
     plan_tier_supports_modality,
     resolve_visual_profile,
+    video_model_capabilities,
 )
 
 
@@ -176,6 +178,34 @@ def minimax_video_requires_first_frame(
         str(aspect_ratio or "").strip() != "16:9"
         and first_frame_image is None
     )
+
+
+def minimax_video_supported_durations(tier: str) -> frozenset[int]:
+    """Return the exact delivery durations the MiniMax route can honor.
+
+    MiniMax video is billed in fixed per-tier duration buckets.  A request
+    outside the reviewed set cannot be honored exactly and must fail over to a
+    capable route instead of being silently shortened.
+    """
+
+    allowed = MINIMAX_VIDEO_ALLOWED_QUALITY.get(str(tier or "").strip().lower())
+    if not allowed:
+        allowed = MINIMAX_VIDEO_ALLOWED_QUALITY["lite"]
+    return frozenset(duration for duration, _resolution in allowed)
+
+
+def video_route_max_duration_seconds(provider: str, model: str | None) -> int | None:
+    """Return the reviewed duration ceiling of one prepared video route.
+
+    The MiniMax ceiling is tier-scoped and therefore answered by
+    ``minimax_video_supported_durations`` instead; this helper covers the
+    model-scoped Agent Plan Seedance capability matrix.
+    """
+
+    normalized = str(provider or "").strip().lower()
+    if normalized == VOLCENGINE_AGENT_PLAN_PROVIDER and model:
+        return video_model_capabilities(model).max_duration_seconds
+    return None
 
 
 def volcengine_video_quota_model(model: str, resolution: str | None) -> str:
@@ -384,8 +414,10 @@ __all__ = [
     "media_provider_order_for_image_strategy",
     "media_provider_order_for_modality",
     "minimax_video_requires_first_frame",
+    "minimax_video_supported_durations",
     "normalize_image_execution_strategy",
     "prepare_media_provider",
     "validate_media_route_policy",
+    "video_route_max_duration_seconds",
     "volcengine_video_quota_model",
 ]

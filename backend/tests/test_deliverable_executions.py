@@ -588,7 +588,17 @@ def _candidate_qa_harness(request: DeliverableRequest, image_bytes: bytes):
             assert key == agent_storage_key(request.agent_id, versioned_path)
             return image_bytes
 
-    db = _Session(execution, candidate_units, [tool_execution])
+    db = _Session(
+        execution,
+        candidate_units,
+        [tool_execution],
+        # FR-I6 auto-selection seam: execution lookup, receipt idempotency
+        # check, unit reload, and the per-candidate cost ledger query.
+        execution,
+        None,
+        candidate_units,
+        [],
+    )
     return db, run_id, candidate_units, _FakeStorage()
 
 
@@ -636,6 +646,13 @@ async def test_poster_v2_candidate_qa_binds_hash_report_in_shadow_mode(
     assert qa_unit.status == "pending"
     assert generate_unit.status == "succeeded"
     assert generate_unit.result_snapshot["artifact_sha256"] == expected_sha
+    # FR-I6: the QA pass also recorded the default selection receipt once.
+    from app.models.deliverable import DeliverableSelectionReceipt
+
+    selections = [item for item in db.added if isinstance(item, DeliverableSelectionReceipt)]
+    assert len(selections) == 1
+    assert selections[0].actor == "auto"
+    assert selections[0].selected_unit_key == "candidate-01"
 
 
 @pytest.mark.asyncio
@@ -675,3 +692,7 @@ async def test_poster_v2_candidate_qa_enforcing_fails_bad_candidates(
     assert qa_unit.status == "failed"
     assert qa_unit.last_error_code == "candidate_qa_failed"
     assert qa_unit.quality_evaluation["enforcement"] == "enforcing"
+    # FR-I6: enforcing mode never auto-selects a QA-failed candidate.
+    from app.models.deliverable import DeliverableSelectionReceipt
+
+    assert not any(isinstance(item, DeliverableSelectionReceipt) for item in db.added)

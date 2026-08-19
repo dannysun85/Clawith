@@ -317,6 +317,23 @@ class Settings(BaseSettings):
     DELIVERABLE_POSTER_V2_ENABLED: bool = False
     DELIVERABLE_POSTER_V2_TENANT_IDS: str = ""
     DELIVERABLE_POSTER_V2_AGENT_IDS: str = ""
+    # Video v2 (storyboard approval + per-shot units) follows the same canary
+    # pattern: the global switch stays false and both allowlists stay empty so
+    # the v1 video contract remains the only default pipeline.
+    DELIVERABLE_VIDEO_V2_ENABLED: bool = False
+    DELIVERABLE_VIDEO_V2_TENANT_IDS: str = ""
+    DELIVERABLE_VIDEO_V2_AGENT_IDS: str = ""
+    # Presentation v2 (source inventory + outline approval + semantic QA)
+    # follows the same canary pattern: the global switch stays false and both
+    # allowlists stay empty so the v1 presentation contract remains the only
+    # default pipeline.
+    DELIVERABLE_PRESENTATION_V2_ENABLED: bool = False
+    DELIVERABLE_PRESENTATION_V2_TENANT_IDS: str = ""
+    DELIVERABLE_PRESENTATION_V2_AGENT_IDS: str = ""
+    # Master switch for non-final stage approvals (storyboard/outline).  Even
+    # when enabled, stage approvals only apply to v2 requests; v1 requests keep
+    # the final-only 409 compatibility branch.
+    DELIVERABLE_STAGE_APPROVALS_ENABLED: bool = False
     # Automated candidate QA defaults to shadow (reports only, no lifecycle
     # effect); "enforcing" applies only to allowlisted tenants/Agents.
     DELIVERABLE_CREATIVE_QA_ENFORCEMENT: str = "shadow"

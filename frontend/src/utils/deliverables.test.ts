@@ -7,6 +7,8 @@ import {
     deliverableLaunchMessage,
     deliverableLaunchUsesIsolatedInputs,
     deliverableRouteTier,
+    isDeliverableAwaitingContinuation,
+    isDeliverableStageVisible,
     latestPendingDeliverable,
     latestTrackedDeliverables,
     nextDeliverableComposerText,
@@ -256,6 +258,41 @@ describe('deliverable composer selection', () => {
         }))).toBe(false);
     });
 
+    it('launches the v2 video pipeline only with its exact version pair', () => {
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '2.0.0',
+            work_type: 'video',
+            output_contract: ['mp4'],
+        }))).toBe(true);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '1.0.0',
+            work_type: 'video',
+            output_contract: ['mp4'],
+        }))).toBe(false);
+    });
+
+    it('launches the v2 video pipeline only with its exact version pair', () => {
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '2.0.0',
+            work_type: 'video',
+            output_contract: ['mp4'],
+        }))).toBe(true);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '1.0.0',
+            work_type: 'video',
+        }))).toBe(false);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '2.0.0',
+            work_type: 'video',
+            status: 'running',
+        }))).toBe(false);
+    });
+
     it('restores only the newest non-dismissed ready request', () => {
         const running = request({ id: 'running', status: 'running', agent_run_id: 'run-1' });
         const dismissed = request({ id: 'dismissed' });
@@ -286,6 +323,65 @@ describe('deliverable composer selection', () => {
             video,
         ]).map((item) => item.id)).toEqual(['new-ppt', 'video']);
         expect(latestTrackedDeliverables([ready, cancelled])).toEqual([]);
+    });
+
+    it('keeps a parked v2 video stage visible and re-arms the composer after the first send', () => {
+        const dismissed = new Set(['video-v2']);
+        const approved = request({
+            id: 'video-v2',
+            work_type: 'video',
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '2.0.0',
+            status: 'ready',
+            current_stage: 'storyboard_approved',
+            agent_run_id: null,
+            output_contract: ['mp4'],
+        });
+        const shotReview = request({
+            ...approved,
+            current_stage: 'shot_review',
+        });
+        const composeReady = request({
+            ...approved,
+            current_stage: 'compose_ready',
+        });
+
+        expect(isDeliverableAwaitingContinuation(approved)).toBe(true);
+        expect(isDeliverableAwaitingContinuation(shotReview)).toBe(false);
+        expect(isDeliverableStageVisible(shotReview)).toBe(true);
+        expect(latestPendingDeliverable([approved], dismissed)?.id).toBe('video-v2');
+        expect(latestTrackedDeliverables([approved]).map((item) => item.id)).toEqual(['video-v2']);
+        expect(latestTrackedDeliverables([shotReview]).map((item) => item.id)).toEqual(['video-v2']);
+        expect(deliverableLaunchMessage(approved, true)).toContain('逐镜头制作');
+        expect(deliverableLaunchMessage(composeReady, false)).toContain('Assemble the completed shots');
+        expect(requestCanLaunchFromComposer(approved)).toBe(true);
+    });
+
+    it('drives the v2 presentation outline gate from the composer', () => {
+        const approved = request({
+            id: 'ppt-v2',
+            work_type: 'presentation',
+            workflow_id: 'builtin.presentation.v2',
+            workflow_version: '2.0.0',
+            status: 'ready',
+            current_stage: 'outline_approved',
+            agent_run_id: null,
+            output_contract: ['pptx'],
+        });
+
+        expect(requestCanLaunchFromComposer(approved)).toBe(true);
+        expect(requestCanLaunchFromComposer(request({
+            ...approved,
+            workflow_version: '1.0.0',
+        }))).toBe(false);
+        expect(isDeliverableAwaitingContinuation(approved)).toBe(true);
+        expect(isDeliverableAwaitingContinuation(request({
+            ...approved,
+            current_stage: 'outline_review',
+            status: 'waiting_approval',
+        }))).toBe(false);
+        expect(deliverableLaunchMessage(approved, true)).toContain('已批准的大纲');
+        expect(deliverableLaunchMessage(approved, false)).toContain('approved outline');
     });
 
     it('builds equivalent Chinese and English launch copy from the persisted goal', () => {

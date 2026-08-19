@@ -26,6 +26,7 @@ from app.services.media_provider_routing import media_provider_order_for_modalit
 from app.services.tool_visibility import tool_enabled_for_agent
 from app.services.volcengine_agent_plan import (
     PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    VIDEO_MODEL_CAPABILITIES,
     plan_tier_supports_modality,
 )
 
@@ -140,6 +141,30 @@ def media_route_capability_status(
         None,
         "按当前工作合同执行；供应商选择由平台托管。",
     )
+
+
+def video_providers_with_native_audio(
+    available_providers: set[str] | list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """FR-V1: providers that can honor in-scene synchronized dialogue.
+
+    The capability matrix is the source of truth: Seedance models declare
+    ``supports_generate_audio``; MiniMax Hailuo has no native audio track, so
+    an in-scene-dialogue brief must never be routed there.
+    """
+
+    providers = {
+        str(provider or "").strip().lower()
+        for provider in available_providers
+        if str(provider or "").strip()
+    }
+    capable: list[str] = []
+    if VOLCENGINE_AGENT_PLAN_PROVIDER in providers and any(
+        capabilities.supports_generate_audio
+        for capabilities in VIDEO_MODEL_CAPABILITIES.values()
+    ):
+        capable.append(VOLCENGINE_AGENT_PLAN_PROVIDER)
+    return tuple(capable)
 
 
 def _credential_media_modalities(credential: LLMCredential) -> set[str]:

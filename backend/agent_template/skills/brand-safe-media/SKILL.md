@@ -120,6 +120,10 @@ claim lip sync unless it came from an audio-capable provider route and passed vi
 receipt is the verification source for the final workspace path, H.264/AAC codecs, dimensions, duration and browser
 safety. Do not call `read_file` or `read_document` on the resulting MP4; those tools intentionally reject binary media.
 
+When the brief exceeds a single shot's duration, request the target duration directly (routing picks a route whose
+model supports it and fails closed rather than silently shortening) or generate same-canvas shots and merge them with
+`concat_videos` before any `compose_video_audio` mix.
+
 ## Copy rules
 
 - User supplied exact copy: pass the same Unicode characters and line breaks to `overlay_text`.

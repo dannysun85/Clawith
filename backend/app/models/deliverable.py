@@ -1009,3 +1009,81 @@ class DeliverableQualityReviewEvidence(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class DeliverableSelectionReceipt(Base):
+    """Immutable candidate-selection receipt for one execution (FR-I6).
+
+    The default selection is automatic (highest-scoring QA-passed candidate);
+    a user may re-select another QA-passed candidate at output review through
+    the existing approvals API.  Every receipt is idempotent via
+    ``client_selection_id`` and binds the per-candidate scores, artifact
+    hashes, and Credits facts at decision time.
+    """
+
+    __tablename__ = "deliverable_selection_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "actor IN ('auto', 'user')",
+            name="ck_deliverable_selection_receipts_actor",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["deliverable_requests.tenant_id", "deliverable_requests.id"],
+            name="fk_deliverable_selection_receipts_tenant_request",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "request_id",
+            "client_selection_id",
+            name="uq_deliverable_selection_receipts_client",
+        ),
+        Index(
+            "ix_deliverable_selection_receipts_request_created",
+            "request_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", name="fk_deliverable_selection_receipts_tenant", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_deliverable_selection_receipts_execution",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            name="fk_deliverable_selection_receipts_actor",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    selected_unit_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    candidate_scores: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    selection_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    cost_breakdown: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    actor: Mapped[str] = mapped_column(String(24), nullable=False)
+    client_selection_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

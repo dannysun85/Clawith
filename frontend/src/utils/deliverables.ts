@@ -9,6 +9,8 @@ const COMPOSER_LAUNCHABLE_WORKFLOWS = new Set([
     'builtin.presentation.v1@1.0.0',
     'builtin.video.v1@1.0.0',
     'builtin.poster.v2@2.0.0',
+    'builtin.video.v2@2.0.0',
+    'builtin.presentation.v2@2.0.0',
 ]);
 
 const WORK_TASK_TO_DELIVERABLE_TYPE: Partial<Record<string, DeliverableWorkType>> = {
@@ -156,6 +158,42 @@ export function requestCanLaunchFromComposer(request: DeliverableRequest): boole
         );
 }
 
+const VIDEO_V2_COMPOSER_CONTINUATION_STAGES = new Set([
+    'storyboard_approved',
+    'compose_ready',
+]);
+
+const PRESENTATION_V2_COMPOSER_CONTINUATION_STAGES = new Set([
+    'outline_approved',
+]);
+
+/**
+ * A parked stage that still needs one more chat message to continue.
+ *
+ * v2 video clears `agent_run_id` after each short stage so the next message
+ * can attach the same request. `shot_review` is excluded: the user must pick
+ * failed shots in the review card before a revision becomes launchable. The
+ * v2 presentation pipeline parks the same way after outline approval.
+ */
+export function isDeliverableAwaitingContinuation(request: DeliverableRequest): boolean {
+    if (request.status !== 'ready' || request.agent_run_id !== null) return false;
+    if (request.current_stage === 'revision_ready') return true;
+    if (request.workflow_id === 'builtin.video.v2'
+        && VIDEO_V2_COMPOSER_CONTINUATION_STAGES.has(request.current_stage)) return true;
+    return request.workflow_id === 'builtin.presentation.v2'
+        && PRESENTATION_V2_COMPOSER_CONTINUATION_STAGES.has(request.current_stage);
+}
+
+/** Keep the in-stream review card visible while a v2 video stage is parked. */
+export function isDeliverableStageVisible(request: DeliverableRequest): boolean {
+    if (request.status === 'cancelled') return false;
+    if (request.agent_run_id !== null) return true;
+    if (isDeliverableAwaitingContinuation(request)) return true;
+    return request.workflow_id === 'builtin.video.v2'
+        && request.status === 'ready'
+        && request.current_stage === 'shot_review';
+}
+
 export function deliverableRouteTier(
     request: DeliverableRequest | null | undefined,
     fallback: DeliverableRequest['tier'] | null | undefined,
@@ -178,6 +216,8 @@ export function latestPendingDeliverable(
     requests: DeliverableRequest[],
     dismissedRequestIds: ReadonlySet<string>,
 ): DeliverableRequest | null {
+    const continuation = requests.find(isDeliverableAwaitingContinuation);
+    if (continuation) return continuation;
     return requests.find((request) => (
         request.status === 'ready'
         && request.agent_run_id === null
@@ -191,11 +231,7 @@ export function latestTrackedDeliverables(
 ): DeliverableRequest[] {
     const latestByWorkType = new Map<DeliverableRequest['work_type'], DeliverableRequest>();
     for (const request of requests) {
-        if (
-            request.agent_run_id === null
-            || request.status === 'cancelled'
-            || latestByWorkType.has(request.work_type)
-        ) {
+        if (!isDeliverableStageVisible(request) || latestByWorkType.has(request.work_type)) {
             continue;
         }
         latestByWorkType.set(request.work_type, request);
@@ -204,6 +240,26 @@ export function latestTrackedDeliverables(
 }
 
 export function deliverableLaunchMessage(request: DeliverableRequest, isChinese: boolean): string {
+    if (request.workflow_id === 'builtin.video.v2' && request.current_stage === 'storyboard_approved') {
+        return isChinese
+            ? `请按照已批准的分镜开始逐镜头制作：${request.goal}`
+            : `Start per-shot production from the approved storyboard: ${request.goal}`;
+    }
+    if (request.workflow_id === 'builtin.video.v2' && request.current_stage === 'compose_ready') {
+        return isChinese
+            ? `请将已完成的镜头合成为最终成片：${request.goal}`
+            : `Assemble the completed shots into the final video: ${request.goal}`;
+    }
+    if (request.workflow_id === 'builtin.presentation.v2' && request.current_stage === 'outline_approved') {
+        return isChinese
+            ? `请按照已批准的大纲开始制作演示文稿：${request.goal}`
+            : `Start building the deck from the approved outline: ${request.goal}`;
+    }
+    if (request.current_stage === 'revision_ready') {
+        return isChinese
+            ? `请只重做需要修改的部分，其余内容沿用当前版本：${request.goal}`
+            : `Redo only the requested changes; keep the rest of the current version: ${request.goal}`;
+    }
     return isChinese
         ? `请按照已确认的工作说明开始制作：${request.goal}`
         : `Start from the confirmed work brief: ${request.goal}`;

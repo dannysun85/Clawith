@@ -9,7 +9,7 @@ suffix="${USER//[^a-zA-Z0-9_]/_}_$$"
 db_name="clawith_g11_purge_${suffix}"
 partial_db_name="${db_name}_partial"
 storage_root="$(mktemp -d "${TMPDIR:-/tmp}/clawith-g11-purge.XXXXXX")"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-creative_brief_receipts}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-deliverable_selection_receipts}"
 
 cleanup() {
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"

@@ -397,6 +397,21 @@ class DeliverableApprovalReceiptOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DeliverableSelectionReceiptOut(BaseModel):
+    id: uuid.UUID
+    execution_id: uuid.UUID
+    selected_unit_key: str
+    candidate_scores: list[dict[str, Any]]
+    selection_reason: str
+    cost_breakdown: dict[str, Any]
+    actor: Literal["auto", "user"]
+    actor_user_id: uuid.UUID | None = None
+    client_selection_id: uuid.UUID
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DeliverableExecutionOut(BaseModel):
     id: uuid.UUID
     request_id: uuid.UUID
@@ -426,6 +441,7 @@ class DeliverableExecutionOut(BaseModel):
     updated_at: datetime
     units: list[DeliverableExecutionUnitOut] = Field(default_factory=list)
     approvals: list[DeliverableApprovalReceiptOut] = Field(default_factory=list)
+    selections: list[DeliverableSelectionReceiptOut] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 

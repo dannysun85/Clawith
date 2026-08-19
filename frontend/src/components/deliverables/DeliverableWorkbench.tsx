@@ -88,6 +88,9 @@ function preflightReasonLabel(reason: string, isZh: boolean) {
         video_post_production_tool_unavailable: ['当前数字员工缺少视频后期工具', 'The Agent lacks a video post-production tool'],
         workflow_execution_not_enabled: ['该工作流尚未开放执行', 'Workflow execution is not enabled'],
         deliverable_poster_v2_not_allowlisted: ['多候选图片流程尚未对该账号开放', 'The multi-candidate image pipeline is not enabled for this account'],
+        deliverable_video_v2_not_allowlisted: ['分镜视频流程尚未对该账号开放', 'The storyboard-gated video pipeline is not enabled for this account'],
+        deliverable_presentation_v2_not_allowlisted: ['大纲审批 PPT 流程尚未对该账号开放', 'The outline-gated presentation pipeline is not enabled for this account'],
+        audio_mode_route_mismatch: ['镜头内同步对白需要具备原生音轨能力的线路，请改用旁白或静音模式', 'In-scene dialogue needs a native-audio route; switch to voiceover or silent'],
     };
     if (reason.startsWith('brief_missing:')) {
         const field = reason.slice('brief_missing:'.length);
@@ -110,6 +113,11 @@ const BRIEF_FIELD_LABELS: Record<string, [string, string]> = {
     reference_assets: ['参考素材', 'Reference assets'],
     redraw_scope: ['允许重绘范围', 'Redraw scope'],
     prohibitions: ['禁止项', 'Prohibitions'],
+    duration: ['总时长', 'Duration'],
+    language: ['语言', 'Language'],
+    story: ['故事与镜头要求', 'Story and shots'],
+    audio_mode: ['声音模式', 'Audio mode'],
+    dialogue_script: ['对白脚本', 'Dialogue script'],
 };
 
 function deliverableErrorLabel(code: string, isZh: boolean) {
@@ -885,7 +893,38 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         setVideoPreviewError(false);
     }, [previewArtifactUrl]);
     const awaitingReview = request.status === 'waiting_approval' && request.current_stage === 'output_review';
+    const storyboardReview = request.workflow_id === 'builtin.video.v2'
+        && request.status === 'waiting_approval'
+        && request.current_stage === 'storyboard_review';
+    const shotReview = request.workflow_id === 'builtin.video.v2'
+        && request.status === 'ready'
+        && request.current_stage === 'shot_review';
+    const composeReady = request.workflow_id === 'builtin.video.v2'
+        && request.status === 'ready'
+        && request.current_stage === 'compose_ready';
+    const storyboardApproved = request.workflow_id === 'builtin.video.v2'
+        && request.status === 'ready'
+        && request.current_stage === 'storyboard_approved';
+    const isPresentationV2 = request.workflow_id === 'builtin.presentation.v2';
+    const outlineReview = isPresentationV2
+        && request.status === 'waiting_approval'
+        && request.current_stage === 'outline_review';
+    const outlineApproved = isPresentationV2
+        && request.status === 'ready'
+        && request.current_stage === 'outline_approved';
     const approvalBlocked = deliverableApprovalBlocked(request);
+    // FR-P7: font substitutions recorded on the latest deck artifact, shown
+    // during output review so a viewer-side fallback is never a surprise.
+    const fontSubstitutions = (() => {
+        const deck = artifacts.find((artifact) => artifact.artifact_type === 'pptx');
+        const facts = deck?.evaluation?.facts;
+        if (!facts || typeof facts !== 'object') return [];
+        const entries = (facts as Record<string, unknown>).font_substitutions;
+        if (!Array.isArray(entries)) return [];
+        return entries
+            .map((entry) => (entry && typeof entry === 'object' ? entry as Record<string, unknown> : null))
+            .filter((entry): entry is Record<string, unknown> => Boolean(entry));
+    })();
     const managedReviewRequired = Boolean(
         awaitingReview && request.approval_readiness?.quality_gate_required,
     );
@@ -910,6 +949,63 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
             .map((unit) => [unit.unit_key, unit]),
     );
     const showCandidateWall = request.workflow_id === 'builtin.poster.v2' && candidateWallUnits.length > 0;
+    // FR-I6: the recorded selection (receipt, else the selection unit's
+    // snapshot) marks which candidate the delivery will ship.
+    const selectedCandidateKey = (() => {
+        const receipts = currentExecution?.selections || [];
+        if (receipts.length > 0) return receipts[receipts.length - 1].selected_unit_key;
+        const selectionUnit = (currentExecution?.units || []).find((unit) => unit.stage_key === 'selection');
+        const key = selectionUnit?.result_snapshot?.selected_unit_key;
+        return typeof key === 'string' && key ? key : '';
+    })();
+    const isVideoV2 = request.workflow_id === 'builtin.video.v2';
+    const shotTimelineUnits = isVideoV2
+        ? uniqueRevisionUnits(currentExecution?.units || []).filter((unit) => /^shot-\d+$/.test(unit.unit_key))
+        : [];
+    const shotStageByKey = new Map<string, Record<string, DeliverableExecutionUnit['status']>>();
+    if (isVideoV2) {
+        for (const unit of currentExecution?.units || []) {
+            if (!/^shot-\d+$/.test(unit.unit_key)) continue;
+            const stages = shotStageByKey.get(unit.unit_key) || {};
+            stages[unit.stage_key] = unit.status;
+            shotStageByKey.set(unit.unit_key, stages);
+        }
+    }
+    const shotQaByKey = new Map(
+        (currentExecution?.units || [])
+            .filter((unit) => unit.stage_key === 'shot_qa')
+            .map((unit) => [unit.unit_key, unit]),
+    );
+    const storyboardUnit = isVideoV2
+        ? (currentExecution?.units || []).find((unit) => unit.stage_key === 'storyboard')
+        : undefined;
+    const storyboardShots = (() => {
+        const payload = storyboardUnit?.result_snapshot?.storyboard;
+        if (!payload || typeof payload !== 'object') return [];
+        const shots = (payload as { shots?: unknown }).shots;
+        if (!Array.isArray(shots)) return [];
+        return shots
+            .map((shot) => (shot && typeof shot === 'object' ? shot as Record<string, unknown> : null))
+            .filter((shot): shot is Record<string, unknown> => Boolean(shot));
+    })();
+    const outlineUnit = isPresentationV2
+        ? (currentExecution?.units || []).find((unit) => unit.stage_key === 'outline')
+        : undefined;
+    const outlineSlides = (() => {
+        const payload = outlineUnit?.result_snapshot?.outline;
+        if (!payload || typeof payload !== 'object') return [];
+        const slides = (payload as { slides?: unknown }).slides;
+        if (!Array.isArray(slides)) return [];
+        return slides
+            .map((slide) => (slide && typeof slide === 'object' ? slide as Record<string, unknown> : null))
+            .filter((slide): slide is Record<string, unknown> => Boolean(slide));
+    })();
+    const outlineClaim = (() => {
+        const payload = outlineUnit?.result_snapshot?.outline;
+        if (!payload || typeof payload !== 'object') return '';
+        const claim = (payload as { one_sentence_claim?: unknown }).one_sentence_claim;
+        return typeof claim === 'string' ? claim : '';
+    })();
     const unitProgress = (currentExecution?.units || []).reduce(
         (summary, unit) => {
             summary.total += 1;
@@ -926,6 +1022,48 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                 title: isZh ? '正在生成交付文件' : 'Creating your deliverables',
                 description: isZh ? '完成后可在这里预览和下载' : 'Preview and download the files here when ready',
                 step: 0,
+            };
+        }
+        if (storyboardReview) {
+            return {
+                title: isZh ? '分镜待批准' : 'Storyboard awaiting approval',
+                description: isZh ? '批准分镜后才开始付费生成；批准前零费用' : 'Paid generation starts only after you approve the storyboard',
+                step: 1,
+            };
+        }
+        if (outlineReview) {
+            return {
+                title: isZh ? '大纲待批准' : 'Outline awaiting approval',
+                description: isZh ? '批准大纲后才开始排版制作；批准前零费用' : 'Production starts only after you approve the outline',
+                step: 1,
+            };
+        }
+        if (outlineApproved) {
+            return {
+                title: isZh ? '大纲已批准' : 'Outline approved',
+                description: isZh ? '发送聊天消息开始制作演示文稿' : 'Send a chat message to start building the deck',
+                step: 1,
+            };
+        }
+        if (storyboardApproved) {
+            return {
+                title: isZh ? '分镜已批准' : 'Storyboard approved',
+                description: isZh ? '发送聊天消息开始逐镜头制作，此时才会产生费用' : 'Send a chat message to start per-shot production; spend starts then',
+                step: 1,
+            };
+        }
+        if (shotReview) {
+            return {
+                title: isZh ? '部分镜头需要重做' : 'Some shots need a redo',
+                description: isZh ? '只有失败镜头会重新计费，已通过镜头保持不变' : 'Only failed shots are re-billed; completed shots are kept',
+                step: 0,
+            };
+        }
+        if (composeReady) {
+            return {
+                title: isZh ? '镜头已全部完成' : 'All shots are complete',
+                description: isZh ? '发送聊天消息继续合成最终成片' : 'Send a chat message to assemble the final video',
+                step: 1,
             };
         }
         if (request.status === 'failed') {
@@ -1022,6 +1160,74 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         }
     };
 
+    // FR-I6: re-selecting another QA-passed candidate is the same idempotent
+    // approval action carrying that candidate as its target unit.
+    const selectCandidateAndApprove = async (unitKey: string) => {
+        setActing('approve');
+        try {
+            const updated = await deliverableApi.approval(request.id, {
+                expected_version: request.version,
+                client_action_id: approvalActionIdRef.current,
+                stage: 'final',
+                action: 'approve',
+                target_units: [unitKey],
+            });
+            onUpdated(updated);
+            toast.success(isZh ? '已按所选方案确认交付' : 'Delivery confirmed with the selected candidate');
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            toast.error(isZh ? '候选改选失败' : 'Candidate re-selection failed', { details: message });
+        } finally {
+            setActing(null);
+        }
+    };
+
+    const approveStoryboard = async () => {
+        setActing('approve');
+        try {
+            const updated = await deliverableApi.approval(request.id, {
+                expected_version: request.version,
+                client_action_id: approvalActionIdRef.current,
+                stage: 'storyboard',
+                action: 'approve',
+            });
+            onUpdated(updated);
+            toast.success(
+                isZh
+                    ? '分镜已批准，发送消息即可开始逐镜头制作'
+                    : 'Storyboard approved; send the message to start per-shot production',
+            );
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            toast.error(isZh ? '分镜审批失败' : 'Storyboard approval failed', { details: message });
+        } finally {
+            setActing(null);
+        }
+    };
+
+    const approveOutline = async () => {
+        setActing('approve');
+        try {
+            const updated = await deliverableApi.approval(request.id, {
+                expected_version: request.version,
+                client_action_id: approvalActionIdRef.current,
+                stage: 'outline',
+                action: 'approve',
+            });
+            onUpdated(updated);
+            toast.success(
+                isZh
+                    ? '大纲已批准，发送消息即可开始制作'
+                    : 'Outline approved; send the message to start production',
+            );
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            toast.error(isZh ? '大纲审批失败' : 'Outline approval failed', { details: message });
+        } finally {
+            setActing(null);
+        }
+    };
+
     const submitRevision = async () => {
         const instruction = revisionInstruction.trim();
         if (instruction.length < 3) {
@@ -1037,7 +1243,9 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
             const updated = await deliverableApi.approval(request.id, {
                 expected_version: request.version,
                 client_action_id: revisionActionRef.current.id,
-                stage: 'final',
+                // Storyboard/outline and shot reviews post their own stage so
+                // the server can keep v1 final-review semantics untouched.
+                stage: storyboardReview ? 'storyboard' : outlineReview ? 'outline' : 'final',
                 action: 'request_changes',
                 instruction,
                 target_units: selectedRevisionUnits,
@@ -1283,9 +1491,19 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         {candidateWallUnits.map((unit) => {
                             const qaUnit = candidateQaByKey.get(unit.unit_key);
                             const qa = qaUnit?.qa_summary;
+                            const isSelected = selectedCandidateKey === unit.unit_key;
+                            const canSelect = awaitingReview
+                                && !approvalBlocked
+                                && !isSelected
+                                && qa?.status === 'passed';
                             return (
                                 <div key={unit.unit_key} className="deliverable-candidate-card" data-status={unit.status}>
-                                    <strong>{revisionUnitLabel(unit.unit_key, isZh)}</strong>
+                                    <strong>
+                                        {revisionUnitLabel(unit.unit_key, isZh)}
+                                        {isSelected && (
+                                            <small>{isZh ? ' · 当前选择' : ' · selected'}</small>
+                                        )}
+                                    </strong>
                                     <small>{unit.status}</small>
                                     {qa && (
                                         <small title={qa.artifact_sha256 || undefined}>
@@ -1295,9 +1513,100 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                                             {qa.artifact_sha256 ? ` · #${qa.artifact_sha256.slice(0, 8)}` : ''}
                                         </small>
                                     )}
+                                    {canSelect && (
+                                        <button
+                                            type="button"
+                                            className="btn btn-secondary"
+                                            disabled={acting !== null}
+                                            onClick={() => void selectCandidateAndApprove(unit.unit_key)}
+                                        >
+                                            {isZh ? '选此方案交付' : 'Deliver this candidate'}
+                                        </button>
+                                    )}
                                 </div>
                             );
                         })}
+                    </div>
+                </section>
+            )}
+            {isVideoV2 && shotTimelineUnits.length > 0 && (
+                <section className="deliverable-candidate-wall" aria-label={isZh ? '逐镜头时间线' : 'Shot timeline'}>
+                    <header>
+                        <strong>{isZh ? `逐镜头时间线（${shotTimelineUnits.length}）` : `Shot timeline (${shotTimelineUnits.length})`}</strong>
+                    </header>
+                    <div className="deliverable-candidate-wall__grid">
+                        {shotTimelineUnits.map((unit) => {
+                            const stages = shotStageByKey.get(unit.unit_key) || {};
+                            const qa = shotQaByKey.get(unit.unit_key)?.qa_summary;
+                            const shotStatus = stages.shot_generate || unit.status;
+                            return (
+                                <div key={unit.unit_key} className="deliverable-candidate-card" data-status={shotStatus}>
+                                    <strong>{revisionUnitLabel(unit.unit_key, isZh)}</strong>
+                                    <small>
+                                        {(isZh ? '首帧：' : 'keyframe: ') + (stages.keyframe_pack || '—')}
+                                        {' · '}
+                                        {(isZh ? '镜头：' : 'clip: ') + shotStatus}
+                                    </small>
+                                    {qa && (
+                                        <small title={qa.artifact_sha256 || undefined}>
+                                            {isZh ? '镜头 QA：' : 'Shot QA: '}
+                                            {qa.status ?? '—'}
+                                            {typeof qa.score === 'number' ? ` · ${qa.score}` : ''}
+                                            {qa.artifact_sha256 ? ` · #${qa.artifact_sha256.slice(0, 8)}` : ''}
+                                        </small>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </section>
+            )}
+            {storyboardReview && (
+                <section className="deliverable-candidate-wall" aria-label={isZh ? '分镜审批' : 'Storyboard review'}>
+                    <header>
+                        <strong>{isZh ? '分镜待批准' : 'Storyboard awaiting approval'}</strong>
+                        <small>
+                            {isZh
+                                ? '批准前不会产生任何生成费用；批准后发送消息开始逐镜头制作。'
+                                : 'No generation spend happens before approval; send the message after approving to start per-shot production.'}
+                        </small>
+                    </header>
+                    <div className="deliverable-candidate-wall__grid">
+                        {storyboardShots.map((shot, index) => (
+                            <div key={String(shot.shot_id || index)} className="deliverable-candidate-card">
+                                <strong>{String(shot.shot_id || `shot-${index + 1}`)}</strong>
+                                <small>{`${String(shot.duration_seconds ?? '—')}s`}</small>
+                                <small>{String(shot.visual || '')}</small>
+                                {Boolean(shot.caption) && <small>{isZh ? `字幕：${String(shot.caption)}` : `Caption: ${String(shot.caption)}`}</small>}
+                                {Boolean(shot.dialogue) && <small>{isZh ? `对白：${String(shot.dialogue)}` : `Dialogue: ${String(shot.dialogue)}`}</small>}
+                            </div>
+                        ))}
+                    </div>
+                </section>
+            )}
+            {outlineReview && (
+                <section className="deliverable-candidate-wall" aria-label={isZh ? '大纲审批' : 'Outline review'}>
+                    <header>
+                        <strong>{isZh ? '大纲待批准' : 'Outline awaiting approval'}</strong>
+                        <small>
+                            {isZh
+                                ? '批准前不会排版或产生任何费用；事实断言必须可溯源或标注为假设。'
+                                : 'No rendering or spend happens before approval; fact assertions must be sourced or labelled as assumptions.'}
+                        </small>
+                    </header>
+                    {outlineClaim && (
+                        <small>
+                            {isZh ? `一句话主张：${outlineClaim}` : `Core claim: ${outlineClaim}`}
+                        </small>
+                    )}
+                    <div className="deliverable-candidate-wall__grid">
+                        {outlineSlides.map((slide, index) => (
+                            <div key={String(slide.slide_id || index)} className="deliverable-candidate-card">
+                                <strong>{String(slide.slide_id || `slide-${index + 1}`)}</strong>
+                                <small>{String(slide.headline || '')}</small>
+                                <small>{String(slide.purpose || '')}</small>
+                            </div>
+                        ))}
                     </div>
                 </section>
             )}
@@ -1348,6 +1657,17 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                             <small>{artifact.artifact_type.toUpperCase()}</small>
                         </a>
                     ))}
+                </div>
+            )}
+            {fontSubstitutions.length > 0 && (
+                <div className="deliverable-review-card__notice" role="status">
+                    <IconAlertCircle size={16} />
+                    <span>
+                        {isZh ? '字体替换：' : 'Font substitutions: '}
+                        {fontSubstitutions
+                            .map((entry) => `${String(entry.requested)} → ${String(entry.actual)}`)
+                            .join('；')}
+                    </span>
                 </div>
             )}
             {request.status === 'failed' && request.last_error_code && (
@@ -1482,7 +1802,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     {isZh ? '暂时无法读取质量检查，请稍后重试。' : 'Quality review is temporarily unavailable. Please try again.'}
                 </div>
             )}
-            {awaitingReview && revisionOpen && (
+            {(awaitingReview || storyboardReview || shotReview || outlineReview) && revisionOpen && (
                 <section className="deliverable-revision-form" aria-label={isZh ? '创建修订版本' : 'Create revision'}>
                     <div>
                         <strong>{isZh ? '说明需要修改的内容' : 'Describe the requested changes'}</strong>
@@ -1576,6 +1896,86 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                             {acting === 'approve' ? (isZh ? '正在确认…' : 'Confirming…') : (isZh ? '确认交付' : 'Confirm delivery')}
                         </button>
                     )}
+                </div>
+            )}
+            {storyboardReview && (
+                <div className="deliverable-review-card__actions">
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={acting !== null}
+                        onClick={() => setRevisionOpen((open) => !open)}
+                    >
+                        {revisionOpen
+                            ? (isZh ? '收起修改说明' : 'Hide revision form')
+                            : (isZh ? '提出修改' : 'Request changes')}
+                    </button>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={acting !== null}
+                        onClick={() => void approveStoryboard()}
+                    >
+                        {acting === 'approve'
+                            ? (isZh ? '正在批准…' : 'Approving…')
+                            : (isZh ? '批准分镜并开始制作' : 'Approve storyboard')}
+                    </button>
+                </div>
+            )}
+            {outlineReview && (
+                <div className="deliverable-review-card__actions">
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={acting !== null}
+                        onClick={() => setRevisionOpen((open) => !open)}
+                    >
+                        {revisionOpen
+                            ? (isZh ? '收起修改说明' : 'Hide revision form')
+                            : (isZh ? '提出修改' : 'Request changes')}
+                    </button>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={acting !== null}
+                        onClick={() => void approveOutline()}
+                    >
+                        {acting === 'approve'
+                            ? (isZh ? '正在批准…' : 'Approving…')
+                            : (isZh ? '批准大纲并开始制作' : 'Approve outline')}
+                    </button>
+                </div>
+            )}
+            {shotReview && (
+                <div className="deliverable-review-card__actions">
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={acting !== null}
+                        onClick={() => setRevisionOpen((open) => !open)}
+                    >
+                        {revisionOpen
+                            ? (isZh ? '收起修改说明' : 'Hide revision form')
+                            : (isZh ? '重做失败镜头' : 'Redo failed shots')}
+                    </button>
+                </div>
+            )}
+            {(storyboardApproved || composeReady) && (
+                <div className="deliverable-review-card__actions">
+                    <small>
+                        {storyboardApproved
+                            ? (isZh ? '分镜已批准，发送聊天消息即可开始逐镜头制作。' : 'Storyboard approved; send a chat message to start per-shot production.')
+                            : (isZh ? '全部镜头已完成，发送聊天消息继续合成成片。' : 'All shots are complete; send a chat message to assemble the final video.')}
+                    </small>
+                </div>
+            )}
+            {outlineApproved && (
+                <div className="deliverable-review-card__actions">
+                    <small>
+                        {isZh
+                            ? '大纲已批准，发送聊天消息即可开始制作演示文稿。'
+                            : 'Outline approved; send a chat message to start building the deck.'}
+                    </small>
                 </div>
             )}
         </section>

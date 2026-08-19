@@ -14,7 +14,7 @@ v4.0.0.
 
 - This Skill guides work; it does not grant a Tool or a Seedance entitlement.
 - Use only `generate_video_minimax`, `check_video_minimax`,
-  `generate_speech_minimax`, `generate_music_minimax`, and
+  `generate_speech_minimax`, `generate_music_minimax`, `concat_videos`, and
   `compose_video_audio`. Astra chooses the provider and keeps an accepted task
   pinned to that provider.
 - Never pass, display, or request an API key. Never run the upstream
@@ -98,6 +98,22 @@ path from the image Tool receipt. Do not pass the shortened attachment label
 such as `images/...`. If the receipt is unavailable, confirm the path with a
 read-only workspace listing first. Never discover a bad path by repeatedly
 calling the paid video Tool.
+
+## Duration and multi-shot assembly
+
+- Request the target duration directly in `generate_video_minimax`. Routing
+  selects a healthy route whose model supports it (the Seedance 2.0 family
+  accepts up to 15 seconds); when no route supports the requested duration the
+  Tool fails closed with `media_video_duration_exceeds_route_capability` and
+  zero Credits instead of silently shortening the video. Never accept a
+  shorter clip as a substitute for the requested duration.
+- For a brief longer than any available single-shot duration, split it into
+  same-aspect shots, generate each shot with `generate_video_minimax`, then
+  merge the completed workspace clips with `concat_videos` in playback order.
+  Every shot must share one canvas; mismatched resolutions fail closed instead
+  of being rescaled. `concat_videos` retains audio only when every clip
+  carries a track; add narration or music afterwards with
+  `compose_video_audio`.
 
 ## Write a timed shot plan
 

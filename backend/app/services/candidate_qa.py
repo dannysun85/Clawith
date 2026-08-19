@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 import hashlib
 from io import BytesIO
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -34,23 +35,34 @@ from app.models.deliverable import (
     DeliverableExecutionUnit,
     DeliverableRequest,
 )
+from app.services.creative_briefs import (
+    VIDEO_V2_WORKFLOW_ID,
+    compile_video_brief,
+)
 from app.services.creative_evidence_collection import (
     _prepare_ocr_variants,
     parse_tesseract_tsv,
 )
 from app.services.media_assets import (
     MediaContractError,
+    _run_process,
     validate_generated_image,
+    validate_generated_video,
     validate_image_delivery_contract,
+    validate_video_delivery_contract,
 )
 from app.services.poster_contract import poster_exact_copy_blocks
 from app.services.prompt_compiler import poster_v2_candidate_unit_key
+from app.services.selection_receipts import ensure_auto_selection
 from app.services.storage import agent_storage_key, get_storage_backend
 
 
 QA_SCHEMA_VERSION = "candidate-qa-v1"
+VIDEO_QA_SCHEMA_VERSION = "shot-qa-v1"
+PACKAGE_QA_SCHEMA_VERSION = "package-qa-v1"
 
 _QA_IMAGE_TOOLS = ("generate_image_minimax",)
+_QA_VIDEO_COMPOSE_TOOLS = ("compose_video_audio",)
 
 
 class CandidateQaCheck(BaseModel):
@@ -344,8 +356,13 @@ def qa_summary_from_evaluation(evaluation: object) -> dict[str, Any] | None:
 
     if not isinstance(evaluation, Mapping):
         return None
-    report = evaluation.get("candidate_qa")
-    if not isinstance(report, Mapping):
+    report = None
+    for key in ("candidate_qa", "shot_qa", "package_qa", "semantic_qa"):
+        candidate = evaluation.get(key)
+        if isinstance(candidate, Mapping):
+            report = candidate
+            break
+    if report is None:
         return None
     checks = [
         {"name": str(check.get("name")), "status": str(check.get("status"))}
@@ -541,17 +558,511 @@ async def evaluate_poster_v2_candidates(
                     elif report.status == "passed" and qa_unit.status in {"pending", "running"}:
                         qa_unit.status = "succeeded"
                         qa_unit.completed_at = now
+    # FR-I6: once candidate QA reports exist, record the default selection
+    # receipt (highest-scoring QA-passed candidate).  The receipt is
+    # idempotent per execution and never overrides a user's earlier choice.
+    if reports:
+        await ensure_auto_selection(
+            db,
+            request=request,
+            enforcement=enforcement,
+            now=now,
+        )
     await db.flush()
     return tuple(reports)
 
 
+_BLACK_DETECT_RE = re.compile(
+    r"black_start:(?P<start>\d+(?:\.\d+)?)\s+black_end:(?P<end>\d+(?:\.\d+)?)"
+)
+
+
+async def _black_frame_intervals(data: bytes) -> tuple[tuple[float, float], ...]:
+    """Detect sustained black frames; caller checks tool availability first."""
+
+    with tempfile.TemporaryDirectory(prefix="shot-qa-black-") as temp_dir:
+        input_path = Path(temp_dir) / "input.mp4"
+        input_path.write_bytes(data)
+        _stdout, stderr = await _run_process(
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(input_path),
+            "-vf",
+            "blackdetect=d=0.1:pix_th=0.10",
+            "-an",
+            "-f",
+            "null",
+            "-",
+            timeout=120,
+            label="Shot black-frame detection",
+        )
+    text = stderr.decode("utf-8", errors="replace")
+    return tuple(
+        (float(match.group("start")), float(match.group("end")))
+        for match in _BLACK_DETECT_RE.finditer(text)
+    )
+
+
+async def _extract_video_frames(
+    data: bytes,
+    duration_seconds: float,
+    *,
+    limit: int = 3,
+) -> tuple[bytes, ...]:
+    """Extract up to ``limit`` frames (start/middle/end) for OCR evidence."""
+
+    duration = max(float(duration_seconds), 0.2)
+    candidates = [0.0, duration / 2, max(duration - 0.2, 0.0)]
+    times = sorted({round(min(max(point, 0.0), duration), 2) for point in candidates})[:limit]
+    frames: list[bytes] = []
+    with tempfile.TemporaryDirectory(prefix="shot-qa-frames-") as temp_dir:
+        input_path = Path(temp_dir) / "input.mp4"
+        input_path.write_bytes(data)
+        for index, offset in enumerate(times):
+            frame_path = Path(temp_dir) / f"frame_{index}.png"
+            await _run_process(
+                "ffmpeg",
+                "-hide_banner",
+                "-ss",
+                f"{offset:.2f}",
+                "-i",
+                str(input_path),
+                "-frames:v",
+                "1",
+                "-f",
+                "image2",
+                str(frame_path),
+                timeout=90,
+                label="Shot frame extraction",
+            )
+            frames.append(frame_path.read_bytes())
+    return tuple(frames)
+
+
+def _first_frame_dimensions(data: bytes) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(data)) as image:
+            return int(image.width), int(image.height)
+    except (OSError, ValueError):
+        return None
+
+
+async def evaluate_video_shot(
+    *,
+    data: bytes,
+    unit_key: str,
+    artifact_path: str,
+    expected_aspect_ratio: str | None = None,
+    expected_duration_seconds: int | float | None = None,
+    require_audio: bool = False,
+    expected_copy_texts: Sequence[str] = (),
+    prohibited_terms: Sequence[str] = (),
+    first_frame_bytes: bytes | None = None,
+    expected_languages: Sequence[str] = ("zh-CN", "en-US"),
+    schema_version: str = VIDEO_QA_SCHEMA_VERSION,
+) -> CandidateQaReport:
+    """FR-V7: provider-free shot/package QA, hash-bound to the exact bytes.
+
+    Duration uses a shot-level tolerance because provider routes quantize clip
+    lengths; the strict ±5% delivery contract stays on the final MP4 in
+    ``deliverable_artifacts``.
+    """
+
+    checks: list[CandidateQaCheck] = []
+    artifact_sha256 = hashlib.sha256(data).hexdigest()
+
+    info = None
+    probe_available = shutil.which("ffprobe") is not None
+    if not probe_available:
+        checks.append(
+            CandidateQaCheck(
+                name="artifact_decodable",
+                status="unavailable",
+                evidence=("ffprobe_unavailable",),
+            )
+        )
+    else:
+        try:
+            info = await validate_generated_video(
+                data,
+                label=f"Shot {unit_key}",
+                require_browser_safe=True,
+            )
+            checks.append(
+                CandidateQaCheck(
+                    name="artifact_decodable",
+                    status="passed",
+                    evidence=(
+                        f"decoded {info.width}x{info.height} "
+                        f"{info.duration_seconds:.2f}s {info.codec_name}/{info.pixel_format}",
+                    ),
+                )
+            )
+        except MediaContractError as exc:
+            checks.append(
+                CandidateQaCheck(
+                    name="artifact_decodable",
+                    status="failed",
+                    evidence=(str(exc)[:200],),
+                )
+            )
+
+    if info is not None:
+        try:
+            validate_video_delivery_contract(
+                info,
+                expected_aspect_ratio=expected_aspect_ratio,
+                require_audio=require_audio,
+            )
+            checks.append(
+                CandidateQaCheck(
+                    name="delivery_contract",
+                    status="passed",
+                    evidence=(
+                        f"aspect/audio contract holds for {expected_aspect_ratio}"
+                        f"{' with audio' if require_audio else ''}",
+                    ),
+                )
+            )
+        except MediaContractError as exc:
+            checks.append(
+                CandidateQaCheck(
+                    name="delivery_contract",
+                    status="failed",
+                    evidence=(str(exc)[:200],),
+                )
+            )
+
+    if info is not None and expected_duration_seconds is not None:
+        expected = float(expected_duration_seconds)
+        tolerance = max(2.5, expected * 0.25)
+        delta = abs(info.duration_seconds - expected)
+        checks.append(
+            CandidateQaCheck(
+                name="duration_match",
+                status="passed" if delta <= tolerance else "failed",
+                evidence=(
+                    f"duration is {info.duration_seconds:.2f}s, expected "
+                    f"{expected:.2f}s ± {tolerance:.2f}s",
+                ),
+            )
+        )
+
+    if info is not None and first_frame_bytes:
+        frame_size = _first_frame_dimensions(first_frame_bytes)
+        if frame_size is None:
+            checks.append(
+                CandidateQaCheck(
+                    name="first_frame_aspect_match",
+                    status="failed",
+                    evidence=("approved first frame is not a decodable image",),
+                )
+            )
+        else:
+            frame_ratio = frame_size[0] / frame_size[1]
+            video_ratio = info.width / info.height
+            matched = abs(frame_ratio - video_ratio) / video_ratio <= 0.03
+            checks.append(
+                CandidateQaCheck(
+                    name="first_frame_aspect_match",
+                    status="passed" if matched else "failed",
+                    evidence=(
+                        f"first frame {frame_size[0]}x{frame_size[1]} vs video "
+                        f"{info.width}x{info.height}",
+                    ),
+                )
+            )
+
+    if info is not None:
+        if shutil.which("ffmpeg") is None:
+            checks.append(
+                CandidateQaCheck(
+                    name="no_black_frames",
+                    status="unavailable",
+                    evidence=("ffmpeg_unavailable",),
+                )
+            )
+        else:
+            try:
+                intervals = await _black_frame_intervals(data)
+            except MediaContractError as exc:
+                checks.append(
+                    CandidateQaCheck(
+                        name="no_black_frames",
+                        status="unavailable",
+                        evidence=(f"blackdetect_failed={str(exc)[:120]}",),
+                    )
+                )
+            else:
+                threshold = max(0.6, info.duration_seconds * 0.1)
+                bad = [
+                    (start, end)
+                    for start, end in intervals
+                    if end - start >= threshold
+                ]
+                checks.append(
+                    CandidateQaCheck(
+                        name="no_black_frames",
+                        status="failed" if bad else "passed",
+                        evidence=(
+                            tuple(
+                                f"black_segment={start:.2f}-{end:.2f}s"
+                                for start, end in bad[:4]
+                            )
+                            or ("no sustained black frames",)
+                        ),
+                    )
+                )
+
+    if info is not None:
+        if shutil.which("ffmpeg") is None or shutil.which("tesseract") is None:
+            unavailable_reason = (
+                "ffmpeg_unavailable"
+                if shutil.which("ffmpeg") is None
+                else "tesseract_unavailable"
+            )
+            checks.append(
+                CandidateQaCheck(
+                    name="no_pseudo_text",
+                    status="unavailable",
+                    evidence=(unavailable_reason,),
+                )
+            )
+            checks.append(
+                CandidateQaCheck(
+                    name="no_prohibited_terms",
+                    status="unavailable",
+                    evidence=(unavailable_reason,),
+                )
+            )
+        else:
+            try:
+                frames = await _extract_video_frames(data, info.duration_seconds)
+            except MediaContractError as exc:
+                frames = ()
+                frame_error = f"frame_extraction_failed={str(exc)[:120]}"
+            else:
+                frame_error = None
+            if frame_error is not None or not frames:
+                reason = frame_error or "frame_extraction_failed=no_frames"
+                checks.append(
+                    CandidateQaCheck(
+                        name="no_pseudo_text",
+                        status="unavailable",
+                        evidence=(reason,),
+                    )
+                )
+                checks.append(
+                    CandidateQaCheck(
+                        name="no_prohibited_terms",
+                        status="unavailable",
+                        evidence=(reason,),
+                    )
+                )
+            else:
+                expected_corpus = _canonical_text(" ".join(expected_copy_texts))
+                pseudo_frames: list[str] = []
+                all_tokens: list[str] = []
+                ocr_failures = 0
+                for frame in frames:
+                    variant_tokens, ocr_error = _ocr_tokens(
+                        frame,
+                        expected_languages=expected_languages,
+                    )
+                    if ocr_error is not None:
+                        ocr_failures += 1
+                        continue
+                    frame_tokens = [token for tokens in variant_tokens for token in tokens]
+                    all_tokens.extend(frame_tokens)
+                    variant_support: dict[str, int] = {}
+                    display_token: dict[str, str] = {}
+                    for tokens in variant_tokens:
+                        seen_in_variant: set[str] = set()
+                        for token in tokens:
+                            canonical = _canonical_text(token)
+                            if not canonical or canonical in seen_in_variant:
+                                continue
+                            seen_in_variant.add(canonical)
+                            variant_support[canonical] = variant_support.get(canonical, 0) + 1
+                            display_token.setdefault(canonical, token)
+                    consensus_threshold = 2 if len(variant_tokens) > 1 else 1
+                    pseudo_frames.extend(
+                        display_token[canonical]
+                        for canonical, support in sorted(variant_support.items())
+                        if support >= consensus_threshold
+                        and _is_significant_ocr_token(canonical)
+                        and canonical not in expected_corpus
+                    )
+                if ocr_failures == len(frames):
+                    checks.append(
+                        CandidateQaCheck(
+                            name="no_pseudo_text",
+                            status="unavailable",
+                            evidence=("ocr_execution_failed",),
+                        )
+                    )
+                    checks.append(
+                        CandidateQaCheck(
+                            name="no_prohibited_terms",
+                            status="unavailable",
+                            evidence=("ocr_execution_failed",),
+                        )
+                    )
+                else:
+                    checks.append(
+                        CandidateQaCheck(
+                            name="no_pseudo_text",
+                            status="failed" if pseudo_frames else "passed",
+                            evidence=(
+                                tuple(
+                                    f"pseudo_text={token[:80]}"
+                                    for token in pseudo_frames[:8]
+                                )
+                                or ("frame OCR found only the contracted copy",)
+                            ),
+                        )
+                    )
+                    full_text = _canonical_text(" ".join(all_tokens))
+                    matched_terms = tuple(
+                        term
+                        for term in prohibited_terms
+                        if _canonical_text(term) and _canonical_text(term) in full_text
+                    )
+                    checks.append(
+                        CandidateQaCheck(
+                            name="no_prohibited_terms",
+                            status="failed" if matched_terms else "passed",
+                            evidence=(
+                                tuple(
+                                    f"prohibited_term_detected={term}"
+                                    for term in matched_terms
+                                )
+                                or ("No prohibited watermark/term detected",)
+                            ),
+                        )
+                    )
+
+    failed = sum(1 for check in checks if check.status == "failed")
+    unavailable = sum(1 for check in checks if check.status == "unavailable")
+    undecodable = any(
+        check.name == "artifact_decodable" and check.status == "failed" for check in checks
+    )
+    score = 0 if undecodable else max(0, 100 - 50 * failed - 10 * unavailable)
+    return CandidateQaReport(
+        schema_version=schema_version,
+        unit_key=unit_key,
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        status="failed" if failed else "passed",
+        score=score,
+        checks=tuple(checks),
+    )
+
+
+async def evaluate_video_v2_package(
+    db: AsyncSession,
+    *,
+    request: DeliverableRequest,
+    storage=None,
+) -> CandidateQaReport | None:
+    """FR-V7: evaluate the composed final MP4 and bind the report to package_qa.
+
+    Shadow mode (the default) only records the report; ``enforcing`` fails the
+    package_qa unit so a broken package cannot be registered for delivery.
+    """
+
+    # Lazy: storyboard imports this module for shot QA.
+    from app.services.storyboard import keyframe_workspace_path
+
+    if request.workflow_id != VIDEO_V2_WORKFLOW_ID or request.current_execution_id is None:
+        return None
+    brief, _missing = compile_video_brief(request.goal, request.spec, request.inputs)
+    final_path = f"workspace/deliverables/{request.id}/final.mp4"
+    storage_backend = storage or get_storage_backend()
+    try:
+        data = await storage_backend.read_bytes(
+            agent_storage_key(request.agent_id, final_path)
+        )
+    except Exception:
+        return None
+    first_frame_bytes: bytes | None = None
+    try:
+        first_frame_bytes = await storage_backend.read_bytes(
+            agent_storage_key(
+                request.agent_id,
+                keyframe_workspace_path(request.id, "shot-01"),
+            )
+        )
+    except Exception:
+        first_frame_bytes = None
+    expected_copy: list[str] = []
+    if brief is not None:
+        if brief.caption_spec.strip():
+            expected_copy.append(brief.caption_spec.strip())
+        if brief.cta.strip():
+            expected_copy.append(brief.cta.strip())
+    report = await evaluate_video_shot(
+        data=data,
+        unit_key="final",
+        artifact_path=final_path,
+        expected_aspect_ratio=(brief.aspect_ratio if brief else None),
+        expected_duration_seconds=(brief.duration_seconds if brief else None),
+        require_audio=bool(brief and brief.audio_mode != "silent"),
+        expected_copy_texts=expected_copy,
+        prohibited_terms=(brief.prohibitions if brief else ()),
+        first_frame_bytes=first_frame_bytes,
+        expected_languages=((brief.language,) if brief else ("zh-CN", "en-US")),
+        schema_version=PACKAGE_QA_SCHEMA_VERSION,
+    )
+    settings = get_settings()
+    enforcement = candidate_qa_enforcement_for_request(
+        request,
+        mode=settings.DELIVERABLE_CREATIVE_QA_ENFORCEMENT,
+        tenant_ids=settings.DELIVERABLE_CREATIVE_QA_TENANT_IDS,
+        agent_ids=settings.DELIVERABLE_CREATIVE_QA_AGENT_IDS,
+    )
+    unit_result = await db.execute(
+        select(DeliverableExecutionUnit).where(
+            DeliverableExecutionUnit.tenant_id == request.tenant_id,
+            DeliverableExecutionUnit.execution_id == request.current_execution_id,
+            DeliverableExecutionUnit.stage_key == "package_qa",
+            DeliverableExecutionUnit.unit_key == "final",
+        )
+    )
+    unit = unit_result.scalar_one_or_none()
+    now = datetime.now(UTC)
+    if unit is not None:
+        unit.quality_evaluation = {
+            "package_qa": report.model_dump(mode="json"),
+            "enforcement": enforcement,
+            "evaluated_at": now.isoformat(),
+        }
+        if enforcement == "enforcing":
+            if report.status == "failed" and unit.status != "failed":
+                unit.status = "failed"
+                unit.last_error_code = "package_qa_failed"
+                unit.completed_at = now
+            elif report.status == "passed" and unit.status in {"pending", "running"}:
+                unit.status = "succeeded"
+                unit.completed_at = now
+    await db.flush()
+    return report
+
+
 __all__ = [
+    "PACKAGE_QA_SCHEMA_VERSION",
     "QA_SCHEMA_VERSION",
+    "VIDEO_QA_SCHEMA_VERSION",
     "CandidateQaCheck",
     "CandidateQaReport",
     "candidate_qa_enforcement_for_request",
     "evaluate_image_candidate",
     "evaluate_poster_v2_candidates",
+    "evaluate_video_shot",
+    "evaluate_video_v2_package",
     "image_average_hash",
     "qa_summary_from_evaluation",
     "subject_similarity",

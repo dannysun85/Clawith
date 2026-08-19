@@ -1426,6 +1426,19 @@ export interface DeliverableApprovalReceipt {
     created_at: string;
 }
 
+export interface DeliverableSelectionReceipt {
+    id: string;
+    execution_id: string;
+    selected_unit_key: string;
+    candidate_scores: Array<Record<string, unknown>>;
+    selection_reason: string;
+    cost_breakdown: Record<string, unknown>;
+    actor: 'auto' | 'user';
+    actor_user_id: string | null;
+    client_selection_id: string;
+    created_at: string;
+}
+
 export interface DeliverableExecution {
     id: string;
     request_id: string;
@@ -1446,6 +1459,7 @@ export interface DeliverableExecution {
     updated_at: string;
     units: DeliverableExecutionUnit[];
     approvals: DeliverableApprovalReceipt[];
+    selections?: DeliverableSelectionReceipt[];
 }
 
 export interface DeliverableApprovalReadiness {
@@ -1614,7 +1628,7 @@ export const deliverableApi = {
         data: {
             expected_version: number;
             client_action_id: string;
-            stage: 'final';
+            stage: 'brief' | 'outline' | 'composition' | 'storyboard' | 'final';
             action: 'approve' | 'request_changes' | 'cancel';
             instruction?: string;
             target_units?: string[];

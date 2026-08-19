@@ -406,7 +406,14 @@ async def project_execution_lifecycle(
     units = await execution_units(db, execution.id, lock=True)
     active_statuses = {"pending", "running", "blocked", "reconciling"}
     has_verified_output = any(unit.status == "succeeded" for unit in units)
-    if request.status == "waiting_approval" and has_verified_output:
+    # The blanket success projection is a v1-runtime compatibility bridge and
+    # is only valid at final output review.  Mid-pipeline approval stages (v2
+    # storyboard review) keep their per-unit truth untouched.
+    if (
+        request.status == "waiting_approval"
+        and has_verified_output
+        and request.current_stage == "output_review"
+    ):
         projected_status = "succeeded"
         evidence_level = "projected_v1_runtime_completion"
     elif request.status == "succeeded":
@@ -488,13 +495,21 @@ async def bind_artifacts_to_current_execution(
             unit.status = "succeeded"
             unit.completed_at = timestamp
             unit.last_error_code = None
-            unit.result_snapshot = {
+            result_snapshot = {
                 "version": 1,
                 "artifact_revision_id": str(artifact.id),
                 "artifact_key": artifact.artifact_key,
                 "content_hash": artifact.content_hash,
                 "size_bytes": artifact.size_bytes,
             }
+            # FR-P7: surface the font substitution mapping on the render unit
+            # so output review and revision history can display it.
+            evaluation = artifact.evaluation if isinstance(artifact.evaluation, Mapping) else {}
+            facts = evaluation.get("facts") if isinstance(evaluation.get("facts"), Mapping) else {}
+            font_substitutions = facts.get("font_substitutions")
+            if isinstance(font_substitutions, list) and font_substitutions:
+                result_snapshot["font_substitutions"] = font_substitutions
+            unit.result_snapshot = result_snapshot
 
 
 async def execution_units(

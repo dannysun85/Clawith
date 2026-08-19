@@ -15,6 +15,7 @@ GLOBAL_DEFAULT_MEDIA_TOOL_NAMES = frozenset(
         "check_image_generation",
         "generate_speech_minimax",
         "compose_video_audio",
+        "concat_videos",
         "generate_video_minimax",
         "check_video_minimax",
     }
@@ -47,8 +48,10 @@ EXPLICIT_GRANT_TOOL_NAMES = frozenset(
 # ``LLMCredential`` pool. Tool visibility may come from the global product
 # default or an explicit Agent assignment; neither path may become an
 # object-level or tenant BYOK credential binding for MiniMax.
+# ``compose_video_audio`` and ``concat_videos`` are deterministic local
+# post-production: they never call a provider and must stay out of the pool.
 CENTRAL_CREDENTIAL_POOL_TOOL_NAMES = (
-    GLOBAL_DEFAULT_MEDIA_TOOL_NAMES - {"compose_video_audio"}
+    GLOBAL_DEFAULT_MEDIA_TOOL_NAMES - {"compose_video_audio", "concat_videos"}
 ) | {"generate_music_minimax"}
 
 

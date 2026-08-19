@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,7 +28,12 @@ from app.models.deliverable import (
     DeliverablePromptCompilation,
     DeliverableRequest,
 )
-from app.services.creative_briefs import CreativeBrief, brief_sha256
+from app.services.creative_briefs import (
+    CandidatePolicy,
+    CreativeBrief,
+    VideoBrief,
+    brief_sha256,
+)
 from app.services.media_assets import MediaContractError
 from app.services.storage import agent_storage_key, get_storage_backend
 from app.services.volcengine_agent_plan import (
@@ -36,8 +41,13 @@ from app.services.volcengine_agent_plan import (
     image_size_for_aspect_ratio,
 )
 
+if TYPE_CHECKING:
+    from app.services.storyboard import ShotSpec
+
 
 COMPILER_VERSION = "image-v1"
+VIDEO_SHOT_COMPILER_VERSION = "video-shot-v1"
+VIDEO_KEYFRAME_COMPILER_VERSION = "video-keyframe-v1"
 
 PROVIDER_TARGETS = ("volcengine_agent_plan", "minimax")
 
@@ -93,6 +103,7 @@ def compile_image_prompt(
     provider_target: str,
     candidate_index: int = 1,
     quality_size: str = "2K",
+    compiler_version: str = COMPILER_VERSION,
 ) -> CompiledImagePrompt:
     """Compile one candidate prompt; pure and reproducible for a given version."""
 
@@ -150,7 +161,7 @@ def compile_image_prompt(
 
     prompt_sha256 = _canonical_sha256(
         {
-            "compiler_version": COMPILER_VERSION,
+            "compiler_version": compiler_version,
             "brief_sha256": brief_sha256(brief),
             "candidate_index": candidate_index,
             "neutral_prompt": neutral_prompt,
@@ -159,6 +170,7 @@ def compile_image_prompt(
         }
     )
     return CompiledImagePrompt(
+        compiler_version=compiler_version,
         brief_sha256=brief_sha256(brief),
         candidate_index=candidate_index,
         neutral=neutral,
@@ -354,13 +366,161 @@ async def mark_poster_v2_candidate_submitted(
         await db.commit()
 
 
+class CompiledVideoShotPrompt(BaseModel):
+    """Two-layer shot compilation receipt: neutral shot plan + payload."""
+
+    compiler_version: str = VIDEO_SHOT_COMPILER_VERSION
+    brief_sha256: str = Field(min_length=64, max_length=64)
+    shot_id: str = Field(pattern=r"^shot-\d{2}$")
+    neutral: dict[str, Any]
+    neutral_prompt: str = Field(min_length=1)
+    provider_target: str
+    provider_payload: dict[str, Any]
+    prompt_sha256: str = Field(min_length=64, max_length=64)
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_NO_GENERATED_VIDEO_TEXT_POLICY = (
+    "Do not render any burned-in words, letters, digits, captions, logos, "
+    "watermarks, signatures, or UI chrome anywhere in the clip."
+)
+
+
+def compile_video_shot_prompt(
+    brief: VideoBrief,
+    shot: ShotSpec,
+    *,
+    provider_target: str,
+) -> CompiledVideoShotPrompt:
+    """Compile one shot prompt; pure and reproducible for a given version.
+
+    The raw ``request.goal`` text is never passed through; only the approved
+    storyboard shot and structured brief elements reach the provider-facing
+    prompt.
+    """
+
+    normalized_target = str(provider_target or "").strip().lower()
+    if normalized_target not in PROVIDER_TARGETS:
+        raise ValueError(f"Unsupported video provider target: {provider_target}")
+
+    negative_constraints = [_NO_GENERATED_VIDEO_TEXT_POLICY, *brief.prohibitions]
+    if brief.audio_mode != "in_scene_dialogue":
+        negative_constraints.append(
+            "Do not generate any speech or dialogue audio track in the clip."
+        )
+    neutral: dict[str, Any] = {
+        "shot_id": shot.shot_id,
+        "visual": shot.visual,
+        "camera": shot.camera,
+        "transition": shot.transition,
+        "audio_mode": brief.audio_mode,
+        "duration_seconds": shot.duration_seconds,
+        "aspect_ratio": brief.aspect_ratio,
+        "negative_constraints": list(negative_constraints),
+        "text_policy": "no_generated_text",
+    }
+    prompt_parts = [
+        f"{shot.visual}",
+        f"Camera: {shot.camera or 'stable commercial shot'}.",
+        (
+            f"Style: {brief.style} commercial video for {brief.channel} aimed at "
+            f"{brief.audience}, framed for a {brief.aspect_ratio} canvas."
+        ),
+    ]
+    if brief.audio_mode == "in_scene_dialogue" and shot.dialogue.strip():
+        # Only a native-audio route ever sees this line; the preflight route
+        # filter keeps the dialogue contract off audio-less providers.
+        prompt_parts.append(
+            "Synchronized in-scene dialogue spoken on camera: "
+            f"{shot.dialogue.strip()}"
+        )
+    prompt_parts.extend(f"Constraint: {item}" for item in negative_constraints)
+    neutral_prompt = "\n".join(prompt_parts)
+
+    if normalized_target == "volcengine_agent_plan":
+        provider_payload: dict[str, Any] = {
+            "prompt": neutral_prompt,
+            "ratio": brief.aspect_ratio,
+            "duration_seconds": shot.duration_seconds,
+            "generate_audio": brief.audio_mode == "in_scene_dialogue",
+        }
+    else:
+        provider_payload = {
+            "model": "MiniMax-Hailuo-02",
+            "prompt": neutral_prompt,
+            "duration": shot.duration_seconds,
+            "first_frame_required": brief.aspect_ratio != "16:9",
+        }
+
+    prompt_sha256 = _canonical_sha256(
+        {
+            "compiler_version": VIDEO_SHOT_COMPILER_VERSION,
+            "brief_sha256": brief_sha256(brief),
+            "shot_id": shot.shot_id,
+            "neutral_prompt": neutral_prompt,
+            "provider_target": normalized_target,
+            "provider_payload": provider_payload,
+        }
+    )
+    return CompiledVideoShotPrompt(
+        brief_sha256=brief_sha256(brief),
+        shot_id=shot.shot_id,
+        neutral=neutral,
+        neutral_prompt=neutral_prompt,
+        provider_target=normalized_target,
+        provider_payload=provider_payload,
+        prompt_sha256=prompt_sha256,
+    )
+
+
+def compile_video_keyframe_prompt(
+    brief: VideoBrief,
+    shot: ShotSpec,
+    *,
+    provider_target: str,
+    quality_size: str = "2K",
+) -> CompiledImagePrompt:
+    """FR-V6: compile the same-aspect first frame through the M1 image pipeline."""
+
+    surrogate = CreativeBrief(
+        purpose=f"{brief.purpose}\nOpening frame: {shot.visual}"[:2000],
+        channel=brief.channel,
+        audience=brief.audience,
+        aspect_ratio=brief.aspect_ratio,
+        style=brief.style,
+        reference_assets=brief.reference_assets,
+        prohibitions=brief.prohibitions,
+        candidate_policy=CandidatePolicy(
+            tier="keyframe",
+            tier_default=1,
+            requested=None,
+            effective=1,
+        ),
+        delivery_formats=("png",),
+    )
+    candidate_index = int(shot.shot_id.rsplit("-", 1)[-1])
+    return compile_image_prompt(
+        surrogate,
+        provider_target=provider_target,
+        candidate_index=candidate_index,
+        quality_size=quality_size,
+        compiler_version=VIDEO_KEYFRAME_COMPILER_VERSION,
+    )
+
+
 __all__ = [
     "COMPILER_VERSION",
     "PROVIDER_TARGETS",
     "TIER_QUALITY_SIZE",
+    "VIDEO_KEYFRAME_COMPILER_VERSION",
+    "VIDEO_SHOT_COMPILER_VERSION",
     "CompiledImagePrompt",
+    "CompiledVideoShotPrompt",
     "PosterV2CandidateBinding",
     "compile_image_prompt",
+    "compile_video_keyframe_prompt",
+    "compile_video_shot_prompt",
     "compiled_prompt_workspace_path",
     "mark_poster_v2_candidate_submitted",
     "poster_v2_candidate_unit_key",
