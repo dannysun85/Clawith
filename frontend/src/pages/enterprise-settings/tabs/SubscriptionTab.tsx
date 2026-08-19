@@ -129,6 +129,15 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const [wechatPay, setWechatPay] = useState<{ orderId: string; codeUrl: string; amountCents: number; currency: string } | null>(null);
     const { data: billingConfig } = useBillingConfig();
     const cnyRate = billingConfig?.usd_cny_rate ?? DEFAULT_USD_CNY_RATE;
+
+    /** Real-money checkout only runs on the public payment domain; redirect there first. */
+    const redirectToPaymentDomain = () => {
+        const host = billingConfig?.payment_host;
+        if (!host || billingConfig?.provider === 'manual') return false;
+        if (window.location.hostname.toLowerCase() === host.toLowerCase()) return false;
+        window.location.assign(`https://${host}${window.location.pathname}${window.location.hash}`);
+        return true;
+    };
     const tenantId = user?.tenant_id || null;
     const membershipId = user?.membership_id || user?.id || null;
     const accessSignature = productAccessSignature(user);
@@ -208,6 +217,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const checkoutSubscribe = useMutation({
         mutationFn: (planId: string) => {
             if (!canManageCompanyBilling) throw new Error('company.billing.manage is required');
+            if (redirectToPaymentDomain()) return new Promise<PaymentOrder>(() => {});
             return fetchJson<PaymentOrder>('/subscription/checkout/subscribe', {
                 method: 'POST',
                 body: JSON.stringify({ plan_id: planId, period: billingPeriod, seats: 1 }),
@@ -219,6 +229,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const checkoutTopup = useMutation({
         mutationFn: (creditPackId: string) => {
             if (!canManageCompanyBilling) throw new Error('company.billing.manage is required');
+            if (redirectToPaymentDomain()) return new Promise<PaymentOrder>(() => {});
             return fetchJson<PaymentOrder>('/subscription/checkout/topup', {
                 method: 'POST',
                 body: JSON.stringify({ credit_pack_id: creditPackId }),

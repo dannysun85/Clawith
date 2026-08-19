@@ -1,3 +1,42 @@
+# v1.11.41 — WeChat Pay Checkout and Four-P0 Product Closure
+
+## Payments
+
+- WeChat Pay V3 Native (扫码支付) checkout for subscription plans and Boost credit
+  packs, selected via `BILLING_PROVIDER=wechat`; webhook authenticity comes from
+  APIv3-key AEAD decryption plus a server-to-server order-state re-query.
+- USD-priced plans and credit packs convert to CNY for display and charging at
+  `BILLING_USD_CNY_RATE` (default 7).
+- Real-money checkout is only accepted from the `PUBLIC_BASE_URL` host; the
+  frontend redirects other origins to the payment domain before ordering.
+
+## Four-P0 product closure
+
+- Billing/Credits/Payment APIs are membership-capability gated: members get a
+  personal safe projection, `company.billing.view` for org admins, and
+  `company.billing.manage` for org owners; platform identity alone grants no
+  tenant billing access.
+- OKR objectives, daily reports, and admin routes share one principal-aware
+  policy across REST and Agent tools, with read-only GET routes and
+  reject-before-side-effect enforcement.
+- Company token/cache aggregation requires `company.analytics.view`; workforce
+  topology resource fields are nulled for unauthorized viewers.
+- Workbench adds deterministic auto executor routing with explainable proposals,
+  confirmation fingerprints, task detail/inbox projections, and a `/work/:taskId`
+  page; legacy getTask and formal-delivery handoff remain compatible.
+
+## Tenant isolation hardening
+
+- Agent listing, plaza posting, enterprise system settings, and file access
+  enforce tenant scope server-side with reject-before-query semantics.
+
+## Operations
+
+- Includes one Alembic migration (creative brief compilation receipts).
+- WeChat Pay requires the `WECHAT_PAY_*` merchant credentials and a publicly
+  reachable `PUBLIC_BASE_URL`; without them the billing provider stays `manual`.
+- Rollback is the normal immutable-release rollback to v1.11.40.
+
 # v1.11.40 — Astra Channel Identity and Conversation Visibility
 
 ## Channel identity

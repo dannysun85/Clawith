@@ -41,6 +41,7 @@ import {
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
+import MfaRecommendationBanner from '../components/MfaRecommendationBanner';
 import { AstraWordmark } from '../components/atlas';
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
@@ -1448,6 +1449,7 @@ export default function Layout() {
             )}
 
             <main className={`main-content${isChatPage ? ' chat-page' : ''}${isAgentSettingsPage ? ' agent-settings-page' : ''}${isGroupsPage ? ' groups-shell' : ''}`}>
+                <MfaRecommendationBanner />
                 <Outlet context={{ openTalentMarket: handleOpenTalentMarket }} />
             </main>
 

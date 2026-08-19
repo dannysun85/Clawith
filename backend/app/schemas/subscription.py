@@ -268,6 +268,8 @@ class BillingConfigOut(BaseModel):
 
     provider: str
     usd_cny_rate: float
+    # Hostname of PUBLIC_BASE_URL: real-money checkout is only accepted from it.
+    payment_host: str | None = None
 
 
 class CheckoutSubscribeIn(BaseModel):

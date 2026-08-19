@@ -192,14 +192,10 @@ def access_context_mfa_verified(user: object) -> bool:
 def mfa_access_error_code(payload: dict, user: object) -> str | None:
     """Return the MFA gate which blocks one business access token."""
 
-    from app.services.mfa_service import identity_requires_mfa
-
     identity = getattr(user, "identity", None)
     enabled = bool(getattr(identity, "mfa_enabled", False))
     if enabled and not access_token_mfa_verified(payload):
         return "mfa_challenge_required"
-    if identity_requires_mfa(user) and not enabled:
-        return "mfa_setup_required"
     return None
 
 

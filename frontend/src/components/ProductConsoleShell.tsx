@@ -4,6 +4,7 @@ import { NavLink, useNavigate } from 'react-router';
 
 import { useAuthStore } from '../stores';
 import { AstraWordmark } from './atlas';
+import MfaRecommendationBanner from './MfaRecommendationBanner';
 import '../pages/productConsole.css';
 
 export type ProductConsoleNavItem = {
@@ -104,6 +105,7 @@ export default function ProductConsoleShell({
                     <div className="product-console__actions">{headerActions}</div>
                 </header>
                 {banner}
+                <MfaRecommendationBanner />
                 <main className="product-console__content">{children}</main>
             </section>
         </div>

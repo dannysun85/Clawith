@@ -216,3 +216,54 @@ async def test_load_remote_event_state_ignores_missing_out_trade_no():
     state = await provider.load_remote_event_state({"id": "evt-x", "type": "TRANSACTION.SUCCESS", "decrypted": {}})
     assert state.order_id is None
     assert state.status == "ignored"
+
+
+# --- Payment-domain gate (checkout must be initiated from PUBLIC_BASE_URL) ---
+
+
+def _gate_request(host: str):
+    return SimpleNamespace(headers={"host": host})
+
+
+def _gate_settings(provider: str = "wechat", public_base_url: str = "https://opc.rama-server.com"):
+    return SimpleNamespace(BILLING_PROVIDER=provider, PUBLIC_BASE_URL=public_base_url)
+
+
+def test_payment_origin_gate_rejects_non_payment_domain():
+    from fastapi import HTTPException
+
+    from app.api.subscription import _enforce_payment_origin
+
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings()):
+        with pytest.raises(HTTPException) as exc_info:
+            _enforce_payment_origin(_gate_request("opc.reeftotem.ai"))
+    assert exc_info.value.status_code == 403
+    assert "opc.rama-server.com" in str(exc_info.value.detail)
+
+
+def test_payment_origin_gate_allows_payment_domain():
+    from app.api.subscription import _enforce_payment_origin
+
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings()):
+        _enforce_payment_origin(_gate_request("opc.rama-server.com"))
+
+
+def test_payment_origin_gate_ignores_request_port():
+    from app.api.subscription import _enforce_payment_origin
+
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings()):
+        _enforce_payment_origin(_gate_request("opc.rama-server.com:8443"))
+
+
+def test_payment_origin_gate_skips_manual_provider():
+    from app.api.subscription import _enforce_payment_origin
+
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings(provider="manual")):
+        _enforce_payment_origin(_gate_request("opc.reeftotem.ai"))
+
+
+def test_payment_origin_gate_skips_without_public_base_url():
+    from app.api.subscription import _enforce_payment_origin
+
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings(public_base_url="")):
+        _enforce_payment_origin(_gate_request("opc.reeftotem.ai"))

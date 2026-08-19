@@ -5,9 +5,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, Response
 
-from app.api import mfa as mfa_api
 from app.core.mfa_crypto import (
     MFA_SECRET_ENVELOPE_PREFIX,
     open_mfa_secret,
@@ -28,6 +26,8 @@ from app.services.mfa_service import (
     decode_challenge_token,
     generate_recovery_codes,
     generate_totp_secret,
+    identity_recommends_mfa,
+    identity_requires_mfa,
     matching_totp_step,
     record_challenge_failure,
     require_live_challenge,
@@ -209,10 +209,14 @@ def test_mfa_gate_matrix_and_access_token_assurance_claim() -> None:
     enabled_member = _user(role="member", enabled=True)
 
     assert mfa_access_error_code({"mfa": False}, member) is None
-    assert mfa_access_error_code({"mfa": False}, owner) == "mfa_setup_required"
-    assert mfa_access_error_code({"mfa": False}, platform) == "mfa_setup_required"
+    assert mfa_access_error_code({"mfa": False}, owner) is None
+    assert mfa_access_error_code({"mfa": False}, platform) is None
     assert mfa_access_error_code({"mfa": False}, enabled_member) == "mfa_challenge_required"
     assert mfa_access_error_code({"mfa": True}, enabled_member) is None
+    assert identity_requires_mfa(owner) is False
+    assert identity_recommends_mfa(owner) is True
+    assert identity_recommends_mfa(platform) is True
+    assert identity_recommends_mfa(member) is False
 
     token = create_access_token(
         str(enabled_member.id),
@@ -242,16 +246,7 @@ def test_failed_challenge_is_consumed_at_bounded_attempt_limit() -> None:
     assert challenge.consumed_at is not None
 
 
-@pytest.mark.asyncio
-async def test_forced_role_cannot_disable_mfa() -> None:
+def test_privileged_role_may_disable_mfa() -> None:
     owner = _user(role="org_owner", enabled=True)
-    with pytest.raises(HTTPException) as exc:
-        await mfa_api.disable_mfa(
-            mfa_api.MfaSensitiveMutation(current_password="password", code="123456"),
-            request=None,  # rejected before request/DB use
-            response=Response(),
-            current_user=owner,
-            db=None,
-        )
-    assert exc.value.status_code == 409
-    assert exc.value.detail["code"] == "mfa_required_by_role"
+    assert identity_requires_mfa(owner) is False
+    assert identity_recommends_mfa(owner) is True

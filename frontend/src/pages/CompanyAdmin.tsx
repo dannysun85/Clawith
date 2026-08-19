@@ -13,6 +13,7 @@ import {
     IconRefresh,
     IconRobot,
     IconSettings,
+    IconShoppingCart,
     IconTrash,
     IconUserPlus,
     IconUsers,
@@ -28,6 +29,7 @@ import { useAuthStore } from '../stores';
 import { hasEffectiveCapability, hasProductSurface, isCompanyOwner, isPlatformOperator } from '../utils/productAccess';
 import { commitSameOriginTenantSwitch } from '../utils/tenantSwitch';
 import EnterpriseSettings from './EnterpriseSettings';
+import SubscriptionTab from './enterprise-settings/tabs/SubscriptionTab';
 import SubscriptionDetail from './SubscriptionDetail';
 
 type CompanyMember = {
@@ -652,6 +654,7 @@ export default function CompanyAdmin() {
         { to: '/company-admin/approvals', label: isChinese ? '权限与审批' : 'Permissions & approvals', icon: <IconChecklist size={17} />, capability: 'company.settings.manage' },
         { to: '/company-admin/integrations', label: isChinese ? '企业知识与集成' : 'Knowledge & integrations', icon: <IconPlugConnected size={17} />, capability: 'company.settings.manage' },
         { to: '/company-admin/billing', label: isChinese ? '套餐、账单与用量' : 'Plan, billing & usage', icon: <IconReceipt size={17} />, capability: 'company.billing.view' },
+        { to: '/company-admin/market', label: isChinese ? '购买套餐与额度' : 'Buy plans & credits', icon: <IconShoppingCart size={17} />, capability: 'company.billing.manage' },
         { to: '/company-admin/audit', label: isChinese ? '审计日志' : 'Audit log', icon: <IconFileAnalytics size={17} />, capability: 'company.audit.view' },
         { to: '/company-admin/settings', label: isChinese ? '公司设置' : 'Company settings', icon: <IconSettings size={17} />, capability: 'company.settings.manage' },
         { to: '/company-admin/ownership', label: isChinese ? '所有权与删除' : 'Ownership & deletion', icon: <IconCrown size={17} />, capability: 'company.ownership.transfer' },
@@ -668,6 +671,7 @@ export default function CompanyAdmin() {
         if (section === 'agents') return <AgentGovernance />;
         if (section === 'settings') return <CompanyPolicySettings tenantId={tenantId} tenant={tenantQuery.data} />;
         if (section === 'billing') return <><PageHeader title={isChinese ? '套餐、账单与用量' : 'Plan, billing and usage'} description={isChinese ? '公司管理员查看聚合用量；支付主体、订单与续费仍按 company.billing.manage 单独守卫。' : 'Company admins see aggregate usage; payer, order, and renewal actions remain gated by company.billing.manage.'} /><SubscriptionDetail /></>;
+        if (section === 'market') return <><PageHeader title={isChinese ? '购买套餐与额度' : 'Buy plans and credits'} description={isChinese ? '选择适合团队的套餐或补充额度包，支付仅允许在官方支付域名上发起。' : 'Pick a plan or top up credits; payment is only accepted on the official payment domain.'} /><SubscriptionTab /></>;
         if (section === 'ownership') return <CompanyOwnership tenantId={tenantId} companyName={companyName} members={membersQuery.data || []} />;
         const legacyTabs: Record<string, 'approvals' | 'tools' | 'audit'> = { approvals: 'approvals', integrations: 'tools', audit: 'audit' };
         if (legacyTabs[section]) return <><PageHeader title={items.find((item) => item.to.endsWith(section))?.label || section} description={isChinese ? '该能力继续复用已验证的企业设置数据源，并置于新的公司治理边界内。' : 'This capability reuses the existing enterprise data source inside the new company-governance boundary.'} /><EnterpriseSettings key={section} initialTab={legacyTabs[section]} embedded /></>;

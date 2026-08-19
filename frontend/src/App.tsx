@@ -113,7 +113,7 @@ function LegacyCompanyAdminRedirect() {
     const hash = location.hash.replace('#', '');
     const sectionByHash: Record<string, string> = {
         users: 'members', invites: 'members', approvals: 'approvals', audit: 'audit',
-        subscription: 'billing', info: 'settings', quotas: 'settings', org: 'integrations',
+        subscription: 'market', info: 'settings', quotas: 'settings', org: 'integrations',
         tools: 'integrations', skills: 'integrations', douyin: 'integrations', okr: 'integrations',
     };
     return <Navigate to={`/company-admin/${sectionByHash[hash] || 'settings'}`} replace />;

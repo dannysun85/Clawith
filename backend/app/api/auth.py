@@ -735,13 +735,12 @@ async def _issue_password_login_mfa_challenge(
     from app.services.mfa_service import (
         MFA_CHALLENGE_MINUTES,
         create_mfa_challenge,
-        identity_requires_mfa,
     )
 
-    # Keep the ordinary member login path unchanged and avoid opening another
-    # transaction unless an MFA decision is actually needed.
+    # Enrollment is recommended for privileged roles, never a login gate.
+    # A challenge is issued only after the Identity has already enabled MFA.
     user.identity = identity
-    if not bool(getattr(identity, "mfa_enabled", False)) and not identity_requires_mfa(user):
+    if not bool(getattr(identity, "mfa_enabled", False)):
         return None
 
     verified_password_hash = identity.password_hash
@@ -781,20 +780,11 @@ async def _issue_password_login_mfa_challenge(
             )
 
         locked_user.identity = locked_identity
-        if bool(getattr(locked_identity, "mfa_enabled", False)):
-            purpose = "login"
-        elif identity_requires_mfa(locked_user):
-            purpose = "bootstrap"
-        else:
-            # A concurrent policy change removed the gate. Refuse this stale
-            # ceremony instead of issuing a token from an old snapshot.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": "login_state_changed",
-                    "message": "Account state changed; sign in again",
-                },
-            )
+        if not bool(getattr(locked_identity, "mfa_enabled", False)):
+            # MFA was disabled after the first snapshot. Continue as a normal
+            # password login instead of forcing enrollment.
+            return None
+        purpose = "login"
 
         _challenge, challenge_token = await create_mfa_challenge(
             session,

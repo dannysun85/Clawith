@@ -101,7 +101,7 @@ export default function AccountSecurity() {
     };
 
     const disableMfa = async () => {
-        if (!user || !status || status.required) return;
+        if (!user || !status) return;
         if (!window.confirm(isChinese ? '确认关闭多因素验证？现有恢复码会全部失效。' : 'Disable MFA? Existing recovery codes will be revoked.')) return;
         setBusy('disable'); setError(''); setSuccess('');
         try {
@@ -165,7 +165,7 @@ export default function AccountSecurity() {
                 <section className="surface-card account-security__status">
                     <header><span className="surface-card__icon"><IconShieldLock size={21} /></span><div><h2>{isChinese ? '当前安全状态' : 'Current security posture'}</h2><p>{status?.enabled ? (isChinese ? '已启用 TOTP 多因素验证' : 'TOTP MFA is enabled') : (isChinese ? '尚未启用多因素验证' : 'MFA is not enabled')}</p></div></header>
                     <dl>
-                        <div><dt>{isChinese ? '角色策略' : 'Role policy'}</dt><dd>{status?.required ? (isChinese ? '强制启用' : 'Required') : (isChinese ? '可选启用' : 'Optional')}</dd></div>
+                        <div><dt>{isChinese ? '角色策略' : 'Role policy'}</dt><dd>{status?.recommended ? (isChinese ? '强烈建议启用' : 'Strongly recommended') : (isChinese ? '可选启用' : 'Optional')}</dd></div>
                         <div><dt>{isChinese ? '剩余恢复码' : 'Recovery codes left'}</dt><dd>{status?.recovery_codes_remaining ?? '—'}</dd></div>
                         <div><dt>{isChinese ? '启用时间' : 'Enabled at'}</dt><dd>{status?.confirmed_at ? new Date(status.confirmed_at).toLocaleString() : '—'}</dd></div>
                     </dl>
@@ -173,7 +173,7 @@ export default function AccountSecurity() {
 
                 {!status?.enabled && !setup && (
                     <section className="surface-card account-security__action">
-                        <header><span className="surface-card__icon"><IconKey size={21} /></span><div><h2>{isChinese ? '绑定验证器' : 'Bind an authenticator'}</h2><p>{isChinese ? '先重新验证当前密码，再生成一次性的绑定密钥。' : 'Re-enter your password before a one-time setup key is generated.'}</p></div></header>
+                        <header><span className="surface-card__icon"><IconKey size={21} /></span><div><h2>{isChinese ? '绑定验证器' : 'Bind an authenticator'}</h2><p>{status?.recommended ? (isChinese ? '公司管理员强烈建议绑定。现在可以跳过，不影响登录和使用；绑定后下次登录才需要动态码。' : 'Strongly recommended for company admins. You can skip this without blocking login; a code is required only after you enable it.') : (isChinese ? '先重新验证当前密码，再生成一次性的绑定密钥。' : 'Re-enter your password before a one-time setup key is generated.')}</p></div></header>
                         <form className="surface-form" onSubmit={startSetup}>
                             <label>{isChinese ? '当前密码' : 'Current password'}<input type="password" value={setupPassword} onChange={(event) => setSetupPassword(event.target.value)} autoComplete="current-password" required /></label>
                             <button type="submit" className="btn btn-primary" disabled={busy === 'setup-start'}>{isChinese ? '开始设置' : 'Start setup'}</button>
@@ -198,8 +198,8 @@ export default function AccountSecurity() {
                         <form className="surface-form" onSubmit={rotateCodes}>
                             <label>{isChinese ? '当前密码' : 'Current password'}<input type="password" value={mutationPassword} onChange={(event) => setMutationPassword(event.target.value)} autoComplete="current-password" required /></label>
                             <label>{isChinese ? '动态码或恢复码' : 'Authenticator or recovery code'}<input type="text" value={mutationCode} onChange={(event) => setMutationCode(event.target.value)} autoComplete="one-time-code" maxLength={64} required /></label>
-                            <div className="console-row-actions"><button type="submit" className="btn btn-secondary" disabled={busy === 'rotate'}>{isChinese ? '轮换恢复码' : 'Rotate recovery codes'}</button>{!status.required && <button type="button" className="btn btn-ghost account-security__danger" disabled={busy === 'disable' || !mutationPassword || !mutationCode.trim()} onClick={() => void disableMfa()}>{isChinese ? '关闭 MFA' : 'Disable MFA'}</button>}</div>
-                            {status.required && <small>{isChinese ? '你的当前角色强制要求 MFA，因此不能关闭；可随时轮换恢复码。' : 'Your current role requires MFA, so it cannot be disabled. Recovery codes can still be rotated.'}</small>}
+                            <div className="console-row-actions"><button type="submit" className="btn btn-secondary" disabled={busy === 'rotate'}>{isChinese ? '轮换恢复码' : 'Rotate recovery codes'}</button><button type="button" className="btn btn-ghost account-security__danger" disabled={busy === 'disable' || !mutationPassword || !mutationCode.trim()} onClick={() => void disableMfa()}>{isChinese ? '关闭 MFA' : 'Disable MFA'}</button></div>
+                            {status.recommended && <small>{isChinese ? '公司管理员仍可关闭 MFA，但强烈建议保持开启。关闭后立即恢复普通密码登录。' : 'Company admins can still disable MFA, but leaving it on is strongly recommended. Disabling restores ordinary password login immediately.'}</small>}
                         </form>
                     </section>
                 )}

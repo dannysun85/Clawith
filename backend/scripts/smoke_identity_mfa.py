@@ -270,7 +270,7 @@ async def _safe_previous_code(secret: str) -> str:
     return totp_code(secret, at_time=now - timedelta(seconds=30))
 
 
-async def _bootstrap_required_identity(
+async def _enroll_privileged_identity(
     client: httpx.AsyncClient,
     *,
     email: str,
@@ -278,37 +278,10 @@ async def _bootstrap_required_identity(
     label: str,
 ) -> tuple[str, list[str], str]:
     login = await _login(client, email, tenant_id=tenant_id, label=f"{label}.login")
-    _require(login.get("requires_mfa_setup") is True, f"{label}.bootstrap_gate_missing")
-    _require("access_token" not in login, f"{label}.bootstrap_leaked_access_token")
-    challenge = str(login.get("challenge_token") or "")
-    setup = _expect_json(
-        await client.post(
-            "/api/auth/mfa/bootstrap/setup",
-            json={"challenge_token": challenge},
-        ),
-        label=f"{label}.bootstrap_setup",
-    )
-    secret = str(setup.get("secret") or "")
-    _require(len(secret) >= 32, f"{label}.secret_shape")
-    _require(
-        str(setup.get("provisioning_uri") or "").startswith("otpauth://totp/"),
-        f"{label}.provisioning_uri",
-    )
-    confirmed = _expect_json(
-        await client.post(
-            "/api/auth/mfa/setup/confirm",
-            json={
-                "challenge_token": challenge,
-                "code": await _safe_previous_code(secret),
-            },
-        ),
-        label=f"{label}.confirm",
-    )
-    token = str(confirmed.get("access_token") or "")
-    recovery_codes = list(confirmed.get("recovery_codes") or [])
-    _require(len(recovery_codes) == RECOVERY_CODE_COUNT, f"{label}.recovery_count")
-    _require(decode_access_token(token).get("mfa") is True, f"{label}.token_assurance")
-    return token, [str(code) for code in recovery_codes], secret
+    token = str(login.get("access_token") or "")
+    _require(bool(token), f"{label}.login_token_missing")
+    _require(login.get("requires_mfa_setup") is not True, f"{label}.bootstrap_gate_still_forced")
+    return await _enroll_optional_identity(client, token=token, label=label)
 
 
 async def _enroll_optional_identity(
@@ -425,7 +398,7 @@ async def _run(base_url: str) -> dict[str, int]:
     assertions = 0
     try:
         async with httpx.AsyncClient(base_url=base_url, timeout=15) as client:
-            owner_token, owner_recovery, owner_secret = await _bootstrap_required_identity(
+            owner_token, owner_recovery, owner_secret = await _enroll_privileged_identity(
                 client,
                 email=fixture.emails["owner"],
                 label="owner",
@@ -446,7 +419,8 @@ async def _run(base_url: str) -> dict[str, int]:
                 label="owner.status",
             )
             _require(status_payload.get("enabled") is True, "owner.status.enabled")
-            _require(status_payload.get("required") is True, "owner.status.required")
+            _require(status_payload.get("required") is False, "owner.status.required")
+            _require(status_payload.get("recommended") is True, "owner.status.recommended")
             _require(
                 status_payload.get("recovery_codes_remaining") == RECOVERY_CODE_COUNT,
                 "owner.status.recovery_count",
@@ -556,9 +530,9 @@ async def _run(base_url: str) -> dict[str, int]:
                     headers=_bearer(rotated_owner_token),
                     json={"current_password": QA_PASSWORD, "code": "000000"},
                 ),
-                status_code=409,
-                code="mfa_required_by_role",
-                label="owner.disable_forbidden",
+                status_code=401,
+                code=None,
+                label="owner.disable_uses_factor_not_role",
             )
             assertions += 7
 
@@ -683,7 +657,7 @@ async def _run(base_url: str) -> dict[str, int]:
             )
 
             platform_token, platform_recovery, platform_secret = (
-                await _bootstrap_required_identity(
+                await _enroll_privileged_identity(
                     client,
                     email=fixture.emails["platform"],
                     label="platform_operator",

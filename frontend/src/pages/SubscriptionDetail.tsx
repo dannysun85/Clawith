@@ -211,7 +211,7 @@ export default function SubscriptionDetail() {
                         <IconReceipt size={16} />
                         {t('subscription.detail.billingManagement', '账单管理')}
                     </button>
-                    <button className="btn btn-secondary" type="button" onClick={() => navigate('/enterprise#subscription')}>
+                    <button className="btn btn-secondary" type="button" onClick={() => navigate('/company-admin/market')}>
                         <IconSettings size={16} />
                         {t('subscription.detail.manageSubscription', '管理订阅')}
                     </button>

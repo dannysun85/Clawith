@@ -1,4 +1,4 @@
-export const DEFAULT_USD_CNY_RATE = 7.2;
+export const DEFAULT_USD_CNY_RATE = 7;
 
 /** Convert a price to CNY cents; non-CNY prices convert at the USD→CNY rate. */
 export function toCnyCents(currency: string, cents: number, usdCnyRate: number = DEFAULT_USD_CNY_RATE): number {

@@ -192,6 +192,7 @@ export type MfaTokenResponse = TokenResponse & {
 export type MfaStatus = {
     enabled: boolean;
     required: boolean;
+    recommended?: boolean;
     confirmed_at: string | null;
     recovery_codes_remaining: number;
 };

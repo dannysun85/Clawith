@@ -293,7 +293,7 @@ class Settings(BaseSettings):
     WECHAT_PAY_NOTIFY_URL: str = ""  # defaults to PUBLIC_BASE_URL + webhook path
     WECHAT_PAY_API_BASE_URL: str = "https://api.mch.weixin.qq.com"
     # WeChat Pay only settles in CNY; USD-priced plans/packs convert at this rate.
-    BILLING_USD_CNY_RATE: float = 7.2
+    BILLING_USD_CNY_RATE: float = 7.0
     BILLING_RECONCILIATION_INTERVAL_SECONDS: int = 60 * 60 * 24
     BILLING_RESERVATION_EXPIRY_SWEEP_SECONDS: int = 60 * 10
     MEDIA_GENERATION_POLL_INTERVAL_SECONDS: int = 15

@@ -6,6 +6,7 @@ providers via BILLING_PROVIDER. See SUBSCRIPTION_IMPLEMENTATION_DESIGN.md §3/§
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import func, select
@@ -81,6 +82,32 @@ def _client_user_label(user: object | None) -> str | None:
     return None
 
 
+def _payment_host() -> str | None:
+    """Hostname of PUBLIC_BASE_URL — the only origin allowed to start real-money checkout."""
+    return urlparse(get_settings().PUBLIC_BASE_URL or "").hostname
+
+
+def _enforce_payment_origin(request: Request) -> None:
+    """Real-money checkout must be initiated from the public payment domain.
+
+    Non-manual providers fix callback/success URLs from PUBLIC_BASE_URL, so an
+    order created from another domain would still be charged there; reject it
+    before any order row or provider call exists. Manual billing (admin-handled)
+    and unconfigured PUBLIC_BASE_URL skip the gate.
+    """
+    if (get_settings().BILLING_PROVIDER or "manual").lower() == "manual":
+        return
+    public_host = _payment_host()
+    if not public_host:
+        return
+    request_host = (request.headers.get("host") or "").split(":")[0].lower()
+    if request_host != public_host.lower():
+        raise HTTPException(
+            status_code=403,
+            detail=f"Payment must be initiated from https://{public_host}",
+        )
+
+
 @router.get("/config", response_model=BillingConfigOut)
 async def get_billing_config(current_user: User = Depends(get_current_user)):
     """Frontend billing display config: active payment provider + USD→CNY rate."""
@@ -88,6 +115,7 @@ async def get_billing_config(current_user: User = Depends(get_current_user)):
     return BillingConfigOut(
         provider=(settings.BILLING_PROVIDER or "manual").lower(),
         usd_cny_rate=settings.BILLING_USD_CNY_RATE,
+        payment_host=_payment_host(),
     )
 
 
@@ -560,10 +588,12 @@ async def get_subscription_summary(
 @router.post("/checkout/subscribe", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_subscribe(
     data: CheckoutSubscribeIn,
+    request: Request,
     current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a subscription checkout order."""
+    _enforce_payment_origin(request)
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User has no tenant")
 
@@ -610,10 +640,12 @@ async def checkout_subscribe(
 @router.post("/checkout/topup", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_topup(
     data: CheckoutTopupIn,
+    request: Request,
     current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a credit top-up checkout order."""
+    _enforce_payment_origin(request)
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User has no tenant")
 

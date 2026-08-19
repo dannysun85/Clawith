@@ -68,6 +68,36 @@
     font-size: 12px;
 }
 
+.mfa-recommendation-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 28%, var(--border-subtle));
+    background: color-mix(in srgb, var(--accent-primary) 8%, var(--bg-secondary));
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+.mfa-recommendation-banner > span {
+    flex: 1;
+}
+
+.mfa-recommendation-banner__dismiss {
+    border: 0;
+    background: transparent;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    padding: 4px;
+}
+
+.mfa-recommendation-banner__dismiss:hover {
+    color: var(--text-primary);
+}
+
 @media (max-width: 720px) {
     .account-security__status,
     .account-security__action,

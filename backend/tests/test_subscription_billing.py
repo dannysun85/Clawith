@@ -1191,6 +1191,7 @@ async def test_checkout_subscribe_returns_provider_session_url():
     with patch.object(subscription_api, "get_billing_provider", return_value=provider, create=True):
         order = await subscription_api.checkout_subscribe(
             CheckoutSubscribeIn(plan_id=plan.id, period="monthly", seats=1),
+            SimpleNamespace(headers={"host": "localhost"}),
             current_user=user,
             db=db,
         )
@@ -1228,6 +1229,7 @@ async def test_checkout_topup_returns_provider_session_url():
     with patch.object(subscription_api, "get_billing_provider", return_value=provider, create=True):
         order = await subscription_api.checkout_topup(
             CheckoutTopupIn(credit_pack_id=pack.id),
+            SimpleNamespace(headers={"host": "localhost"}),
             current_user=user,
             db=db,
         )

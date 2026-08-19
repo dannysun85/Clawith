@@ -522,7 +522,7 @@ export default function Login() {
             ? (isZh ? '保存恢复码' : 'Save recovery codes')
             : (isZh ? '完成多因素验证' : 'Complete multi-factor authentication');
     const mfaSubtitle = mfaFlow?.stage === 'setup'
-        ? (isZh ? '你尚未设置过 MFA。当前角色策略要求首次登录先绑定验证器，完成后才会签发访问令牌。' : 'You have not set up MFA yet. Your current role policy requires authenticator enrollment before an access token is issued.')
+        ? (isZh ? '建议现在绑定验证器。这不是强制步骤；完成后下次登录才需要动态码。' : 'We recommend binding an authenticator now. This is not required; a code is needed on the next login only after you finish setup.')
         : mfaFlow?.stage === 'recovery'
             ? (isZh ? '这些一次性恢复码只显示一次。保存后再进入产品。' : 'These one-time recovery codes are shown once. Save them before continuing.')
             : (isZh ? '输入验证器动态码，或使用一枚尚未使用的恢复码。' : 'Enter an authenticator code or one unused recovery code.');

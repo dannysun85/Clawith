@@ -33,7 +33,7 @@ from app.services.mfa_service import (
     create_mfa_challenge,
     decode_challenge_token,
     generate_totp_secret,
-    identity_requires_mfa,
+    identity_recommends_mfa,
     matching_totp_step,
     open_mfa_secret,
     provisioning_uri,
@@ -203,9 +203,11 @@ async def mfa_status(
     """Return only non-secret MFA posture for the current Identity."""
 
     identity = current_user.identity
+    recommended = identity_recommends_mfa(current_user)
     return {
         "enabled": bool(identity.mfa_enabled),
-        "required": identity_requires_mfa(current_user),
+        "required": False,
+        "recommended": recommended,
         "confirmed_at": identity.mfa_confirmed_at,
         "recovery_codes_remaining": (
             await recovery_codes_remaining(db, identity_id=identity.id)
@@ -283,7 +285,12 @@ async def start_bootstrap_setup(
         identity, user = await _challenge_principal(db, challenge)
     except MfaChallengeError as exc:
         raise _challenge_http_error(exc) from exc
-    if identity.mfa_enabled or not identity_requires_mfa(user):
+    if identity.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "mfa_already_enabled", "message": "MFA is already enabled"},
+        )
+    if not identity_recommends_mfa(user):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "mfa_bootstrap_not_required", "message": "MFA setup is not required"},
@@ -491,17 +498,9 @@ async def disable_mfa(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Disable MFA for an optional-role Identity after fresh factor proof."""
+    """Disable MFA after fresh factor proof. Privileged roles may still disable it."""
 
     _no_store(response)
-    if identity_requires_mfa(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "mfa_required_by_role",
-                "message": "MFA cannot be disabled while the current role requires it",
-            },
-        )
     identity, method = await _verify_sensitive_mutation(
         data, request, current_user, db
     )

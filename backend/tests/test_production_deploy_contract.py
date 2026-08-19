@@ -938,15 +938,19 @@ def test_smoke_credentials_are_hidden_from_local_gate_children_and_emit_exact_js
         "SMOKE_TENANT_ID": "11111111-1111-4111-8111-111111111111",
         "SMOKE_PLATFORM_ADMIN_EMAIL": "admin@example.com",
         "SMOKE_PLATFORM_ADMIN_PASSWORD": "管理员-password",
+        "SMOKE_MEMBER_EMAIL": "member@example.com",
+        "SMOKE_MEMBER_PASSWORD": "member password sentinel",
     }
     harness = f"""set -euo pipefail
-SMOKE_ENV_KEYS=(SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD SMOKE_TENANT_ID SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD)
+SMOKE_ENV_KEYS=(SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD SMOKE_TENANT_ID SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD SMOKE_MEMBER_EMAIL SMOKE_MEMBER_PASSWORD)
 SMOKE_ENV_VALUES=()
 export SMOKE_TENANT_EMAIL={shlex.quote(expected["SMOKE_TENANT_EMAIL"])}
 export SMOKE_TENANT_PASSWORD={shlex.quote(expected["SMOKE_TENANT_PASSWORD"])}
 export SMOKE_TENANT_ID={shlex.quote(expected["SMOKE_TENANT_ID"])}
 export SMOKE_PLATFORM_ADMIN_EMAIL={shlex.quote(expected["SMOKE_PLATFORM_ADMIN_EMAIL"])}
 export SMOKE_PLATFORM_ADMIN_PASSWORD={shlex.quote(expected["SMOKE_PLATFORM_ADMIN_PASSWORD"])}
+export SMOKE_MEMBER_EMAIL={shlex.quote(expected["SMOKE_MEMBER_EMAIL"])}
+export SMOKE_MEMBER_PASSWORD={shlex.quote(expected["SMOKE_MEMBER_PASSWORD"])}
 {capture}
 {isolation}
 {emitter}
@@ -975,6 +979,8 @@ def test_smoke_credentials_never_enter_bash_xtrace_output():
         "SMOKE_TENANT_ID": "11111111-1111-4111-8111-111111111111",
         "SMOKE_PLATFORM_ADMIN_EMAIL": "xtrace-admin@example.test",
         "SMOKE_PLATFORM_ADMIN_PASSWORD": "xtrace-admin-password-sentinel",
+        "SMOKE_MEMBER_EMAIL": "xtrace-member@example.test",
+        "SMOKE_MEMBER_PASSWORD": "xtrace-member-password-sentinel",
     }
     canonical = (json.dumps(expected, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
     expected_digest = hashlib.sha256(canonical).hexdigest()

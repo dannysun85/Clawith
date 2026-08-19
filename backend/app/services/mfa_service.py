@@ -41,14 +41,25 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def identity_requires_mfa(user: object) -> bool:
-    """Return whether one membership/global role must enroll in MFA."""
+def identity_recommends_mfa(user: object) -> bool:
+    """Return whether this role should be strongly guided to enroll in MFA.
+
+    Company owners, company admins, and platform operators are prompted, but
+    enrollment never blocks login or ordinary product use.
+    """
 
     identity = getattr(user, "identity", None)
     return bool(
         getattr(identity, "is_platform_admin", False)
         or getattr(user, "role", None) in {"platform_admin", "org_owner", "org_admin"}
     )
+
+
+def identity_requires_mfa(user: object) -> bool:
+    """Enrollment is never mandatory; kept so older callers stay fail-open."""
+
+    del user
+    return False
 
 
 def generate_totp_secret() -> str:
@@ -344,6 +355,7 @@ __all__ = [
     "decode_challenge_token",
     "generate_recovery_codes",
     "generate_totp_secret",
+    "identity_recommends_mfa",
     "identity_requires_mfa",
     "matching_totp_step",
     "open_mfa_secret",
