@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import datetime, timezone
 import inspect
@@ -425,15 +426,25 @@ def test_worker_and_production_compose_enable_monitoring_contract():
 
 
 @pytest.mark.asyncio
-async def test_monitor_exits_after_consecutive_failures_for_worker_restart(
+async def test_monitor_degrades_but_keeps_running_after_consecutive_failures(
     monkeypatch,
 ):
+    """The monitor is an observer: sustained DB failures must not exit it.
+
+    Exiting used to terminate the whole dedicated worker via the critical-task
+    supervision in app.main, amplifying a monitor-only fault (e.g. corrupted
+    planner statistics) into a full worker outage.
+    """
+
     attempts = 0
 
     async def fail_flush():
         nonlocal attempts
         attempts += 1
-        raise RuntimeError("database unavailable")
+        if attempts < 5:
+            raise RuntimeError("database unavailable")
+        # Stop the infinite loop only after it has survived past the threshold.
+        raise asyncio.CancelledError()
 
     async def no_wait(_seconds):
         return None
@@ -458,10 +469,13 @@ async def test_monitor_exits_after_consecutive_failures_for_worker_restart(
     )
     monkeypatch.setattr(production_issue_monitor.asyncio, "sleep", no_wait)
 
-    with pytest.raises(RuntimeError, match="failure threshold"):
+    with pytest.raises(asyncio.CancelledError):
         await production_issue_monitor.start_production_issue_monitor_daemon()
 
-    assert attempts == 2
+    # Old behavior raised RuntimeError at attempt 2; the daemon must keep
+    # running until explicitly cancelled.
+    assert attempts == 5
+    assert production_issue_monitor._monitor_consecutive_db_failures == 4
 
 
 def test_first_alert_creates_a_privacy_safe_saas_owner_notification():

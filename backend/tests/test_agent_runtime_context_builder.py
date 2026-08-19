@@ -314,6 +314,80 @@ async def test_incomplete_started_tool_exchange_blocks_model_context():
 
 
 @pytest.mark.asyncio
+async def test_dangling_tool_calls_from_a_lost_ledger_row_never_reach_the_model():
+    """Incident W0/R3: a failed Run leaves unanswered tool_calls on the shared
+    direct-chat Thread; when its ledger rows were lost environmentally, the
+    next Run's model payload must omit the dangling assistant message instead
+    of emitting protocol-invalid context."""
+    snapshots = RunInputSnapshots(
+        session_context=SessionContextSnapshot.empty().to_json(),
+        session_context_version=0,
+        recent_session_messages=(),
+        related_run_summaries=(),
+        initial_input={"content": "retry after failure"},
+    )
+    builder = context_builder.ContextBuilder(
+        _SessionContextService(SessionContextPack(SessionContextSnapshot.empty(), ()))
+    )
+
+    state = _state(
+        snapshots=snapshots,
+        run_messages=[
+            _normal("user-question"),
+            _assistant("assistant-dangling", ["call-lost-a", "call-lost-b"]),
+            _normal("user-retry"),
+        ],
+    )
+    # The ledger rows are gone: no entries for either dangling call.
+    built = await builder.build(state, _context(state), tool_execution_ledger={})
+
+    emitted = built.recent_thread_messages
+    assert [message["id"] for message in emitted] == ["user-question", "user-retry"]
+    assert all("tool_calls" not in message for message in emitted)
+    assert built.blocked is True
+    assert built.retry_model is False
+    assert built.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_dangling_tool_calls_with_rebuilt_unknown_row_require_confirmation():
+    """After the W0/R1 unknown rebuild, the dangling call enters the existing
+    human-confirmation gate and still never reaches the model payload."""
+    snapshots = RunInputSnapshots(
+        session_context=SessionContextSnapshot.empty().to_json(),
+        session_context_version=0,
+        recent_session_messages=(),
+        related_run_summaries=(),
+        initial_input={"content": "retry after failure"},
+    )
+    builder = context_builder.ContextBuilder(
+        _SessionContextService(SessionContextPack(SessionContextSnapshot.empty(), ()))
+    )
+
+    state = _state(
+        snapshots=snapshots,
+        run_messages=[
+            _normal("user-question"),
+            _assistant("assistant-dangling", ["call-lost"]),
+            _normal("user-retry"),
+        ],
+    )
+    built = await builder.build(
+        state,
+        _context(state),
+        tool_execution_ledger={
+            "call-lost": {"status": "unknown", "tool_name": "write_file"},
+        },
+    )
+
+    emitted = built.recent_thread_messages
+    assert [message["id"] for message in emitted] == ["user-question", "user-retry"]
+    assert all("tool_calls" not in message for message in emitted)
+    assert built.blocked is True
+    assert built.requires_confirmation is True
+
+
+@pytest.mark.asyncio
 async def test_current_run_uses_checkpoint_lifecycle_and_has_no_query_projection_input():
     snapshots = RunInputSnapshots(
         session_context=SessionContextSnapshot.empty().to_json(),

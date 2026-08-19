@@ -674,6 +674,42 @@ async def test_rejecting_start_atomically_releases_held_lane():
     assert db.flush_count == 1
 
 
+@pytest.mark.asyncio
+async def test_rejecting_orphan_start_command_terminates_without_raising():
+    """A start Command whose Run was cascade-deleted must still be rejectable.
+
+    Raising here used to leave the Command claimed forever: the rejection
+    rolled back, the claim TTL expired, and the worker re-claimed the same
+    orphan every cycle (the production RuntimePersistenceError loop).
+    """
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    tenant_id = uuid.uuid4()
+    command = _command(
+        tenant_id=tenant_id,
+        run_id=uuid.uuid4(),
+        command_type="start",
+        status="claimed",
+        claimant="worker-1",
+        attempt_count=1,
+    )
+    # Command lookup succeeds; the Run lookup returns None.
+    db = _FakeSession(command, None)
+
+    rejected = await persistence.mark_command_rejected(
+        db,
+        tenant_id=tenant_id,
+        command_id=command.id,
+        claimant="worker-1",
+        error_code="run_not_found",
+        clock=lambda: now,
+    )
+
+    assert rejected.status == "rejected"
+    assert rejected.error_code == "run_not_found"
+    assert rejected.claim_expires_at is None
+    assert db.flush_count == 1
+
+
 def test_rejected_start_lane_repair_targets_only_abandoned_holders() -> None:
     statement = persistence._release_rejected_start_lanes_statement()
     sql = str(

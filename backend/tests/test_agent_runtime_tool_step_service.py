@@ -20,6 +20,7 @@ from app.services.agent_runtime.state import (
 )
 from app.services.agent_runtime.tool_execution import (
     RetryableToolNodeError,
+    ToolExecutionError,
     ToolExecutionOutcome,
     ToolExecutionReconciliationPending,
     ToolExecutionReservation,
@@ -507,6 +508,244 @@ async def test_success_is_reserved_before_execution_and_settled_afterwards(
             "result_ref": None,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_missing_ledger_row_at_settle_defers_safe_read_without_killing_run(
+    monkeypatch,
+) -> None:
+    """Incident regression: an environmentally lost ledger row must not kill the Run."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-lost", "read_file")
+    state = _state(tenant_id, agent, (call,))
+    context = _context(state)
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(context.run_id),
+        "call-lost",
+        "read_file",
+    )
+    executed: list[str] = []
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        del arguments, agent_id, user_id, session_id, on_output
+        executed.append(name)
+        return ToolExecutionOutcome(
+            status="succeeded",
+            result_summary="file contents",
+            result_ref=None,
+        )
+
+    async def mark_lost(db, **kwargs):
+        del db, kwargs
+        raise ToolExecutionError(
+            "tool_execution_not_found",
+            f"tool execution {execution.id} does not exist in tenant {tenant_id}",
+        )
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_succeeded", mark_lost)
+
+    with pytest.raises(ToolExecutionReconciliationPending) as exc_info:
+        await _service(agent, _CancelSource(None), execute).execute_pending(
+            state,
+            context,
+            (call,),
+        )
+
+    assert exc_info.value.code == "tool_ledger_row_missing"
+    assert exc_info.value.defer_without_attempt is True
+    assert executed == ["read_file"]
+
+
+@pytest.mark.asyncio
+async def test_missing_ledger_row_at_settle_rebuilds_unknown_for_write_tools(
+    monkeypatch,
+) -> None:
+    """A lost write receipt is rebuilt as unknown for human confirmation."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-lost-write", "write_file", {"path": "notes.md", "content": "hi"})
+    state = _state(tenant_id, agent, (call,))
+    context = _context(state)
+    run_uuid = uuid.UUID(context.run_id)
+    lost_execution = _execution(tenant_id, run_uuid, "call-lost-write", "write_file")
+    rebuilt_execution = _execution(tenant_id, run_uuid, "call-lost-write", "write_file")
+    reserve_calls: list[dict] = []
+
+    async def reserve(db, **kwargs):
+        del db
+        reserve_calls.append(kwargs)
+        return _reservation(
+            lost_execution if len(reserve_calls) == 1 else rebuilt_execution
+        )
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        del name, arguments, agent_id, user_id, session_id, on_output
+        return ToolExecutionOutcome(
+            status="succeeded",
+            result_summary="written",
+            result_ref=None,
+        )
+
+    async def mark_lost(db, **kwargs):
+        del db, kwargs
+        raise ToolExecutionError(
+            "tool_execution_not_found",
+            f"tool execution {lost_execution.id} does not exist in tenant {tenant_id}",
+        )
+
+    marked_unknown: list[dict] = []
+
+    async def mark_unknown(db, **kwargs):
+        del db
+        marked_unknown.append(kwargs)
+        rebuilt_execution.status = "unknown"
+        rebuilt_execution.result_summary = kwargs["result_summary"]
+        rebuilt_execution.result_metadata = {
+            "error_code": kwargs["error_code"],
+            "retryable": kwargs["retryable"],
+        }
+        return rebuilt_execution
+
+    async def terminal_forbidden(*args, **kwargs):
+        raise AssertionError(f"the lost row must not be marked again: {args}, {kwargs}")
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_succeeded", mark_lost)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_unknown", mark_unknown)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_failed", terminal_forbidden)
+
+    result = await _service(agent, _CancelSource(None), execute).execute_pending(
+        state,
+        context,
+        (call,),
+    )
+
+    assert result.error is None
+    assert len(reserve_calls) == 2
+    assert reserve_calls[1]["lease_owner"] != reserve_calls[0]["lease_owner"]
+    assert marked_unknown[0]["execution_id"] == rebuilt_execution.id
+    assert marked_unknown[0]["error_code"] == "tool_ledger_row_missing"
+    assert result.waiting_request == {
+        "waiting_type": "user",
+        "correlation_id": str(uuid.uuid5(run_uuid, "tool-reconcile:call-lost-write")),
+        "reason": "tool_ledger_row_missing",
+        "tool_call_id": "call-lost-write",
+    }
+    assert result.pending_tool_calls == (call,)
+    assert [message["execution_status"] for message in result.messages] == ["unknown"]
+    assert result.messages[0]["error_code"] == "tool_ledger_row_missing"
+
+
+@pytest.mark.asyncio
+async def test_missing_ledger_row_during_exception_marking_defers_safe_read(
+    monkeypatch,
+) -> None:
+    """The _mark_exception settlement chain follows the same ledger-missing rule."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-lost-exc", "read_file")
+    state = _state(tenant_id, agent, (call,))
+    context = _context(state)
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(context.run_id),
+        "call-lost-exc",
+        "read_file",
+    )
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        del name, arguments, agent_id, user_id, session_id, on_output
+        raise RuntimeError("provider exploded")
+
+    async def mark_lost(db, **kwargs):
+        del db, kwargs
+        raise ToolExecutionError(
+            "tool_execution_not_found",
+            f"tool execution {execution.id} does not exist in tenant {tenant_id}",
+        )
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_failed", mark_lost)
+
+    with pytest.raises(ToolExecutionReconciliationPending) as exc_info:
+        await _service(agent, _CancelSource(None), execute).execute_pending(
+            state,
+            context,
+            (call,),
+        )
+
+    assert exc_info.value.code == "tool_ledger_row_missing"
+    assert exc_info.value.defer_without_attempt is True
+
+
+@pytest.mark.asyncio
+async def test_reserve_defers_when_committed_ledger_row_is_not_visible(
+    monkeypatch,
+) -> None:
+    """R2: a just-committed ledger row that is not readable defers before execution."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-invisible", "read_file")
+    state = _state(tenant_id, agent, (call,))
+    context = _context(state)
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(context.run_id),
+        "call-invisible",
+        "read_file",
+    )
+    executed: list[str] = []
+
+    class _MissingRowDB(_DB):
+        async def execute(self, statement):
+            if "agent_tool_executions" in str(statement):
+                return _Result(None)
+            return await super().execute(statement)
+
+    @asynccontextmanager
+    async def missing_row_factory():
+        yield _MissingRowDB(agent)
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        del arguments, agent_id, user_id, session_id, on_output
+        executed.append(name)
+        return ToolExecutionOutcome(
+            status="succeeded",
+            result_summary="file contents",
+            result_ref=None,
+        )
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=missing_row_factory,
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+        autonomy_enforcer=_allow_autonomy,
+    )
+
+    with pytest.raises(ToolExecutionReconciliationPending) as exc_info:
+        await service.execute_pending(state, context, (call,))
+
+    assert exc_info.value.code == "tool_ledger_row_missing"
+    assert exc_info.value.defer_without_attempt is True
+    assert executed == []
 
 
 @pytest.mark.asyncio

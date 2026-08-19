@@ -890,11 +890,13 @@ async def mark_command_rejected(
         )
         run = run_result.scalar_one_or_none()
         if run is None:
-            raise RuntimePersistenceError(
-                "run_not_found",
-                "rejected start command Run does not exist in its tenant",
-            )
-        if run.lane_held:
+            # The Run was removed (e.g. cascade delete) while its start
+            # Command sat claimed. The lane died with the Run, so there is
+            # nothing to release; rejecting the Command is the terminal,
+            # loop-breaking outcome. Raising here used to leave such
+            # Commands claimed forever, re-claimed on every TTL expiry.
+            pass
+        elif run.lane_held:
             run.lane_held = False
             run.lane_claimed_at = None
             lane_released = True

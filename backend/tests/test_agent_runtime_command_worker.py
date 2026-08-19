@@ -19,7 +19,9 @@ from app.services.agent_runtime.command_worker import (
     RuntimeCommandRecord,
     RuntimeCommandWorker,
     RuntimeRunRecord,
+    runtime_command_record,
 )
+from app.services.agent_runtime.persistence import RuntimePersistenceError
 from app.services.agent_runtime.state import (
     RunInputSnapshots,
     RunRegistrySnapshot,
@@ -756,6 +758,135 @@ async def test_defer_release_atomically_refunds_the_consumed_attempt() -> None:
     assert command.attempt_count == 2
     release.assert_awaited_once()
     assert "flush" in timeline
+
+
+@pytest.mark.asyncio
+async def test_ledger_row_missing_defer_refunds_attempt_and_preserves_code(
+    _stub_business_attempt_boundary,
+) -> None:
+    """Incident W0/R1: an environmentally lost tool ledger row defers the
+    command without consuming an attempt, so the chain cannot exhaust on its
+    own and the retry carries the ledger-missing code instead of the raw
+    tool_execution_not_found."""
+    timeline: list[str] = []
+    run = _run()
+    command = _command(run, "start")
+    worker = _worker(
+        timeline=timeline,
+        run=run,
+        reader=_Reader(command=(None,), latest=(None,)),
+        executor=_Executor(
+            timeline,
+            error=ToolExecutionReconciliationPending(
+                "tool_ledger_row_missing",
+                "committed tool execution ledger row is not visible",
+                defer_without_attempt=True,
+            ),
+        ),
+    )
+    worker._defer_without_attempt = AsyncMock()  # type: ignore[method-assign]
+
+    with patch(
+        "app.services.agent_runtime.command_worker.claim_next_command",
+        new=AsyncMock(return_value=command),
+    ):
+        result = await worker.run_once()
+
+    assert result.status == "retry"
+    assert result.error_code == "tool_ledger_row_missing"
+    _stub_business_attempt_boundary.assert_awaited_once()
+    worker._defer_without_attempt.assert_awaited_once()  # type: ignore[attr-defined]
+    assert worker._defer_without_attempt.await_args.args[1] == (  # type: ignore[attr-defined]
+        "tool_ledger_row_missing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_run_rejects_orphan_start_command_without_retry(
+    _stub_business_attempt_boundary,
+) -> None:
+    """Incident: a claimed start whose Run was deleted must terminalize.
+
+    Raising RuntimePersistenceError used to roll the rejection back, leave the
+    Command claimed, and re-claim it on every TTL expiry.
+    """
+    timeline: list[str] = []
+    run = _run()
+    command = _command(run, "start")
+    worker = RuntimeCommandWorker(
+        session_factory=_SessionFactory(timeline, None),  # type: ignore[arg-type]
+        lock_engine=_Engine(_Connection(timeline)),  # type: ignore[arg-type]
+        checkpoint_reader=_Reader(),
+        command_executor=_Executor(timeline),
+        post_checkpoint_handler=_PostCheckpointHandler(timeline),
+        claimant="worker-1",
+        claim_ttl_seconds=60,
+        claim_renew_seconds=10,
+        max_attempts=5,
+    )
+
+    with (
+        patch(
+            "app.services.agent_runtime.command_worker.claim_next_command",
+            new=AsyncMock(return_value=command),
+        ),
+        patch(
+            "app.services.agent_runtime.command_worker.mark_command_rejected",
+            new=AsyncMock(),
+        ) as rejected,
+    ):
+        result = await worker.run_once()
+
+    assert result.status == "rejected"
+    assert result.error_code == "run_not_found"
+    rejected.assert_awaited_once()
+    _stub_business_attempt_boundary.assert_not_awaited()
+    assert "lock_acquire" not in timeline
+
+
+@pytest.mark.asyncio
+async def test_vanished_command_rejection_is_terminal_and_skips_handler() -> None:
+    timeline: list[str] = []
+    run = _run()
+    command = _command(run, "start")
+    rejection_handler = _RejectionHandler()
+    worker = _worker(
+        timeline=timeline,
+        run=run,
+        reader=_Reader(),
+        executor=_Executor(timeline),
+        rejection_handler=rejection_handler,
+    )
+    runtime_run = RuntimeRunRecord(
+        tenant_id=run.tenant_id,
+        run_id=run.id,
+        thread_id=str(run.runtime_thread_id),
+        runtime_type="langgraph",
+        goal=run.goal,
+        run_kind=run.run_kind,
+        source_type=run.source_type,
+        model_id=str(run.model_id),
+        graph_name=run.graph_name,
+        graph_version=run.graph_version,
+    )
+
+    with patch(
+        "app.services.agent_runtime.command_worker.mark_command_rejected",
+        new=AsyncMock(
+            side_effect=RuntimePersistenceError(
+                "command_not_found",
+                "command was cascade-deleted",
+            )
+        ),
+    ):
+        await worker._mark_rejected(
+            runtime_command_record(command),
+            "run_not_found",
+            error_message="command Run does not exist in its tenant",
+            run=runtime_run,
+        )
+
+    assert rejection_handler.calls == []
 
 
 @pytest.mark.asyncio

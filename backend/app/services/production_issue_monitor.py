@@ -47,6 +47,7 @@ _monitor_started_at: datetime | None = None
 _monitor_last_db_loop_success_at: datetime | None = None
 _monitor_oldest_due_delivery_age_seconds = 0.0
 _monitor_consecutive_db_failures = 0
+_monitor_failure_threshold_alerted = False
 _monitor_interval_seconds = 30
 _ALLOWED_METADATA_KEYS = {
     "status_code",
@@ -1303,9 +1304,15 @@ def production_issue_monitor_health(
 
 
 async def start_production_issue_monitor_daemon() -> None:
-    """Continuously alert and cap event retention on the worker process."""
+    """Continuously alert and cap event retention on the worker process.
+
+    The monitor is an observer: a failing monitor must never take the worker
+    down with it.  Sustained DB failures degrade this daemon (logged critical
+    once, exposed via health) while the rest of the worker keeps running.
+    """
 
     global _monitor_consecutive_db_failures
+    global _monitor_failure_threshold_alerted
     global _monitor_interval_seconds
     global _monitor_last_db_loop_success_at
     global _monitor_started_at
@@ -1318,6 +1325,7 @@ async def start_production_issue_monitor_daemon() -> None:
     _monitor_started_at = datetime.now(timezone.utc)
     _monitor_last_db_loop_success_at = None
     _monitor_consecutive_db_failures = 0
+    _monitor_failure_threshold_alerted = False
     logger.info("[production-issues] monitor started interval={}s", interval)
     purge_counter = 0
     while True:
@@ -1331,6 +1339,7 @@ async def start_production_issue_monitor_daemon() -> None:
                 purge_counter = 0
             _monitor_last_db_loop_success_at = datetime.now(timezone.utc)
             _monitor_consecutive_db_failures = 0
+            _monitor_failure_threshold_alerted = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1340,13 +1349,17 @@ async def start_production_issue_monitor_daemon() -> None:
                 type(exc).__name__,
                 _monitor_consecutive_db_failures,
             )
-            if _monitor_consecutive_db_failures >= PRODUCTION_ISSUE_MONITOR_MAX_CONSECUTIVE_FAILURES:
+            if (
+                _monitor_consecutive_db_failures
+                >= PRODUCTION_ISSUE_MONITOR_MAX_CONSECUTIVE_FAILURES
+                and not _monitor_failure_threshold_alerted
+            ):
+                _monitor_failure_threshold_alerted = True
                 logger.critical(
-                    "PRODUCTION_MONITOR_FATAL release={} task={} error_type={} consecutive_failures={}",
+                    "PRODUCTION_MONITOR_DEGRADED release={} task={} error_type={} consecutive_failures={}",
                     getattr(settings, "APP_VERSION", "unknown"),
                     "production_issue_monitor",
                     type(exc).__name__,
                     _monitor_consecutive_db_failures,
                 )
-                raise RuntimeError("Production issue monitor exceeded its failure threshold") from exc
         await asyncio.sleep(interval)

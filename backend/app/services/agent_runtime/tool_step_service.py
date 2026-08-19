@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import logging
 import re
 from typing import Protocol, cast
 import uuid
@@ -91,6 +92,9 @@ from app.services.builtin_tool_definitions import (
     builtin_sensitive_paths,
 )
 from app.services.media_tool_registry import MEDIA_ARTIFACT_TOOL_MODALITIES
+
+
+logger = logging.getLogger(__name__)
 
 
 _CONTROL_TOOL_NAMES = frozenset({"finish", "wait"})
@@ -1083,7 +1087,52 @@ class RuntimeToolStepService:
                         "assistant_message_id": assistant_message_id,
                     },
                 )
-                return reservation
+        if reservation.created:
+            await self._require_visible_ledger_row(
+                tenant_id=tenant_id,
+                reservation=reservation,
+            )
+        return reservation
+
+    async def _require_visible_ledger_row(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        reservation: ToolExecutionReservation,
+    ) -> None:
+        """Prove a freshly committed ledger row is readable before executing.
+
+        A committed row that is not visible to a follow-up read means the
+        environment lost it (failover/WAL/volume rollback). Defer without
+        consuming the attempt instead of executing against a doomed receipt.
+        """
+        execution = reservation.execution
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(AgentToolExecution.id).where(
+                    AgentToolExecution.tenant_id == tenant_id,
+                    AgentToolExecution.id == execution.id,
+                )
+            )
+            if result.scalar_one_or_none() is not None:
+                return
+        logger.warning(
+            "tool execution ledger row missing right after reserve commit",
+            extra={
+                "error_code": "tool_ledger_row_missing",
+                "tenant_id": str(tenant_id),
+                "run_id": str(execution.run_id),
+                "tool_call_id": execution.tool_call_id,
+                "execution_id": str(execution.id),
+                "tool_name": execution.tool_name,
+            },
+        )
+        raise ToolExecutionReconciliationPending(
+            "tool_ledger_row_missing",
+            "committed tool execution ledger row is not visible; "
+            "the attempt is deferred so a later attempt can re-reserve",
+            defer_without_attempt=True,
+        )
 
     async def _settle_outcome(
         self,
@@ -1434,6 +1483,184 @@ class RuntimeToolStepService:
                 metadata={"error_class": type(exc).__name__},
             ),
         )
+
+    async def _handle_ledger_row_missing(
+        self,
+        *,
+        state: RuntimeGraphState,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        command_id: str,
+        call_id: str,
+        tool_name: str,
+        arguments: dict,
+        assistant_message_id: str,
+        policy: ToolPolicy,
+        lost_execution_id: uuid.UUID,
+        error: ToolExecutionError,
+        messages: Sequence[JsonObject],
+        pending_tool_calls: Sequence[JsonObject],
+        tail_tool_calls: Sequence[JsonObject],
+    ) -> ToolStepResult:
+        """Keep the Run alive when the ledger row vanished environmentally.
+
+        A ``read + safe`` call carries no side effect, so the command-level
+        defer re-reserves (recreating the lost row) and re-executes on the
+        next attempt. Any other call must never be re-executed blindly: the
+        lost row is rebuilt as ``unknown`` and the Run enters the existing
+        human-reconciliation waiting path instead of terminating.
+        """
+        logger.warning(
+            "tool execution ledger row missing at settlement",
+            extra={
+                "error_code": "tool_ledger_row_missing",
+                "tenant_id": str(tenant_id),
+                "run_id": str(run_id),
+                "tool_call_id": call_id,
+                "execution_id": str(lost_execution_id),
+                "tool_name": tool_name,
+            },
+        )
+        if (
+            policy.side_effect_classification == "read"
+            and policy.retry_policy == "safe"
+        ):
+            raise ToolExecutionReconciliationPending(
+                "tool_ledger_row_missing",
+                "tool execution ledger row vanished after reserve; the "
+                "side-effect-free read is deferred and re-executed later",
+                defer_without_attempt=True,
+            ) from error
+        outcome = await self._rebuild_unknown_ledger_row(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            command_id=command_id,
+            call_id=call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            assistant_message_id=assistant_message_id,
+            policy=policy,
+            lost_execution_id=lost_execution_id,
+        )
+        if _is_group_agent_run(state):
+            return self._group_unknown_failure(
+                run_id=run_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                policy=policy,
+                outcome=outcome,
+                messages=messages,
+                pending_tool_calls=tail_tool_calls,
+            )
+        return ToolStepResult(
+            messages=(
+                *messages,
+                _result_message(
+                    run_id=run_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    outcome=outcome,
+                ),
+            ),
+            waiting_request=_waiting_request(
+                run_id=run_id,
+                call_id=call_id,
+                requires_confirmation=True,
+                error_code="tool_ledger_row_missing",
+            ),
+            pending_tool_calls=tuple(pending_tool_calls),
+        )
+
+    async def _rebuild_unknown_ledger_row(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        command_id: str,
+        call_id: str,
+        tool_name: str,
+        arguments: dict,
+        assistant_message_id: str,
+        policy: ToolPolicy,
+        lost_execution_id: uuid.UUID,
+    ) -> ToolExecutionOutcome:
+        """Recreate an environmentally lost ledger row as ``unknown``.
+
+        The rebuilt row keeps the existing reconciliation loop functional:
+        the session runtime state surfaces it as a pending reconciliation and
+        the existing reconcile endpoint can settle it before any resume. If
+        the rebuild itself hits the environment (or the row reappeared), defer
+        so the standard reservation decisions reconcile on the next attempt.
+        """
+        rebuild_lease_owner = _tool_execution_lease_owner(command_id, call_id)
+        try:
+            async with self._session_factory() as db:
+                async with db.begin():
+                    rebuilt = await reserve_tool_execution(
+                        db,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        assistant_message_id=assistant_message_id,
+                        arguments=arguments,
+                        sanitized_arguments=sanitize_tool_arguments(
+                            arguments,
+                            sensitive_paths=builtin_sensitive_paths(tool_name),
+                        ),
+                        request_ref=None,
+                        side_effect_classification=cast(str, policy.side_effect_classification),  # type: ignore[arg-type]
+                        retry_policy=cast(str, policy.retry_policy),  # type: ignore[arg-type]
+                        lease_owner=rebuild_lease_owner,
+                        lease_ttl_seconds=self._lease_ttl_seconds,
+                        resume_safe_read=False,
+                    )
+                    if not rebuilt.created:
+                        raise ToolExecutionError(
+                            "tool_ledger_row_missing",
+                            "the tool execution ledger row reappeared before "
+                            "the unknown rebuild; defer to the standard "
+                            "reservation reconciliation",
+                        )
+                    execution = await mark_tool_execution_unknown(
+                        db,
+                        tenant_id=tenant_id,
+                        execution_id=rebuilt.execution.id,
+                        lease_owner=rebuild_lease_owner,
+                        result_summary=(
+                            "The tool execution ledger row was lost by the "
+                            "environment after the tool ran; the business "
+                            "outcome is unknown and requires human confirmation. "
+                            f"(lost execution id: {lost_execution_id})"
+                        ),
+                        result_ref=None,
+                        error_code="tool_ledger_row_missing",
+                        retryable=False,
+                    )
+                    await _insert_runtime_activity(
+                        db,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        key=f"activity:tool:{call_id}:unknown",
+                        summary=f"Runtime tool {tool_name} unknown",
+                        payload={
+                            "status": "done",
+                            "activity_type": "tool_call",
+                            "call_id": call_id,
+                            "name": tool_name,
+                            "args": dict(rebuilt.execution.sanitized_arguments or {}),
+                            "result": execution.result_summary or "",
+                            "execution_status": "unknown",
+                            "error_code": "tool_ledger_row_missing",
+                        },
+                    )
+        except ToolExecutionError as exc:
+            raise ToolExecutionReconciliationPending(
+                "tool_ledger_row_missing",
+                str(exc),
+                defer_without_attempt=True,
+            ) from exc
+        return execution_outcome(execution)
 
     def _group_unknown_failure(
         self,
@@ -2174,13 +2401,33 @@ class RuntimeToolStepService:
                             actor_user_id=actor_user_id,
                         )
                     except Exception as exc:
-                        outcome = await self._mark_exception(
-                            tenant_id=tenant_id,
-                            reservation=reservation,
-                            lease_owner=lease_owner,
-                            policy=policy,
-                            exc=exc,
-                        )
+                        try:
+                            outcome = await self._mark_exception(
+                                tenant_id=tenant_id,
+                                reservation=reservation,
+                                lease_owner=lease_owner,
+                                policy=policy,
+                                exc=exc,
+                            )
+                        except ToolExecutionError as mark_exc:
+                            if mark_exc.code != "tool_execution_not_found":
+                                raise
+                            return await self._handle_ledger_row_missing(
+                                state=state,
+                                tenant_id=tenant_id,
+                                run_id=run_id,
+                                command_id=context.command_id,
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                assistant_message_id=assistant_message_id,
+                                policy=policy,
+                                lost_execution_id=reservation.execution.id,
+                                error=mark_exc,
+                                messages=messages,
+                                pending_tool_calls=tool_calls[index:],
+                                tail_tool_calls=tool_calls[index + 1 :],
+                            )
                         if outcome.status == "unknown":
                             if _is_group_agent_run(state):
                                 return self._group_unknown_failure(
@@ -2441,13 +2688,33 @@ class RuntimeToolStepService:
                 except GroupWorkspaceReconciliationPending:
                     raise
                 except Exception as exc:
-                    outcome = await self._mark_exception(
-                        tenant_id=tenant_id,
-                        reservation=reservation,
-                        lease_owner=lease_owner,
-                        policy=policy,
-                        exc=exc,
-                    )
+                    try:
+                        outcome = await self._mark_exception(
+                            tenant_id=tenant_id,
+                            reservation=reservation,
+                            lease_owner=lease_owner,
+                            policy=policy,
+                            exc=exc,
+                        )
+                    except ToolExecutionError as mark_exc:
+                        if mark_exc.code != "tool_execution_not_found":
+                            raise
+                        return await self._handle_ledger_row_missing(
+                            state=state,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            command_id=context.command_id,
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            assistant_message_id=assistant_message_id,
+                            policy=policy,
+                            lost_execution_id=reservation.execution.id,
+                            error=mark_exc,
+                            messages=messages,
+                            pending_tool_calls=tool_calls[index:],
+                            tail_tool_calls=tool_calls[index + 1 :],
+                        )
                     if outcome.status == "unknown":
                         if _is_group_agent_run(state):
                             return self._group_unknown_failure(
@@ -2501,6 +2768,31 @@ class RuntimeToolStepService:
                             outcome=proposed_outcome,
                         )
                     except Exception as exc:
+                        if (
+                            isinstance(exc, ToolExecutionError)
+                            and exc.code == "tool_execution_not_found"
+                            and not _is_group_workspace_mutation_call(
+                                state,
+                                tool_name,
+                                arguments,
+                            )
+                        ):
+                            return await self._handle_ledger_row_missing(
+                                state=state,
+                                tenant_id=tenant_id,
+                                run_id=run_id,
+                                command_id=context.command_id,
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                assistant_message_id=assistant_message_id,
+                                policy=policy,
+                                lost_execution_id=reservation.execution.id,
+                                error=exc,
+                                messages=messages,
+                                pending_tool_calls=tool_calls[index:],
+                                tail_tool_calls=tool_calls[index + 1 :],
+                            )
                         if _is_group_workspace_mutation_call(
                             state,
                             tool_name,

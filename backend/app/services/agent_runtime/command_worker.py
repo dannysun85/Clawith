@@ -19,6 +19,7 @@ from app.core.logging_config import set_trace_id
 from app.models.agent_run import AgentRun
 from app.models.agent_run_command import AgentRunCommand
 from app.services.agent_runtime.persistence import (
+    RuntimePersistenceError,
     begin_command_attempt,
     claim_next_command,
     mark_command_applied,
@@ -503,17 +504,31 @@ class RuntimeCommandWorker:
         run: RuntimeRunRecord | None,
     ) -> None:
         delivered_message: tuple[uuid.UUID, uuid.UUID] | None = None
+        command_vanished = False
         async with self._session_factory() as db:
             async with db.begin():
-                await mark_command_rejected(
-                    db,
-                    tenant_id=command.tenant_id,
-                    command_id=command.id,
-                    claimant=self._claimant,
-                    error_code=error_code,
-                )
+                try:
+                    await mark_command_rejected(
+                        db,
+                        tenant_id=command.tenant_id,
+                        command_id=command.id,
+                        claimant=self._claimant,
+                        error_code=error_code,
+                    )
+                except RuntimePersistenceError as exc:
+                    if exc.code != "command_not_found":
+                        raise
+                    # The Command (and its Run) were cascade-deleted while
+                    # claimed. There is nothing left to reject; treat as done
+                    # instead of surfacing an error every claim cycle.
+                    command_vanished = True
+                    logger.warning(
+                        "Runtime Command vanished before rejection",
+                        extra={"command_id": command.id, "error_code": error_code},
+                    )
                 if (
-                    self._rejection_handler is not None
+                    not command_vanished
+                    and self._rejection_handler is not None
                     and run is not None
                     and command.command_type == "start"
                     and error_code not in {"already_terminal", "cancelled_before_apply"}
