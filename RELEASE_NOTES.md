@@ -24,9 +24,33 @@
   off by default: structured briefs, storyboard/outline approvals, per-shot
   units, and candidate QA. The v1 pipelines remain the default.
 
+## CEO orchestrator P1 (opt-in, observational)
+
+- Each company can enable a single system-role CEO employee (not recruitable,
+  excluded from seat quota) that reads the company panorama and runs gated
+  briefing/meeting facilitation. All automation ships off by default behind
+  `CEO_ORCHESTRATOR_ENABLED` plus empty tenant/agent allowlists.
+- New read-only `company_brief_snapshot` tool composes the workforce topology,
+  OKR, and work projections with a hard size cap; it refuses to run outside an
+  enabled CEO context.
+- Daily/weekly briefing triggers are durable-runtime occurrences created only
+  when the platform flag, tenant opt-in, and briefing toggle are all on;
+  standup meetings produce minutes without creating tasks, and a per-tenant
+  credits budget cap fails closed on automation runs.
+
+## Runtime resilience
+
+- Settle-time `tool_execution_not_found` (ledger row lost to an environmental
+  database event) no longer kills the run: read+safe tools defer and re-reserve,
+  writes rebuild an unknown ledger row and wait for human reconciliation.
+  Reserve re-reads the ledger row after commit and raises structured alerts.
+- Commands whose run vanished mid-claim are rejected terminally instead of
+  looping, and the production issue monitor stays observational on its own
+  failure path.
+
 ## Operations
 
-- Includes Alembic migrations up to `subscription_change_kind`.
+- Includes Alembic migrations up to `ceo_orchestrator_settings`.
 - Rollback is the normal immutable-release rollback to v1.11.41.
 
 # v1.11.41 — WeChat Pay Checkout and Four-P0 Product Closure
