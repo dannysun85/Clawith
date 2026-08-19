@@ -23,12 +23,13 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["subscription_change_kind"]
+    assert _script_directory().get_heads() == ["ceo_orchestrator_settings"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("subscription_change_kind")
+    release_head = script.get_revision("ceo_orchestrator_settings")
+    subscription_change_revision = script.get_revision("subscription_change_kind")
     payment_order_period_revision = script.get_revision("payment_order_period")
     selection_receipts_revision = script.get_revision("deliverable_selection_receipts")
     creative_brief_revision = script.get_revision("creative_brief_receipts")
@@ -70,7 +71,8 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("payment_order_period",)
+    assert release_head._normalized_down_revisions == ("subscription_change_kind",)
+    assert subscription_change_revision._normalized_down_revisions == ("payment_order_period",)
     assert payment_order_period_revision._normalized_down_revisions == ("deliverable_selection_receipts",)
     assert selection_receipts_revision._normalized_down_revisions == ("creative_brief_receipts",)
     assert creative_brief_revision._normalized_down_revisions == ("legacy_assistant_lifecycle",)

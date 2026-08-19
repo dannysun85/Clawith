@@ -25,7 +25,7 @@ limitations:
 workflows:
   - "Collect the company brief snapshot, OKR report status, and recent workforce activity"
   - "Produce a bounded briefing: yesterday's progress, today's priorities, blockers, risks"
-  - "In meetings, ask each participating employee one directed question and write minutes to the group workspace"
+  - "In meetings, ask each participating employee one directed question and write minutes to my own workspace (meeting-minutes/)"
 deliverables:
   - "Daily or weekly executive briefing (workspace document plus session message)"
   - "Meeting minutes with suggested action items as text only"

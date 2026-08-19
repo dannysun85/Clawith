@@ -816,8 +816,22 @@ async def start_ceo_meeting(
         )
     denial = await automation_budget_denial(db, settings=settings)
     if denial is not None:
-        await _notify_enabler_automation_blocked(db, settings=settings, reason=denial)
-        _audit_ceo_automation_blocked(db, settings=settings, reason=denial, source="meeting_start")
+        # The API layer converts the error below into HTTPException and the
+        # request transaction is rolled back, which would silently drop the
+        # notification and audit rows. Persist them in an independent session
+        # (same pattern as the daemon gate in gate_ceo_trigger_automation).
+        tenant_id = settings.tenant_id
+        async with async_session() as audit_db:
+            persisted_result = await audit_db.execute(
+                select(CeoOrchestratorSettings).where(
+                    CeoOrchestratorSettings.tenant_id == tenant_id
+                )
+            )
+            persisted_settings = persisted_result.scalar_one_or_none()
+            if persisted_settings is not None:
+                await _notify_enabler_automation_blocked(audit_db, settings=persisted_settings, reason=denial)
+                _audit_ceo_automation_blocked(audit_db, settings=persisted_settings, reason=denial, source="meeting_start")
+                await audit_db.commit()
         raise CeoOrchestratorError(
             "ceo_budget_cap_exceeded",
             f"CEO automation budget cap reached ({denial}); the meeting was not started",

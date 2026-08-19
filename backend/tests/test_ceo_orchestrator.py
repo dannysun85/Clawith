@@ -342,6 +342,53 @@ async def test_meeting_start_fail_closed_when_rollout_closed(monkeypatch: pytest
     assert excinfo.value.code == "ceo_orchestrator_not_available"
 
 
+@pytest.mark.asyncio
+async def test_meeting_start_budget_block_persists_notify_and_audit_outside_request_tx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Budget-blocked meeting start: the API layer turns the error into an
+    HTTPException and the request transaction rolls back, so the notification
+    and audit rows must be written (and committed) in an independent session."""
+    settings = _settings_row()
+    monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: True)
+
+    async def _deny(db, *, settings, **kwargs):  # noqa: ARG001
+        return "daily cap reached"
+
+    monkeypatch.setattr(ceo_orchestrator, "automation_budget_denial", _deny)
+
+    calls: dict[str, object] = {}
+
+    async def _notify(db, *, settings, reason):  # noqa: ARG001
+        calls["notify_db"] = db
+
+    def _audit(db, *, settings, reason, source):  # noqa: ARG001
+        calls["audit_db"] = db
+        calls["source"] = source
+
+    monkeypatch.setattr(ceo_orchestrator, "_notify_enabler_automation_blocked", _notify)
+    monkeypatch.setattr(ceo_orchestrator, "_audit_ceo_automation_blocked", _audit)
+
+    audit_db = _QueueSession([_FakeResult(scalar=settings)])
+    monkeypatch.setattr(ceo_orchestrator, "async_session", lambda: audit_db)
+
+    request_db = _QueueSession()
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as excinfo:
+        await ceo_orchestrator.start_ceo_meeting(
+            request_db,
+            settings=settings,
+            actor=SimpleNamespace(id=uuid.uuid4()),
+            kind="morning",
+        )
+    assert excinfo.value.code == "ceo_budget_cap_exceeded"
+    assert calls["notify_db"] is audit_db
+    assert calls["audit_db"] is audit_db
+    assert calls["source"] == "meeting_start"
+    assert audit_db.committed == 1
+    assert request_db.committed == 0
+    assert request_db.added == []
+
+
 def test_ceo_orchestrator_never_writes_tasks() -> None:
     """FR-CEO-4: action items are advisory text; no Task model usage anywhere."""
     import inspect
