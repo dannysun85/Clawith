@@ -23,6 +23,7 @@ import {
     ApiError,
     workforceApi,
     agentApi,
+    ceoApi,
     type WorkforceTopology as WorkforceTopologyData,
     type WorkforceTopologyNode,
 } from '../services/api';
@@ -238,6 +239,11 @@ function EmployeeDirectory({
                                 </span>
                                 <span>
                                     <strong>{node.name}</strong>
+                                    {node.is_system && (
+                                        <span className="employee-directory__system-badge">
+                                            {isChinese ? '系统岗位' : 'System role'}
+                                        </span>
+                                    )}
                                     <small>{node.role_description || (isChinese ? '尚未填写职责' : 'No responsibility provided')}</small>
                                 </span>
                             </div>
@@ -348,6 +354,15 @@ export default function Employees() {
         queryKey: ['agents', currentTenant],
         queryFn: () => agentApi.list(currentTenant || undefined),
         enabled: Boolean(currentTenant),
+        retry: false,
+    });
+
+    // CEO orchestrator entry card — only company governors covered by the
+    // rollout canary see it; everyone else gets zero entry points.
+    const { data: ceoSettings } = useQuery({
+        queryKey: ['ceo-orchestrator-settings', currentTenant],
+        queryFn: () => ceoApi.settings(),
+        enabled: canGovernAgents && Boolean(currentTenant),
         retry: false,
     });
 
@@ -582,6 +597,42 @@ export default function Employees() {
                 busyAgentId={legacyBusyId}
                 onAction={(agent, action) => void updateLegacyAssistant(agent, action)}
             />
+
+            {canGovernAgents && ceoSettings?.feature_available && (
+                <div className="employees-page__ceo-card" data-testid="ceo-orchestrator-entry">
+                    <div>
+                        <div className="employees-page__ceo-card-title">
+                            {isChinese ? '公司 CEO（观察型）' : 'Company CEO (observer)'}
+                        </div>
+                        <div className="employees-page__ceo-card-desc">
+                            {ceoSettings.enabled
+                                ? (isChinese
+                                    ? '已启用。CEO 只读汇总业务全景、生成简报并可主持晨会；行动项仅为文本建议。'
+                                    : 'Enabled. The CEO reads the business panorama, publishes briefings, and chairs meetings; action items are advisory text only.')
+                                : (isChinese
+                                    ? '每家公司可启用一位系统岗位 CEO：业务全景、日报/周报节奏、晨会纪要。不占员工席位，消耗租户 Credits。'
+                                    : 'Enable one system-role CEO per company: business panorama, daily/weekly briefings, meeting minutes. Uses no employee seat; consumes tenant Credits.')}
+                        </div>
+                    </div>
+                    {ceoSettings.enabled && ceoSettings.ceo_agent_id ? (
+                        <button
+                            type="button"
+                            className="btn btn-secondary"
+                            onClick={() => navigate(`/agents/${ceoSettings.ceo_agent_id}/chat`)}
+                        >
+                            {isChinese ? '打开 CEO 详情' : 'Open CEO page'}
+                        </button>
+                    ) : (
+                        <button
+                            type="button"
+                            className="btn btn-primary"
+                            onClick={() => navigate('/enterprise#okr')}
+                        >
+                            {isChinese ? '启用公司 CEO' : 'Enable company CEO'}
+                        </button>
+                    )}
+                </div>
+            )}
 
             {isLoading ? (
                 <div className="employees-page__state">{isChinese ? '正在加载数字员工…' : 'Loading digital employees…'}</div>

@@ -165,6 +165,24 @@ async def handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) ->
     return True
 
 
+async def handle_ceo_automation_gate(trigger: AgentTrigger, now: datetime) -> bool:
+    """Budget/opt-in gate for CEO system triggers (FR-CEO-5, fail-closed).
+
+    CEO trigger names never collide with the OKR special cases above, so the
+    094 semantics are untouched. Returns True only when the fire was consumed
+    here (skipped); an allowed CEO fire returns False and proceeds onto the
+    ordinary durable enqueue chain.
+    """
+    from app.services.ceo_orchestrator import (
+        CEO_SYSTEM_TRIGGER_NAMES,
+        gate_ceo_trigger_automation,
+    )
+
+    if not trigger.is_system or trigger.name not in CEO_SYSTEM_TRIGGER_NAMES:
+        return False
+    return await gate_ceo_trigger_automation(trigger, now)
+
+
 def is_private_url(url: str) -> bool:
     try:
         parsed = urlparse(url)

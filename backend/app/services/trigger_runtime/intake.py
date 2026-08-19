@@ -23,6 +23,7 @@ from app.services.agent_runtime.model_route import (
     resolve_runtime_model_route,
 )
 from app.services.chat_session_service import ensure_primary_platform_session
+from app.services.ceo_briefing import maybe_attach_ceo_brief_snapshot
 from app.services.participant_identity import get_or_create_agent_participant
 from app.services.trigger_runtime.executions import build_execution_runtime_trigger
 
@@ -266,6 +267,15 @@ async def enqueue_trigger_runtime(
 
     runtime_trigger = build_execution_runtime_trigger(trigger, execution)
     context = build_trigger_context([runtime_trigger])
+    # CEO triggers opt into a read-only business panorama via
+    # ``attach_brief_snapshot`` in their server-synced config (FR-CEO-2).
+    context = await maybe_attach_ceo_brief_snapshot(
+        db,
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        trigger_config=_trigger_config(runtime_trigger),
+        context=context,
+    )
     event_data = _trigger_event_data(runtime_trigger)
     message_id = _trigger_input_message_id(execution.id)
     session = await _ensure_trigger_session(

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from loguru import logger
-from sqlalchemy import String, cast, delete, exists, func, select
+from sqlalchemy import String, cast, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -66,6 +66,7 @@ from app.services.product_roles import (
     resolve_agent_product_roles,
 )
 from app.services.access_control import is_company_governor, is_platform_operator
+from app.services.ceo_orchestrator import CEO_TEMPLATE_ROLE_KEY
 from app.services.company_product_policy import default_agent_autonomy_policy
 from app.models.onboarding import UserTenantOnboarding
 from app.services.product_roles import PRIVATE_ASSISTANT_ROLE_KEY, PRIVATE_ASSISTANT_TEMPLATE_NAME
@@ -419,6 +420,9 @@ async def list_templates(
     result = await db.execute(
         select(AgentTemplate)
         .where(AgentTemplate.lifecycle_status == TEMPLATE_LIFECYCLE_ENABLED)
+        # The CEO system role joins a company only through the CEO orchestrator
+        # enable flow, never through the recruiting market or ordinary creation.
+        .where(or_(AgentTemplate.role_key.is_(None), AgentTemplate.role_key != CEO_TEMPLATE_ROLE_KEY))
         .order_by(AgentTemplate.is_builtin.desc(), AgentTemplate.created_at.asc())
     )
     templates = result.scalars().all()
@@ -946,6 +950,15 @@ async def create_agent(
                     "code": "agent_template_not_recruitable",
                     "lifecycle_status": selected_template.lifecycle_status,
                     "activation_gate": selected_template.activation_gate,
+                },
+            )
+        if selected_template.role_key == CEO_TEMPLATE_ROLE_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "agent_template_not_recruitable",
+                    "lifecycle_status": selected_template.lifecycle_status,
+                    "activation_gate": "ceo_orchestrator_opt_in",
                 },
             )
 

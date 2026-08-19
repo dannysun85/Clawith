@@ -338,7 +338,8 @@
       "peer": "Peer",
       "assistant": "Assistant",
       "direct_leader": "Direct Leader",
-      "other": "Other"
+      "other": "Other",
+      "systemRole": "System role"
     },
     "directory": {
       "title": "Directory",

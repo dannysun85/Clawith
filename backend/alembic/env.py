@@ -40,6 +40,7 @@ from app.models.experience_reference import ExperienceReference  # noqa: F401
 from app.models.schedule import AgentSchedule  # noqa: F401
 from app.models.system_settings import SystemSetting  # noqa: F401
 from app.models.tenant import Tenant  # noqa: F401
+from app.models.ceo import CeoOrchestratorSettings  # noqa: F401
 from app.models.tenant_setting import TenantSetting  # noqa: F401
 from app.models.tool import Tool  # noqa: F401
 from app.models.trigger import AgentTrigger  # noqa: F401

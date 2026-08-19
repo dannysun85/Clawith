@@ -107,6 +107,15 @@ from app.services.agent_runtime.tool_execution import (
     ToolExecutionOutcome,
     sanitize_tool_arguments,
 )
+from app.services.ceo_briefing import (
+    CeoBriefingError,
+    build_company_brief_snapshot,
+    ceo_orchestrator_allowed,
+)
+from app.services.ceo_orchestrator import (
+    get_enabled_ceo_settings_for_agent,
+    is_enabled_ceo_agent,
+)
 from app.services.tool_release_policy import (
     RELEASE_DISABLED_TOOL_NAMES,
     release_tool_denial_reason,
@@ -794,6 +803,7 @@ RUNTIME_TYPED_APPLICATION_TOOL_NAMES = frozenset(
         "update_trigger",
         "cancel_trigger",
         "list_triggers",
+        "company_brief_snapshot",
         "query_directory",
         "send_channel_message",
         "send_platform_message",
@@ -3768,6 +3778,8 @@ async def execute_builtin_tool_outcome(
         return await _handle_cancel_trigger_outcome(agent_id, arguments)
     if tool_name == "list_triggers":
         return await _handle_list_triggers_outcome(agent_id)
+    if tool_name == "company_brief_snapshot":
+        return await _company_brief_snapshot_outcome(agent_id, arguments)
     if tool_name == "read_emails":
         return await _read_emails_outcome(agent_id, arguments)
     if tool_name in {"send_email", "reply_email"}:
@@ -12498,6 +12510,71 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         outcome,
         fallback="Trigger listing returned no summary.",
     )
+
+
+async def _company_brief_snapshot_outcome(
+    agent_id: uuid.UUID,
+    arguments: dict,
+) -> ToolExecutionOutcome:
+    """CEO-only read projection (FR-CEO-2); fail-closed for every other Agent.
+
+    The caller must be this tenant's currently enabled CEO Agent (is_system +
+    ceo template + enabled settings row) and the rollout gate must be open;
+    both failures surface as ``ceo_only`` without leaking tenant data.
+    """
+    try:
+        window_hours = int(arguments.get("window_hours", 168) or 168)
+    except (TypeError, ValueError):
+        return _typed_failure(
+            "company_brief_snapshot window_hours must be an integer.",
+            "invalid_tool_arguments",
+        )
+    window_hours = max(1, min(window_hours, 168))
+
+    try:
+        from app.models.agent import Agent as AgentModel
+
+        async with async_session() as db:
+            agent_result = await db.execute(
+                select(AgentModel).where(
+                    AgentModel.id == agent_id,
+                    AgentModel.deleted_at.is_(None),
+                )
+            )
+            agent = agent_result.scalar_one_or_none()
+            if agent is None or agent.tenant_id is None:
+                return _typed_failure(
+                    "Agent not found.",
+                    "source_agent_not_found",
+                )
+            if not await is_enabled_ceo_agent(db, agent):
+                return _typed_failure(
+                    "company_brief_snapshot is only available to this company's enabled CEO Agent.",
+                    "ceo_only",
+                )
+            if not ceo_orchestrator_allowed(tenant_id=agent.tenant_id, agent_id=agent.id):
+                return _typed_failure(
+                    "company_brief_snapshot is not enabled for this company.",
+                    "ceo_only",
+                )
+            settings_row = await get_enabled_ceo_settings_for_agent(db, agent.id)
+            snapshot = await build_company_brief_snapshot(
+                db,
+                tenant_id=agent.tenant_id,
+                viewer_user_id=settings_row.enabled_by_user_id if settings_row else None,
+                window_hours=window_hours,
+            )
+            return _typed_success(
+                snapshot.render_markdown(max_chars=_settings.CEO_BRIEF_SNAPSHOT_MAX_CHARS)
+            )
+    except CeoBriefingError as exc:
+        return _typed_failure(str(exc), exc.code)
+    except Exception as exc:
+        return _typed_failure(
+            f"Company brief snapshot could not be composed: {type(exc).__name__}",
+            "brief_snapshot_failed",
+            retryable=True,
+        )
 
 
 # ─── Image Upload (ImageKit CDN) ────────────────────────────────

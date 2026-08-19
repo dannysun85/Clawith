@@ -54,7 +54,9 @@ def test_candidate_seeds_are_persistable_but_not_recruitable() -> None:
 def test_template_seeder_includes_92_candidates_without_replacing_existing_roles() -> None:
     templates = _merged_templates()
 
-    assert len(templates) == 125
+    # 125 = 4 legacy + 30 workforce folders + 92 candidates - 1 override;
+    # +1 for the Astra-native `ceo` system-role folder (FR-CEO-1).
+    assert len(templates) == 126
     assert sum(
         template.get("lifecycle_status", "enabled") == "candidate_disabled"
         for template in templates
@@ -62,7 +64,7 @@ def test_template_seeder_includes_92_candidates_without_replacing_existing_roles
     assert sum(
         template.get("lifecycle_status", "enabled") == "enabled"
         for template in templates
-    ) == 32
+    ) == 33
     assert sum(
         template.get("lifecycle_status", "enabled") == "not_recruitable"
         for template in templates

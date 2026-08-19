@@ -344,7 +344,8 @@
             "peer": "同事",
             "assistant": "助理",
             "direct_leader": "直属领导",
-            "other": "其他"
+            "other": "其他",
+            "systemRole": "系统岗位"
         },
         "tasks": {
             "todo": "待办",

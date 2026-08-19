@@ -241,6 +241,14 @@ class Settings(BaseSettings):
     # claim yet and remains separately quarantined.
     SUPERVISION_EXECUTION_ENABLED: bool = False
     OKR_AUTOMATION_ENABLED: bool = False
+    # CEO orchestrator (P1 observer) is an explicit tenant/Agent canary: the
+    # global switch stays false and both allowlists stay empty so no deployment
+    # gets a CEO Agent unless an operator opts in deliberately.
+    CEO_ORCHESTRATOR_ENABLED: bool = False
+    CEO_ORCHESTRATOR_TENANT_IDS: str = ""
+    CEO_ORCHESTRATOR_AGENT_IDS: str = ""
+    # Hard length bound for the CEO business snapshot / briefing projections.
+    CEO_BRIEF_SNAPSHOT_MAX_CHARS: int = 4000
     TRIGGER_MAX_CONCURRENCY: int = 8
     TRIGGER_CLAIM_BATCH_SIZE: int = 16
 

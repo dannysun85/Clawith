@@ -24,6 +24,7 @@ from app.models.trigger_execution import TriggerExecution
 from app.models.user import User
 from app.services.trigger_runtime.evaluator import (
     evaluate_trigger as evaluate_trigger_runtime,
+    handle_ceo_automation_gate as handle_ceo_automation_gate_runtime,
     handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
     handle_okr_report_trigger as handle_okr_report_trigger_runtime,
     mark_trigger_fired as mark_trigger_fired_runtime,
@@ -177,6 +178,10 @@ async def _handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bo
 
 async def _handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     return await handle_okr_collection_trigger_runtime(trigger, now)
+
+
+async def _handle_ceo_automation_gate(trigger: AgentTrigger, now: datetime) -> bool:
+    return await handle_ceo_automation_gate_runtime(trigger, now)
 
 
 async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
@@ -421,6 +426,8 @@ async def _tick():
                 handled = await _handle_okr_report_trigger(trigger, now)
                 if not handled:
                     handled = await _handle_okr_collection_trigger(trigger, now)
+                if not handled:
+                    handled = await _handle_ceo_automation_gate(trigger, now)
                 if not handled:
                     execution_id, created = await enqueue_due_trigger(
                         trigger,

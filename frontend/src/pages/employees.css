@@ -499,6 +499,43 @@
 .employee-directory__health-dot[data-status='error'] { background: var(--error); }
 .employee-directory__health-dot[data-status='creating'] { background: var(--accent-primary); }
 
+.employee-directory__system-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--accent-primary);
+    background: rgba(99, 102, 241, 0.12);
+    vertical-align: middle;
+}
+
+.employees-page__ceo-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+    padding: 14px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    background: rgba(99, 102, 241, 0.05);
+}
+
+.employees-page__ceo-card-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.employees-page__ceo-card-desc {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
 .employee-directory__actions {
     display: flex;
     justify-content: flex-end;

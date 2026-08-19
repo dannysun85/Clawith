@@ -8,7 +8,7 @@
   },
   "local_baseline": {
     "source_template_count": 33,
-    "folder_template_count": 30,
+    "folder_template_count": 31,
     "legacy_template_count": 4,
     "folder_override_names": [
       "Project Manager"

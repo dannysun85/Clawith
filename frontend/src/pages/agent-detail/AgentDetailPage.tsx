@@ -131,6 +131,7 @@ import {
 import { useDropZone } from '../../hooks/useDropZone';
 import ApprovalsTab from './tabs/ApprovalsTab';
 import { AGENT_DETAIL_TABS } from './agentDetailTabs';
+import CeoBriefPanel from './CeoBriefPanel';
 import DouyinTab from './tabs/DouyinTab';
 import MindTab from './tabs/MindTab';
 import SettingsTab from './tabs/SettingsTab';
@@ -6698,6 +6699,15 @@ export default function AgentDetailPage() {
                                     >
                                         {agentProductRoleLabel}
                                     </span>
+                                    {(agent as any)?.is_system && (
+                                        <span
+                                            className="badge badge-info"
+                                            data-testid="agent-system-role"
+                                            style={{ background: 'rgba(99,102,241,0.15)', color: 'var(--accent-primary)' }}
+                                        >
+                                            {t('agent.detail.systemRole', 'System role')}
+                                        </span>
+                                    )}
                                 </div>
                                 <button
                                     className={`agent-info-chevron${infoCardOpen ? ' agent-info-chevron--open' : ''}`}
@@ -6759,6 +6769,9 @@ export default function AgentDetailPage() {
                         </div>
                     </div>
                 )}
+
+                {/* CEO business panorama — renders only for the tenant's enabled CEO Agent */}
+                <CeoBriefPanel agentId={id} />
 
                 {/* Tabs */}
                 {activeTab !== 'chat' && <div className="tabs">

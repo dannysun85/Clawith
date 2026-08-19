@@ -2690,6 +2690,38 @@ _BUILTIN_TOOL_SOURCE = [
         "config": {},
         "config_schema": {},
     },
+    # --- CEO Orchestrator (P1 observer) ---
+    {
+        # company_brief_snapshot — CEO-only read projection composed from the
+        # workforce topology and OKR read models. Granted exclusively through
+        # the ceo Agent template; the typed adapter stays fail-closed for every
+        # other Agent, so an absent grant never exposes tenant-wide data.
+        "name": "company_brief_snapshot",
+        "display_name": "Company Brief Snapshot",
+        "description": (
+            "Read-only company panorama for the CEO role: workforce activity, in-flight "
+            "work and blockers, OKR report cadence status, and recent deliverable counts, "
+            "hard-truncated to a bounded length. Only available to this company's enabled "
+            "CEO Agent; every other Agent receives a ceo_only failure."
+        ),
+        "category": "okr",
+        "icon": "🛰️",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "window_hours": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 168,
+                    "description": "Lookback window in hours (default 168, max 168).",
+                },
+            },
+            "required": [],
+        },
+        "config": {},
+        "config_schema": {},
+    },
 ]
 
 # ── AgentBay Tools ──────────────────────────────────────────────────────────
@@ -3743,6 +3775,7 @@ _READ_TOOL_NAMES = frozenset(
         "group_read_memory",
         "group_list_workspace",
         "group_read_workspace_file",
+        "company_brief_snapshot",
     }
 )
 

@@ -37,7 +37,8 @@ def test_catalog_freezes_current_clawith_template_baseline() -> None:
 
     assert catalog.local_baseline == {
         "source_template_count": 33,
-        "folder_template_count": 30,
+        # 30 workforce folders + the Astra-native `ceo` system-role folder.
+        "folder_template_count": 31,
         "legacy_template_count": 4,
         "folder_override_names": ["Project Manager"],
     }

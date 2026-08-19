@@ -1292,6 +1292,85 @@ export const workforceApi = {
         request<WorkforceTopology>(`/workforce/topology?window_hours=${windowHours}`),
 };
 
+// ─── CEO Orchestrator (P1 observer) ──────────────────
+export type CeoOrchestratorSettings = {
+    feature_available: boolean;
+    configured: boolean;
+    ceo_agent_id: string | null;
+    enabled: boolean;
+    enabled_by_user_id: string | null;
+    enabled_at: string | null;
+    briefing_enabled: boolean;
+    morning_meeting_enabled: boolean;
+    meeting_group_id: string | null;
+    daily_credit_cap: number;
+    monthly_credit_cap: number;
+    meeting_member_agent_ids: string[];
+};
+
+export type CeoCompanyBrief = {
+    snapshot: {
+        company_name: string;
+        window_hours: number;
+        generated_at: string;
+        employee_total: number;
+        employee_active_in_window: number;
+        work_executing: number;
+        work_review: number;
+        work_approval: number;
+        work_blocked: number;
+        work_completed_recent: number;
+        blocked_items: { agent_name: string; title: string; stage: string }[];
+        in_progress_items: { agent_name: string; title: string; stage: string }[];
+        okr_tracked_members: number;
+        okr_reports_today_submitted: number;
+        okr_reports_today_missing: number;
+        truncated: boolean;
+    };
+    markdown: string;
+};
+
+export const ceoApi = {
+    settings: () => request<CeoOrchestratorSettings>('/companies/current/ceo/settings'),
+
+    enable: (data: {
+        member_agent_ids?: string[];
+        briefing_enabled?: boolean;
+        morning_meeting_enabled?: boolean;
+        daily_credit_cap?: number;
+        monthly_credit_cap?: number;
+    }) => request<CeoOrchestratorSettings>('/companies/current/ceo/enable', {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+
+    disable: () => request<CeoOrchestratorSettings>('/companies/current/ceo/disable', {
+        method: 'POST',
+    }),
+
+    updateSettings: (data: Partial<{
+        briefing_enabled: boolean;
+        morning_meeting_enabled: boolean;
+        daily_credit_cap: number;
+        monthly_credit_cap: number;
+        member_agent_ids: string[];
+    }>) => request<CeoOrchestratorSettings>('/companies/current/ceo/settings', {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+    }),
+
+    companyBrief: (agentId: string, windowHours = 168) =>
+        request<CeoCompanyBrief>(`/agents/${agentId}/company-brief?window_hours=${windowHours}`),
+
+    startMeeting: (agentId: string, kind: 'morning' | 'weekly') =>
+        request<{
+            trigger_execution_id: string;
+            status: string;
+            meeting_group_id: string | null;
+            kind: string;
+        }>(`/agents/${agentId}/meetings/${kind}/start`, { method: 'POST' }),
+};
+
 // ─── Deliverable Workbench ───────────────────────────
 export type DeliverableWorkType = 'presentation' | 'poster' | 'video' | 'report' | 'spreadsheet';
 

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import { fetchJson } from '../utils/fetchJson';
+import CeoCard from './CeoCard';
 
 // ─── OKR Tab ──────────────────────────────────────────
 export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
@@ -434,6 +435,10 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                     </div>
                 )}
             </div>
+            {/* CEO orchestrator (P1 observer) — independent card; renders nothing
+                unless the rollout canary covers this tenant. Kept out of the OKR
+                (094) settings card semantics above. */}
+            <CeoCard tenantId={tenantId} />
         </div>
     );
 }

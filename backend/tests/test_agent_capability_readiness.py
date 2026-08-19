@@ -34,7 +34,7 @@ class _Db:
 def test_every_enabled_folder_template_has_registered_typed_capability_contract() -> None:
     contracts = [readiness.template_capability_contract(template) for template in _load_folder_templates()]
 
-    assert len(contracts) == 30
+    assert len(contracts) == 31  # 30 workforce folders + Astra-native `ceo`
     assert all(contract["contract_ready"] for contract in contracts)
     assert all(
         tool["registered"] and tool["typed_adapter"] and tool["readiness"]

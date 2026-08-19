@@ -17,6 +17,7 @@ from app.models.org import AgentRelationship, OrgMember
 from app.models.user import User
 from app.services.collaboration import collaboration_service
 from app.services.agent_template_contract import TEMPLATE_LIFECYCLE_ENABLED
+from app.services.ceo_orchestrator import CEO_TEMPLATE_ROLE_KEY
 
 router = APIRouter(tags=["advanced"])
 
@@ -149,10 +150,11 @@ async def list_templates(
     category: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """List available agent templates."""
+    """List available agent templates (the CEO system role is opt-in only)."""
     query = (
         select(AgentTemplate)
         .where(AgentTemplate.lifecycle_status == TEMPLATE_LIFECYCLE_ENABLED)
+        .where(AgentTemplate.role_key != CEO_TEMPLATE_ROLE_KEY)
         .order_by(AgentTemplate.name)
     )
     if category:

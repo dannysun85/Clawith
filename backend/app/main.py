@@ -459,6 +459,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"[startup] OKR Agent patch failed: {e}")
 
+        # CEO orchestrator has no global seeder (per-tenant opt-in only); this
+        # merely realigns trigger gates for tenants that already enabled it.
+        try:
+            from app.services.ceo_orchestrator import sync_ceo_orchestrators_on_startup
+            await sync_ceo_orchestrators_on_startup()
+        except Exception as e:
+            logger.warning(f"[startup] CEO orchestrator sync failed: {e}")
+
         # Run effective Skill deployment only after every built-in Agent has
         # been created or repaired. Base workspace initialization deliberately
         # skips repository Skill source packages.
@@ -732,6 +740,7 @@ from app.api.pages import router as pages_router, public_router as pages_public_
 from app.api.agent_credentials import router as agent_credentials_router  # noqa: E402
 from app.api.agentbay_control import router as agentbay_control_router
 from app.api.okr import router as okr_router
+from app.api.ceo import router as ceo_router
 from app.api.onboarding import router as onboarding_router
 from app.api.subscription import router as subscription_router  # noqa: E402
 from app.api.credentials import router as credential_pool_router  # noqa: E402
@@ -796,6 +805,7 @@ app.include_router(pages_public_router)  # Public endpoint for /p/{short_id}, no
 app.include_router(agent_credentials_router, prefix=settings.API_PREFIX)
 app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
 app.include_router(okr_router)  # OKR — self-prefixed at /api/okr
+app.include_router(ceo_router)  # CEO orchestrator — self-prefixed at /api
 app.include_router(onboarding_router, prefix=settings.API_PREFIX)
 app.include_router(subscription_router, prefix=settings.API_PREFIX)
 app.include_router(credential_pool_router, prefix=settings.API_PREFIX)
