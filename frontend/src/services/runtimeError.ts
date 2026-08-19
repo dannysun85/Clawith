@@ -41,7 +41,18 @@ export function formatRuntimeErrorDiagnostics(error: RuntimeErrorContext): strin
 export const runtimeErrorDisablesReconnect = (error: RuntimeErrorContext): boolean =>
     error.code === 'model_unavailable'
     || error.code === 'agent_expired'
-    || error.code === 'setup_failed';
+    || error.code === 'setup_failed'
+    || error.code === 'chat_authorization_revoked'
+    || error.code === 'authentication_failed';
 
 export const runtimeErrorMarksAgentExpired = (error: RuntimeErrorContext): boolean =>
     error.code === 'agent_expired';
+
+export function runtimeErrorChatCopy(error: RuntimeErrorContext, isChinese: boolean): string {
+    if (error.code === 'chat_authorization_revoked' || error.code === 'authentication_failed') {
+        return isChinese
+            ? '登录状态已更新，请刷新页面后重新发送消息。'
+            : 'Your sign-in was refreshed. Reload the page and send again.';
+    }
+    return error.message || (isChinese ? '请求被拒绝' : 'Request denied');
+}

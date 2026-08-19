@@ -156,6 +156,7 @@ import { fetchAuth } from './utils/fetchAuth';
 import {
     formatRuntimeErrorDiagnostics,
     normalizeRuntimeError,
+    runtimeErrorChatCopy,
     runtimeErrorDisablesReconnect,
     runtimeErrorMarksAgentExpired,
     type RuntimeErrorContext,
@@ -4389,12 +4390,26 @@ export default function AgentDetailPage() {
                 queryClient.invalidateQueries({ queryKey: ['agents'] });
             } else if (d.type === 'error' || d.type === 'quota_exceeded') {
                 const runtimeError = normalizeRuntimeError(d);
+                const latestToken = localStorage.getItem('token') || '';
+                if (
+                    (runtimeError.code === 'chat_authorization_revoked' || runtimeError.code === 'authentication_failed')
+                    && latestToken
+                    && latestToken !== authToken
+                ) {
+                    reconnectDisabledRef.current[key] = false;
+                    closeWebSocketIntentionally(ws);
+                    ensureSessionSocket(sess, agentId, latestToken);
+                    return;
+                }
                 if (runtimeErrorDisablesReconnect(runtimeError)) {
                     reconnectDisabledRef.current[key] = true;
                 }
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
-                    const warningText = `Warning: ${runtimeError.message}`;
+                    const warningText = runtimeErrorChatCopy(
+                        runtimeError,
+                        (i18n.language || 'en').toLowerCase().startsWith('zh'),
+                    );
                     if (last && last.role === 'assistant' && last.content === warningText) return prev;
                     return [...prev, parseChatMsg({
                         role: 'assistant',
