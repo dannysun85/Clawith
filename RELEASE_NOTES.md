@@ -1,5 +1,13 @@
 # v1.11.42 — Subscription Lifecycle and Creative Deliverables v2
 
+## Stability fixes
+
+- Web chat reconnects with the rotated credential instead of stalling on a
+  stale socket, and only asks for a page reload when the credential is truly
+  gone.
+- WeChat Pay checkout stays on the payment domain across product aliases, and
+  manual orders no longer present as a failed QR.
+
 ## Subscription lifecycle
 
 - Plan purchases are classified at checkout (new / renew / period switch /
