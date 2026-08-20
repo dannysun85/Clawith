@@ -4,6 +4,7 @@ import type { WorkforceTopologyNode } from '../services/api';
 import {
     computeTopologyLayout,
     filterTopologyNodes,
+    topologyExecutionWorkGroup,
     topologyNodeIdKey,
     topologyRectsOverlap,
 } from './workforceTopology';
@@ -91,5 +92,46 @@ describe('workforce topology projection', () => {
             health: 'idle',
             work: 'no_work',
         }).map((candidate) => candidate.id)).toEqual(['two']);
+    });
+
+    it('uses authoritative execution state ahead of creator-scoped work detail', () => {
+        const candidate = node('one', {
+            execution: {
+                id: 'run-one',
+                run_id: 'run-one',
+                source_type: 'a2a',
+                status: 'waiting_agent',
+                phase: 'waiting_agent',
+                title: 'Agent delegation',
+                summary: 'Agent delegation status: waiting_agent',
+                details_visible: false,
+                active_count: 1,
+                recently_finished_count: 0,
+                deep_link: '/agents/one/chat',
+                updated_at: '2026-08-20T10:00:00Z',
+            },
+            work: {
+                id: 'old-work',
+                title: 'Older task projection',
+                summary: 'Older projection',
+                stage: 'completed',
+                active_count: 0,
+                recently_completed_count: 1,
+                deep_link: '/work/old-work',
+                updated_at: '2026-08-20T09:00:00Z',
+            },
+        });
+
+        expect(topologyExecutionWorkGroup(candidate)).toBe('waiting');
+        expect(filterTopologyNodes([candidate], {
+            query: '',
+            health: 'all',
+            work: 'waiting',
+        })).toEqual([candidate]);
+        expect(filterTopologyNodes([candidate], {
+            query: '',
+            health: 'all',
+            work: 'completed',
+        })).toEqual([]);
     });
 });

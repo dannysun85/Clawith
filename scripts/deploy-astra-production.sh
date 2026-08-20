@@ -269,6 +269,13 @@ if [ ! -f "$SSH_KEY" ]; then
     exit 1
 fi
 
+echo "[local] verifying unique production data-plane DNS"
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+    env -u BASH_ENV -u BASHOPTS -u SHELLOPTS python3 - \
+    --app-root "$APP_ROOT" \
+    --compose-project "$COMPOSE_PROJECT" \
+    < "$ROOT_DIR/scripts/assert_production_data_plane_dns.py"
+
 echo "[local] checking Alembic heads"
 ALEMBIC_HEADS="$(cd backend && uv run --frozen alembic heads)"
 ALEMBIC_HEAD_COUNT="$(printf '%s\n' "$ALEMBIC_HEADS" | grep -c '(head)')"
@@ -4401,7 +4408,8 @@ fi
 # This must precede every cutover recovery, active-state rewrite, pending-drain
 # completion, service action, Nginx change, database backup, or migration.
 # Package extraction and state parsing above do not expose or mutate runtime
-# traffic. A missing or drifted host contract stops before recovery can act.
+# traffic. Split postgres/redis DNS or a missing/drifted host contract stops
+# before recovery can act.
 EARLY_ENV="$CURRENT_TARGET/.env"
 [ -f "$EARLY_ENV" ] && [ ! -L "$EARLY_ENV" ] || {
     echo "current release environment is missing before host egress verification" >&2
@@ -4415,6 +4423,11 @@ if [ -z "$DOCKER_NETWORK_NAME" ]; then
     echo "current release environment must define DOCKER_NETWORK before host egress verification" >&2
     exit 1
 fi
+echo "[remote] verifying unique production data-plane DNS"
+python3 "$RELEASE/scripts/assert_production_data_plane_dns.py" \
+    --app-root "$APP_ROOT" \
+    --compose-project "$COMPOSE_PROJECT" \
+    --expected-network "$DOCKER_NETWORK_NAME"
 echo "[remote] verifying host-level MCP egress contract"
 sudo bash "$RELEASE/scripts/manage-production-mcp-egress-guard.sh" verify \
     "$DOCKER_NETWORK_NAME" \

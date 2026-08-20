@@ -151,11 +151,26 @@ export function workTaskDeliverableHandoff(
 }
 
 export function requestCanLaunchFromComposer(request: DeliverableRequest): boolean {
-    return request.status === 'ready'
+    const baseLaunchable = request.status === 'ready'
         && request.agent_run_id === null
         && COMPOSER_LAUNCHABLE_WORKFLOWS.has(
             `${request.workflow_id}@${request.workflow_version}`,
         );
+    if (!baseLaunchable || request.current_stage === 'brief_clarifying') return false;
+    if (request.current_stage !== 'brief_confirmed') return true;
+    const launchable = request.latest_preflight?.launchable;
+    // Older servers did not persist the Provider-free snapshot. Preserve their
+    // behavior during rolling upgrades; new servers make this an explicit fact.
+    return typeof launchable === 'boolean' ? launchable : true;
+}
+
+export function deliverableNextAction(
+    request: DeliverableRequest | null | undefined,
+): string | null {
+    const nextAction = request?.latest_preflight?.next_action;
+    return typeof nextAction === 'string' && nextAction.trim()
+        ? nextAction.trim()
+        : null;
 }
 
 const VIDEO_V2_COMPOSER_CONTINUATION_STAGES = new Set([

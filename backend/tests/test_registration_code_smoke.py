@@ -21,6 +21,28 @@ def _load_runner():
     return module
 
 
+def test_registration_code_prefix_matches_admin_list_mask():
+    runner = _load_runner()
+
+    assert runner.registration_code_prefix("reg-abcde12345-fghij67890-klmno") == "REG-ABCDE123"
+
+
+def test_api_error_text_supports_structured_governance_errors():
+    runner = _load_runner()
+
+    error_text = runner.api_error_text(
+        {
+            "detail": {
+                "code": "registration_grant_exhausted",
+                "message": "Registration grant has reached its usage limit",
+            }
+        }
+    )
+
+    assert "registration_grant_exhausted" in error_text
+    assert "registration grant has reached its usage limit" in error_text
+
+
 @pytest.mark.asyncio
 async def test_smoke_admin_password_reset_enables_login_and_revokes_old_tokens(monkeypatch):
     runner = _load_runner()

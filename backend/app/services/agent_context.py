@@ -10,6 +10,7 @@ from app.services.storage import get_storage_backend, normalize_storage_key
 
 
 _INTERNAL_A2A_TRIGGER_NAMES = {"a2a_wake", "__a2a_wake__"}
+_MIDDLE_TRUNCATION_MARKER = "\n...(older middle content omitted; latest entries follow)...\n"
 
 
 def _render_active_trigger_lines(triggers) -> list[str]:
@@ -40,7 +41,36 @@ def _render_active_trigger_lines(triggers) -> list[str]:
     return lines
 
 
-async def _read_file_safe(key: str, max_chars: int = 3000) -> str:
+def _truncate_context_text(
+    content: str,
+    max_chars: int,
+    *,
+    preserve_tail: bool = False,
+) -> str:
+    """Bound prompt text while optionally retaining its newest tail entries."""
+    if len(content) <= max_chars:
+        return content
+    if not preserve_tail:
+        return content[:max_chars] + "\n...(truncated)"
+    if max_chars <= len(_MIDDLE_TRUNCATION_MARKER):
+        return content[-max_chars:]
+
+    available = max_chars - len(_MIDDLE_TRUNCATION_MARKER)
+    head_chars = max(1, available // 3)
+    tail_chars = available - head_chars
+    return (
+        content[:head_chars]
+        + _MIDDLE_TRUNCATION_MARKER
+        + content[-tail_chars:]
+    )
+
+
+async def _read_file_safe(
+    key: str,
+    max_chars: int = 3000,
+    *,
+    preserve_tail: bool = False,
+) -> str:
     """Read a storage-backed text file, returning empty text when unavailable."""
     storage = get_storage_backend()
     if not await storage.exists(key) or not await storage.is_file(key):
@@ -53,9 +83,11 @@ async def _read_file_safe(key: str, max_chars: int = 3000) -> str:
                 errors="replace",
             )
         ).strip()
-        if len(content) > max_chars:
-            return content[:max_chars] + "\n...(truncated)"
-        return content
+        return _truncate_context_text(
+            content,
+            max_chars,
+            preserve_tail=preserve_tail,
+        )
     except Exception:
         return ""
 
@@ -301,6 +333,12 @@ Memory contains durable information that may remain useful across conversations.
 Workspace is your persistent file and artifact environment.
 - Use it for durable task artifacts such as documents, reports, datasets, and
   generated files.
+- Your Workspace is private to this digital employee. File tools cannot read a
+  colleague's Workspace, and that isolation is expected rather than evidence
+  that the colleague lacks a capability or failed to create an artifact.
+- A path mentioned by another Agent is not a delivery receipt. Use the latest
+  Directory `target_agent_id` with `send_file_to_agent` when an artifact must
+  cross Agent Workspaces, and trust only the resulting transfer receipt.
 - Read actual files before relying on their contents.
 - Base claims about file changes on successful tool results.
 - Tool names and file-operation parameters are defined by the current Tool Schema.
@@ -336,6 +374,10 @@ are allowed to discover or contact.
   file to a person or digital employee.
 - Use only stable identifiers and contact tools returned by the latest Directory
   result; never guess recipients or reuse remembered identifiers as routing data.
+- Directory capability entries are the authoritative safe assignment summary.
+  `availability=requires_preflight` means run the relevant current preflight;
+  it does not mean the capability is absent. Never infer capability absence from
+  your own tool list or Workspace.
 - Relationships and Memory are background context, not contact routes.
 
 # Objective
@@ -511,11 +553,13 @@ async def build_agent_context(
     memory = await _read_file_safe(
         normalize_storage_key(f"{agent_id}/memory/memory.md"),
         2000,
+        preserve_tail=True,
     )
     if not memory:
         memory = await _read_file_safe(
             normalize_storage_key(f"{agent_id}/memory.md"),
             2000,
+            preserve_tail=True,
         )
     if memory.startswith("# "):
         memory = "\n".join(memory.split("\n")[1:]).strip()
@@ -528,6 +572,7 @@ async def build_agent_context(
     relationships = ""
     company_information = ""
     active_triggers = []
+    ceo_mode_instruction = ""
     try:
         from app.database import async_session
         from app.models.trigger import AgentTrigger
@@ -543,6 +588,48 @@ async def build_agent_context(
                 )
             )
             active_triggers = list(trigger_result.scalars().all())
+            try:
+                from app.models.ceo import CeoOrchestratorSettings
+                from app.services.ceo_briefing import ceo_operating_mode
+
+                ceo_result = await db.execute(
+                    select(CeoOrchestratorSettings).where(
+                        CeoOrchestratorSettings.ceo_agent_id == agent_id
+                    )
+                )
+                ceo_settings = ceo_result.scalar_one_or_none()
+                if ceo_settings is not None:
+                    mode = ceo_operating_mode(ceo_settings)
+                    if mode == "observer":
+                        ceo_mode_instruction = (
+                            "Operating mode: observer. You may read the company panorama and use "
+                            "A2A consult for bounded questions. You must not use notify or "
+                            "task_delegate. If dispatch is requested, explain that a company "
+                            "governor must enable Coordinator mode."
+                        )
+                    elif mode in {"coordinator", "coordinator_auto"}:
+                        automation = (
+                            "Non-chat source Runs may dispatch within policy."
+                            if mode == "coordinator_auto"
+                            else "Only a current human chat may initiate dispatch; non-chat Runs must not dispatch."
+                        )
+                        ceo_mode_instruction = (
+                            "Operating mode: coordinator. Before delegating, query the latest "
+                            "Directory and route from its capability/readiness evidence. A "
+                            "requires_preflight capability must be preflighted, not treated as "
+                            "absent. Use task_delegate for work and wait for its correlated "
+                            "receipt; an Agent path or narrative claim is not an Artifact receipt. "
+                            + automation
+                        )
+                    else:
+                        ceo_mode_instruction = (
+                            "Operating mode: disabled. Do not dispatch, notify, or represent "
+                            "yourself as an active company coordinator."
+                        )
+            except Exception:
+                # Runtime enforcement remains fail-closed even if this explanatory
+                # prompt projection is temporarily unavailable.
+                ceo_mode_instruction = ""
     except Exception:
         # Prompt assembly must remain usable when optional organization context is
         # temporarily unavailable.
@@ -565,6 +652,8 @@ async def build_agent_context(
         identity.extend(["", "<soul>", soul, "</soul>"])
 
     static_parts = ["\n".join(identity), _BASE_PROMPT_BEFORE_CAPABILITIES]
+    if ceo_mode_instruction:
+        static_parts.append(f"# CEO Runtime Authority\n\n{ceo_mode_instruction}")
     capability_policies = _active_capability_policies(allowed)
 
     if capability_policies:

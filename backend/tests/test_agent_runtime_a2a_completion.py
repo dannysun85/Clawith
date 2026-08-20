@@ -16,6 +16,7 @@ from app.models.chat_session import ChatSession
 from app.models.gateway_message import GatewayMessage
 from app.services.agent_runtime.a2a_completion import (
     A2ARuntimeCompletionHandler,
+    _terminal_result,
 )
 from app.services.agent_runtime.command_worker import (
     CheckpointObservation,
@@ -234,6 +235,30 @@ def _records(
         target_agent,
         session,
     )
+
+
+def test_terminal_result_preserves_verified_delegation_receipts() -> None:
+    _, checkpoint, _, _, _, _ = _records()
+    contract_id = str(uuid.uuid4())
+    checkpoint.state["lifecycle"]["result_summary"] = {
+        "summary": "Verified research result",
+        "artifact_refs": ["doc:1"],
+        "evidence_refs": ["evidence:1"],
+        "tool_receipts": [{"tool_name": "web_search", "status": "succeeded"}],
+        "delivery_receipts": [
+            {"kind": "agent_workspace_file", "sha256": "a" * 64}
+        ],
+        "delegation_contract_id": contract_id,
+    }
+
+    _, payload = _terminal_result(checkpoint)
+
+    assert payload["evidence_refs"] == ["evidence:1"]
+    assert payload["tool_receipts"] == [
+        {"tool_name": "web_search", "status": "succeeded"}
+    ]
+    assert payload["delivery_receipts"][0]["sha256"] == "a" * 64
+    assert payload["delegation_contract_id"] == contract_id
 
 
 @pytest.mark.asyncio

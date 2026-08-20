@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api import workforce_topology as workforce_topology_api
+from app.schemas.workforce_topology import WorkforceTopologyOut
 from app.services import workforce_topology
 
 
@@ -61,6 +62,21 @@ def _agent(*, tenant_id, creator_id, **overrides):
 def test_workforce_topology_route_is_viewer_scoped_under_api_prefix():
     assert workforce_topology_api.router.prefix == "/workforce"
     assert "/workforce/topology" in {route.path for route in workforce_topology_api.router.routes}
+
+
+def test_workforce_topology_declares_three_layer_scope_contract():
+    result = WorkforceTopologyOut(
+        company_id=uuid.uuid4(),
+        company_name="Astra Labs",
+        window_hours=24,
+        generated_at=datetime.now(UTC),
+    )
+
+    assert result.scope_contract.model_dump() == {
+        "execution": "company_visible_redacted",
+        "work": "viewer_owned",
+        "analytics": "governor_or_managed",
+    }
 
 
 def test_merge_activity_edges_is_undirected_and_rejects_unknown_agents():
@@ -146,6 +162,57 @@ def test_work_summary_prioritizes_blockers_and_ignores_cancelled_or_stale_work()
     assert summary.recently_completed_count == 1
 
 
+def test_runtime_execution_projection_keeps_tool_completion_running():
+    event = SimpleNamespace(
+        event_type="status_changed",
+        payload={"status": "done", "activity_type": "tool_call"},
+    )
+
+    assert workforce_topology._run_execution_status(event) == "running"
+    assert workforce_topology._run_execution_phase(event) == "tool_call"
+
+
+def test_execution_summary_prioritizes_active_waiting_over_recent_terminal():
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    summaries = workforce_topology._project_topology_execution_summaries(
+        [
+            workforce_topology._ExecutionCandidate(
+                id=uuid.uuid4(),
+                agent_id=agent_id,
+                run_id=uuid.uuid4(),
+                source_type="direct_chat",
+                status="completed",
+                phase="run_completed",
+                title="Recent completion",
+                summary="Recent completion",
+                details_visible=True,
+                deep_link="/agents/example/chat",
+                updated_at=now,
+            ),
+            workforce_topology._ExecutionCandidate(
+                id=uuid.uuid4(),
+                agent_id=agent_id,
+                run_id=uuid.uuid4(),
+                source_type="a2a",
+                status="waiting_agent",
+                phase="waiting_agent",
+                title="Agent delegation",
+                summary="Agent delegation status: waiting_agent",
+                details_visible=False,
+                deep_link="/agents/example/chat",
+                updated_at=now - timedelta(minutes=2),
+            ),
+        ],
+        since=now - timedelta(hours=24),
+    )
+
+    summary = summaries[agent_id]
+    assert summary.status == "waiting_agent"
+    assert summary.active_count == 1
+    assert summary.recently_finished_count == 1
+
+
 @pytest.mark.asyncio
 async def test_work_summary_queries_are_viewer_scoped_and_not_globally_capped():
     tenant_id = uuid.uuid4()
@@ -171,6 +238,114 @@ async def test_work_summary_queries_are_viewer_scoped_and_not_globally_capped():
     assert "tasks.updated_at" in task_query
     assert "LIMIT" not in deliverable_query
     assert "LIMIT" not in task_query
+
+
+@pytest.mark.asyncio
+async def test_execution_summary_covers_company_runs_deliverables_and_media_without_leaking_chat_goal():
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    direct_agent_id = uuid.uuid4()
+    deliverable_agent_id = uuid.uuid4()
+    media_agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    direct_run = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        agent_id=direct_agent_id,
+        session_id=uuid.uuid4(),
+        source_type="chat",
+        source_id=str(uuid.uuid4()),
+        origin_user_id=uuid.uuid4(),
+        goal="Confidential conversation goal",
+        delivery_target={"kind": "direct"},
+        created_at=now - timedelta(minutes=3),
+        updated_at=now - timedelta(minutes=3),
+    )
+    direct_event = SimpleNamespace(
+        id=uuid.uuid4(),
+        run_id=direct_run.id,
+        event_type="status_changed",
+        payload={"status": "done", "activity_type": "tool_call"},
+        created_at=now - timedelta(minutes=1),
+    )
+    request = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        agent_id=deliverable_agent_id,
+        agent_run_id=None,
+        created_by_user_id=user_id,
+        session_id=uuid.uuid4(),
+        work_type="video",
+        goal="Launch film",
+        status="running",
+        current_stage="generation",
+        current_execution_id=uuid.uuid4(),
+        updated_at=now - timedelta(minutes=4),
+    )
+    execution = SimpleNamespace(
+        id=request.current_execution_id,
+        status="running",
+        current_stage="generation",
+        updated_at=now - timedelta(minutes=2),
+    )
+    linked_media = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=deliverable_agent_id,
+        user_id=user_id,
+        origin_session_id=request.session_id,
+        deliverable_execution_id=execution.id,
+        modality="video",
+        status="processing",
+        updated_at=now,
+    )
+    standalone_media = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=media_agent_id,
+        user_id=uuid.uuid4(),
+        origin_session_id=uuid.uuid4(),
+        deliverable_execution_id=None,
+        modality="image",
+        status="submission_ambiguous",
+        updated_at=now,
+    )
+    db = _RecordingDb(
+        [
+            _Result(values=[direct_run]),
+            _Result(values=[direct_event]),
+            _Result(rows=[(request, execution)]),
+            _Result(values=[linked_media, standalone_media]),
+        ]
+    )
+
+    result = await workforce_topology._load_topology_execution_summaries(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        employee_ids={direct_agent_id, deliverable_agent_id, media_agent_id},
+        auditable_agent_ids={direct_agent_id, deliverable_agent_id, media_agent_id},
+        since=now - timedelta(hours=24),
+    )
+
+    direct = result[direct_agent_id]
+    assert direct.status == "running"
+    assert direct.source_type == "direct_chat"
+    assert direct.details_visible is False
+    assert direct.title == "Direct conversation"
+    assert "Confidential" not in direct.summary
+    deliverable = result[deliverable_agent_id]
+    assert deliverable.source_type == "deliverable"
+    assert deliverable.status == "running"
+    assert deliverable.phase == "video:processing"
+    assert deliverable.details_visible is True
+    assert deliverable.title == "Launch film"
+    media = result[media_agent_id]
+    assert media.source_type == "media"
+    assert media.status == "waiting_external"
+    assert media.deep_link == f"/agents/{media_agent_id}/chat"
+    assert len(db.statements) == 4
+    assert "agent_runs.origin_user_id =" not in str(db.statements[0])
+    assert "NOT (EXISTS" in str(db.statements[0])
+    assert all("LIMIT" not in str(statement) for statement in db.statements)
 
 
 @pytest.mark.asyncio
@@ -256,6 +431,15 @@ async def test_member_topology_excludes_assistant_and_unmanageable_relationships
         "_load_topology_work_summaries",
         fake_work_summaries,
     )
+
+    async def fake_execution_summaries(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        workforce_topology,
+        "_load_topology_execution_summaries",
+        fake_execution_summaries,
+    )
     db = _RecordingDb(
         [
             _Result(scalar=tenant),
@@ -326,6 +510,15 @@ async def test_company_admin_receives_visible_relationships_and_merged_activity_
         workforce_topology,
         "_load_topology_work_summaries",
         fake_work_summaries,
+    )
+
+    async def fake_execution_summaries(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        workforce_topology,
+        "_load_topology_execution_summaries",
+        fake_execution_summaries,
     )
     db = _RecordingDb(
         [

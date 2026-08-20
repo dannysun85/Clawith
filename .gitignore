@@ -49,10 +49,12 @@ _agents/
 !.agents/workflows/add-product-capability.md
 !.agents/workflows/creative-deliverables-implementation-rollout.md
 !.agents/workflows/agent-workforce-v2-rollout.md
+!.agents/workflows/production-cutover-operating-procedure.md
 !.agents/reference/
 .agents/reference/*
 !.agents/reference/creative-deliverables-capability.md
 !.agents/reference/agency-agents-zh-provenance.md
+!.agents/reference/wechat-payment-readiness.md
 
 # Internal docs
 docs/

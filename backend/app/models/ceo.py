@@ -1,4 +1,4 @@
-"""CEO orchestrator (P1 observer) per-tenant settings model.
+"""Company CEO P1 observer plus opt-in P2 coordinator settings model.
 
 One row per tenant, created only on explicit opt-in. The CEO Agent itself is a
 regular ``Agent`` row with ``is_system=True`` and the ``ceo`` role template;
@@ -9,7 +9,7 @@ meeting group binding). Disable never deletes the Agent or any history.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -22,6 +22,10 @@ class CeoOrchestratorSettings(Base):
     __tablename__ = "ceo_orchestrator_settings"
     __table_args__ = (
         UniqueConstraint("ceo_agent_id", name="uq_ceo_orchestrator_settings_ceo_agent"),
+        CheckConstraint(
+            "max_parallel_delegations BETWEEN 1 AND 12",
+            name="ck_ceo_orchestrator_max_parallel_delegations",
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -48,6 +52,21 @@ class CeoOrchestratorSettings(Base):
     # Cadence switches (both default off; require the master switch too).
     briefing_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     morning_meeting_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # P2 is deliberately independent from the P1 master switch. Existing rows
+    # stay observer-only until a governor opts in while the P2 canary is open.
+    coordination_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    auto_dispatch_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    coordination_enabled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    coordination_enabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    max_parallel_delegations: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
 
     # Lazily created on the first meeting; never auto-created at enable time.
     meeting_group_id: Mapped[uuid.UUID | None] = mapped_column(

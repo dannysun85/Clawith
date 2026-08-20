@@ -58,6 +58,75 @@ def ceo_orchestrator_allowed(
     return agent_id is not None and str(agent_id) in parse(s.CEO_ORCHESTRATOR_AGENT_IDS)
 
 
+def ceo_coordination_rollout_allowed(
+    *,
+    tenant_id: uuid.UUID | str | None,
+    agent_id: uuid.UUID | str | None = None,
+    runtime_settings: Settings | None = None,
+) -> bool:
+    """Return whether the independent P2 coordination canary is open.
+
+    P2 can never widen the P1 boundary: both global gates and one matching
+    allowlist entry for each layer are required.
+    """
+    s = runtime_settings or get_settings()
+    if not ceo_orchestrator_allowed(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        runtime_settings=s,
+    ):
+        return False
+    if not s.CEO_COORDINATION_ENABLED:
+        return False
+
+    def parse(raw: str) -> set[str]:
+        return {item.strip() for item in str(raw or "").split(",") if item.strip()}
+
+    if str(tenant_id) in parse(s.CEO_COORDINATION_TENANT_IDS):
+        return True
+    return agent_id is not None and str(agent_id) in parse(s.CEO_COORDINATION_AGENT_IDS)
+
+
+def ceo_coordination_allowed(
+    settings_row: CeoOrchestratorSettings | None,
+    *,
+    runtime_settings: Settings | None = None,
+) -> bool:
+    """Fail-closed P2 authority check for one persisted company CEO."""
+    if settings_row is None:
+        return False
+    if not bool(getattr(settings_row, "enabled", False)):
+        return False
+    if not bool(getattr(settings_row, "coordination_enabled", False)):
+        return False
+    return ceo_coordination_rollout_allowed(
+        tenant_id=settings_row.tenant_id,
+        agent_id=settings_row.ceo_agent_id,
+        runtime_settings=runtime_settings,
+    )
+
+
+def ceo_operating_mode(
+    settings_row: CeoOrchestratorSettings | None,
+    *,
+    runtime_settings: Settings | None = None,
+) -> str:
+    """Derive the authoritative CEO operating mode from gates plus row state."""
+    if settings_row is None or not bool(getattr(settings_row, "enabled", False)):
+        return "disabled"
+    if not ceo_orchestrator_allowed(
+        tenant_id=settings_row.tenant_id,
+        agent_id=settings_row.ceo_agent_id,
+        runtime_settings=runtime_settings,
+    ):
+        return "disabled"
+    if not ceo_coordination_allowed(settings_row, runtime_settings=runtime_settings):
+        return "observer"
+    if bool(getattr(settings_row, "auto_dispatch_enabled", False)):
+        return "coordinator_auto"
+    return "coordinator"
+
+
 async def maybe_attach_ceo_brief_snapshot(
     db: AsyncSession,
     *,
@@ -343,6 +412,9 @@ __all__ = [
     "CeoBriefingError",
     "CompanyBriefSnapshot",
     "build_company_brief_snapshot",
+    "ceo_coordination_allowed",
+    "ceo_coordination_rollout_allowed",
+    "ceo_operating_mode",
     "ceo_orchestrator_allowed",
     "maybe_attach_ceo_brief_snapshot",
 ]

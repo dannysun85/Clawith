@@ -114,7 +114,7 @@ function LegacyCompanyAdminRedirect() {
     const sectionByHash: Record<string, string> = {
         users: 'members', invites: 'members', approvals: 'approvals', audit: 'audit',
         subscription: 'market', info: 'settings', quotas: 'settings', org: 'integrations',
-        tools: 'integrations', skills: 'integrations', douyin: 'integrations', okr: 'integrations',
+        tools: 'integrations', skills: 'integrations', douyin: 'integrations', okr: 'settings/okr',
     };
     return <Navigate to={`/company-admin/${sectionByHash[hash] || 'settings'}`} replace />;
 }

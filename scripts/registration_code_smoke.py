@@ -84,10 +84,27 @@ def require(condition: bool, stage: str, detail: Any) -> None:
         raise SmokeFailure(stage, detail)
 
 
+def api_error_text(body: Any) -> str:
+    """Flatten legacy and structured API errors for stable smoke assertions."""
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body.lower()
+    try:
+        return json.dumps(body, ensure_ascii=False, sort_keys=True).lower()
+    except (TypeError, ValueError):
+        return str(body).lower()
+
+
 def smoke_username_for(email: str) -> str:
     """Derive a stable username that does not collide with older smoke runs."""
     stem = re.sub(r"[^a-zA-Z0-9]+", "_", email.lower()).strip("_")
     return f"smoke_{stem}"[:100]
+
+
+def registration_code_prefix(raw_code: str) -> str:
+    """Mirror the non-secret prefix exposed by the admin list endpoint."""
+    return raw_code.strip().upper()[:12]
 
 
 async def ensure_smoke_platform_admin(email: str, password: str) -> dict[str, str]:
@@ -190,7 +207,7 @@ async (page) => {{
     type: input.getAttribute('type') || ''
   }})));
   const serialized = JSON.stringify({{ bodyText, inputs }});
-  if (!serialized.includes('邀请码') && !serialized.includes('注册码') && !/invitation|code/i.test(serialized)) {{
+  if (!serialized.includes('邀请码') && !serialized.includes('注册码') && !serialized.includes('注册凭证') && !/invitation|code/i.test(serialized)) {{
     throw new Error('registration code field not visible');
   }}
   return {{ ok: true, inputs }};
@@ -282,10 +299,14 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         summary["registration_code"] = created_code
         summary["checks"].append("registration_code_create_ok")
 
-        encoded_code = urllib.parse.quote(created_code)
+        code_prefix = registration_code_prefix(created_code)
+        encoded_code = urllib.parse.quote(code_prefix)
         status, code_list = call_api("GET", api_base, f"/admin/registration-codes?search={encoded_code}", token=token)
         require(status == 200 and code_list.get("items"), "registration_code_list", {"status": status, "body": code_list})
-        code_row = next((item for item in code_list["items"] if item["code"] == created_code), code_list["items"][0])
+        code_row = next(
+            (item for item in code_list["items"] if item["code"].removesuffix("…") == code_prefix),
+            code_list["items"][0],
+        )
         code_id = code_row["id"]
         summary["registration_code_id"] = code_id
         summary["checks"].append("registration_code_list_ok")
@@ -323,7 +344,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
         require(
-            status == 400 and body and body.get("detail") == "Registration code is required",
+            status == 400 and "registration code is required" in api_error_text(body),
             "register_without_code_rejected",
             {"status": status, "body": body},
         )
@@ -343,7 +364,8 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
         require(
-            status == 400 and body and body.get("detail") == "Invalid registration code",
+            status == 400
+            and "invalid registration grant or organization invitation" in api_error_text(body),
             "register_invalid_code_rejected",
             {"status": status, "body": body},
         )
@@ -384,7 +406,12 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
         require(
-            status == 400 and body and body.get("detail") == "Registration code has reached its usage limit",
+            status == 400
+            and (
+                "registration_grant_exhausted" in api_error_text(body)
+                or "registration_grant_inactive" in api_error_text(body)
+                or "registration grant has reached its usage limit" in api_error_text(body)
+            ),
             "registration_code_usage_limit",
             {"status": status, "body": body},
         )
@@ -392,7 +419,10 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
         status, code_list_after = call_api("GET", api_base, f"/admin/registration-codes?search={encoded_code}", token=token)
         require(status == 200 and code_list_after.get("items"), "registration_code_list_after", {"status": status, "body": code_list_after})
-        used_row = next((item for item in code_list_after["items"] if item["code"] == created_code), code_list_after["items"][0])
+        used_row = next(
+            (item for item in code_list_after["items"] if item["code"].removesuffix("…") == code_prefix),
+            code_list_after["items"][0],
+        )
         require(used_row.get("used_count") == 1, "registration_code_consumed_once", used_row)
         summary["used_count_after_register"] = used_row.get("used_count")
         summary["checks"].append("registration_code_consumed_once_ok")

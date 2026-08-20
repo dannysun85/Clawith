@@ -10904,6 +10904,22 @@ async def _send_file_to_agent_outcome(
         note_lines.append(f'- Read the file via `read_file(path="{target_rel_path}")`')
         await storage.write_text(note_key, "\n".join(note_lines), encoding="utf-8")
 
+        # The write itself is not proof of delivery. Read both durable objects
+        # back before issuing a successful receipt so a delegated Run cannot
+        # finish on a narrative-only file claim.
+        delivered_bytes = await storage.read_bytes(target_key)
+        delivered_note = await storage.read_text(
+            note_key,
+            encoding="utf-8",
+            errors="strict",
+        )
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        if (
+            hashlib.sha256(delivered_bytes).hexdigest() != source_sha256
+            or target_rel_path not in delivered_note
+        ):
+            raise RuntimeError("agent file delivery readback mismatch")
+
         try:
             from app.models.audit import AuditLog
 
@@ -11017,7 +11033,22 @@ async def _send_file_to_agent_outcome(
             )
 
         return _typed_success(
-            f"File sent to {target_name}.\n- Delivered to: {target_rel_path}\n- Inbox note: {note_rel_path}"
+            f"File sent to {target_name}.\n- Delivered to: {target_rel_path}\n- Inbox note: {note_rel_path}",
+            metadata={
+                "delivery_receipts": [
+                    {
+                        "version": 1,
+                        "kind": "agent_workspace_file",
+                        "source_agent_id": str(from_agent_id),
+                        "target_agent_id": str(target_id),
+                        "source_path": rel_path,
+                        "delivered_path": target_rel_path,
+                        "inbox_note_path": note_rel_path,
+                        "size_bytes": len(delivered_bytes),
+                        "sha256": source_sha256,
+                    }
+                ]
+            },
         )
     except Exception as exc:
         if mutation_started:
@@ -27826,7 +27857,7 @@ async def _a2a_handle_consult(
             "Plain text responses will be REJECTED and you will be asked to redo.\n"
             "\n** CRITICAL FILE DELIVERY RULE **\n"
             f"After you write any file (report, document, analysis, etc.) that the requesting agent needs, "
-            f'you MUST call `send_file_to_agent(agent_name="{ctx.source_agent.name}", file_path="<path>")` '
+            f'you MUST call `send_file_to_agent(target_agent_id="{ctx.source_agent.id}", file_path="<path>")` '
             f"to deliver it. The other agent CANNOT access your workspace. "
             f"Never just tell them the path — always deliver explicitly.\n"
         )

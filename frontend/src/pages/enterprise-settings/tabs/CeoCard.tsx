@@ -8,7 +8,7 @@ import { agentApi, ceoApi, type CeoOrchestratorSettings } from '../../../service
 import type { Agent } from '../../../types';
 
 /**
- * CEO orchestrator (P1 observer) settings card.
+ * One company CEO with observer-by-default and opt-in coordinator authority.
  *
  * Rendered as an independent card on the OKR/company settings tab. It never
  * mixes into the OKR (094) settings semantics: all state comes from the
@@ -25,6 +25,7 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
     const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
     const [dailyCap, setDailyCap] = useState('20');
     const [monthlyCap, setMonthlyCap] = useState('300');
+    const [maxParallel, setMaxParallel] = useState('3');
     const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
     const [saveError, setSaveError] = useState('');
     const saveTimerRef = useRef<number | null>(null);
@@ -47,6 +48,7 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
         setSelectedMemberIds(settings.meeting_member_agent_ids ?? []);
         setDailyCap(String(settings.daily_credit_cap ?? 20));
         setMonthlyCap(String(settings.monthly_credit_cap ?? 300));
+        setMaxParallel(String(settings.max_parallel_delegations ?? 3));
     }, [settings]);
 
     useEffect(() => () => {
@@ -145,6 +147,50 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
         });
     };
 
+    const saveParallelism = () => {
+        const value = Math.min(12, Math.max(1, Number.parseInt(maxParallel, 10) || 3));
+        setMaxParallel(String(value));
+        setSaveState('saving');
+        setSaveError('');
+        patchMutation.mutate({ max_parallel_delegations: value });
+    };
+
+    const toggleCoordination = async (value: boolean) => {
+        if (value) {
+            const confirmed = await dialog.confirm(
+                zh
+                    ? '协调型 CEO 可以在当前人工对话中，根据员工能力目录下发任务。它仍不能替你审批、付款、签约或发布外部内容；所有委派都必须留下运行与交付回执。'
+                    : 'Coordinator mode may delegate from a current human chat using Directory capability evidence. It still cannot approve, pay, sign, or publish externally; every delegation must leave Runtime and delivery receipts.',
+                {
+                    title: zh ? '启用 CEO 协调权限' : 'Enable CEO coordination',
+                    confirmLabel: zh ? '确认启用' : 'Enable coordination',
+                },
+            );
+            if (!confirmed) return;
+        }
+        setSaveState('saving');
+        setSaveError('');
+        patchMutation.mutate({ coordination_enabled: value });
+    };
+
+    const toggleAutoDispatch = async (value: boolean) => {
+        if (value) {
+            const confirmed = await dialog.confirm(
+                zh
+                    ? '自动派发会允许 CEO 的非人工对话运行（例如已授权的系统节奏）继续下发任务。默认建议保持关闭，直到人工对话委派已完成验收。'
+                    : 'Autonomous dispatch lets authorized non-chat CEO runs delegate work. Keep it off until human-chat delegation has passed acceptance testing.',
+                {
+                    title: zh ? '启用自动派发' : 'Enable autonomous dispatch',
+                    confirmLabel: zh ? '确认启用' : 'Enable autonomous dispatch',
+                },
+            );
+            if (!confirmed) return;
+        }
+        setSaveState('saving');
+        setSaveError('');
+        patchMutation.mutate({ auto_dispatch_enabled: value });
+    };
+
     const confirmDisable = async () => {
         const confirmed = await dialog.confirm(
             zh
@@ -193,18 +239,22 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '16px' }}>
                     <div>
                         <div style={{ fontWeight: 600, fontSize: '15px', color: 'var(--text-primary)', marginBottom: '4px' }}>
-                            {zh ? '公司 CEO（观察型）' : 'Company CEO (observer)'}
+                            {zh ? '公司 CEO' : 'Company CEO'}
                             <span style={{
                                 marginLeft: '8px', padding: '1px 8px', borderRadius: '999px', fontSize: '11px',
                                 background: 'rgba(99,102,241,0.12)', color: 'var(--accent-primary)', fontWeight: 500,
                             }}>
-                                {zh ? '系统岗位 · 不占员工席位' : 'System role · no seat used'}
+                                {settings.operating_mode === 'coordinator_auto'
+                                    ? (zh ? '协调型 · 自动派发' : 'Coordinator · autonomous')
+                                    : settings.operating_mode === 'coordinator'
+                                        ? (zh ? '协调型' : 'Coordinator')
+                                        : (zh ? '观察型 · 不占员工席位' : 'Observer · no seat used')}
                             </span>
                         </div>
                         <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6, maxWidth: '620px' }}>
                             {zh
-                                ? '启用后，公司 CEO 只读汇总业务全景、按节奏生成日报/周报，并可主持晨会产出纪要。行动项仅为文本建议，不会自动派发任务。运行消耗租户 Credits，可在下方设置日/月预算帽。'
-                                : 'The company CEO reads the business panorama, produces daily/weekly briefings on a cadence, and can chair a morning meeting into minutes. Suggested actions are text only — nothing is dispatched automatically. Runs consume tenant Credits; cap them below.'}
+                                ? 'CEO 默认以观察型运行：汇总业务全景、生成简报并主持晨会。管理员可另行开启协调型权限，让它在人工对话中依据能力目录委派任务；自动派发仍是独立开关。运行消耗租户 Credits。'
+                                : 'The CEO defaults to observer mode for panorama, briefings, and meetings. A governor may separately enable coordinator authority for capability-based delegation from human chat; autonomous dispatch remains an independent switch. Runs consume tenant Credits.'}
                         </div>
                     </div>
                     {configured && settings.ceo_agent_id && (
@@ -299,6 +349,55 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                                 </div>
                                 {renderToggle(settings.morning_meeting_enabled, patchMutation.isPending, (value) => toggleCadence('morning_meeting_enabled', value), 'morning_meeting_enabled')}
                             </div>
+                        </div>
+                    )}
+
+                    {configured && enabled && (
+                        <div style={{ marginTop: '18px', paddingTop: '16px', borderTop: '1px solid var(--border-subtle)' }}>
+                            <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '12px' }}>
+                                {zh ? '协调与派发权限' : 'Coordination and dispatch authority'}
+                            </div>
+                            {!settings.coordination_feature_available ? (
+                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                    {zh
+                                        ? '当前部署尚未为本公司开放协调型 canary；CEO 将保持观察型。'
+                                        : 'The coordinator canary is not open for this company; the CEO remains observer-only.'}
+                                </div>
+                            ) : (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', maxWidth: '620px', gap: '16px' }}>
+                                        <div style={{ fontSize: '13px' }}>
+                                            <div style={{ fontWeight: 500 }}>{zh ? '协调型 CEO' : 'Coordinator mode'}</div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                                {zh ? '仅在当前人工对话中，依据最新能力目录委派并等待回执。' : 'Delegate only from a current human chat using current Directory evidence and correlated receipts.'}
+                                            </div>
+                                        </div>
+                                        {renderToggle(settings.coordination_enabled, patchMutation.isPending, (value) => void toggleCoordination(value), 'coordination_enabled')}
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', maxWidth: '620px', gap: '16px' }}>
+                                        <div style={{ fontSize: '13px' }}>
+                                            <div style={{ fontWeight: 500 }}>{zh ? '允许非人工运行自动派发' : 'Allow autonomous dispatch from non-chat runs'}</div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                                {zh ? '独立高风险开关；关闭时，触发器、心跳与被委派运行都不能继续派发。' : 'Independent high-risk switch; when off, triggers, heartbeats, and delegated runs cannot dispatch onward.'}
+                                            </div>
+                                        </div>
+                                        {renderToggle(settings.auto_dispatch_enabled, patchMutation.isPending || !settings.coordination_enabled, (value) => void toggleAutoDispatch(value), 'auto_dispatch_enabled')}
+                                    </div>
+                                    <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '13px' }}>
+                                        <span style={{ color: 'var(--text-secondary)' }}>{zh ? '最大并行委派数' : 'Maximum parallel delegations'}</span>
+                                        <input
+                                            className="form-input"
+                                            type="number"
+                                            min={1}
+                                            max={12}
+                                            value={maxParallel}
+                                            onChange={(event) => setMaxParallel(event.target.value)}
+                                            onBlur={saveParallelism}
+                                            style={{ width: '90px' }}
+                                        />
+                                    </label>
+                                </div>
+                            )}
                         </div>
                     )}
 

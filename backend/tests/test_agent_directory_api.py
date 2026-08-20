@@ -148,6 +148,7 @@ async def test_get_agent_directory_filters_uncontactable_agents_by_default(monke
     db = RecordingDB([
         DummyResult(scalar_value=source),
         DummyResult(values=[running, stopped]),
+        DummyResult(values=[]),
     ])
 
     async def fake_check_agent_access(_db, _current_user, _agent_id):

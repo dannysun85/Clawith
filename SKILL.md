@@ -203,6 +203,7 @@ Clawith/
 **工作流（`.agents/workflows/`）——步骤化操作指南**
 
 - `.agents/workflows/deploy-production.md` — 生产部署固定流程（`opc.reeftotem.ai` / `/opt/astra-poc`）
+- `.agents/workflows/production-cutover-operating-procedure.md` — 生产切流操作规程（单人主责、数据面唯一、失败即停）
 - `.agents/workflows/add-product-capability.md` — 新增或升级产品能力、Skill、Tool、Provider 与 Agent 员工的统一流程
 - `.agents/workflows/creative-deliverables-implementation-rollout.md` — 图片、视频、PPT 的完整落地、兼容迁移、灰度、验收和回滚方案
 - `.agents/workflows/agent-workforce-v2-rollout.md` — 外部 268 个角色的 19/92/142/15 全量治理、迁移、能力注册、评测与回滚计划
@@ -213,5 +214,6 @@ Clawith/
 - `.agents/reference/creative-deliverables-capability.md` — 当前图片、视频、PPT 实现基线、质量方案、调用链与降级矩阵
 - `.agents/reference/agency-agents-zh-provenance.md` — 首批外部 Agent 角色的固定版本、筛选映射、MIT 来源和 Astra 重写边界
 - `.agents/reference/clawith-v1.11.3-upgrade.md` — 上游 v1.11.3 语义升级范围、Astra 保留项、拒绝项和验证门禁
+- `.agents/reference/wechat-payment-readiness.md` — manual/wechat 支付状态、验签、订单绑定、幂等、退款与外部上线门
 
 > 规则：本文件总长度控制在 250 行以内。超过时优先把最详细的部分拆到 `.agents/reference/`，并在上面登记链接。

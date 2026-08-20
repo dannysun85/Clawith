@@ -10,7 +10,9 @@ from app.core.permissions import evaluate_roster_agent_visibility, evaluate_rost
 from app.models.agent import Agent as AgentModel, AgentPermission
 from app.models.identity import IdentityProvider
 from app.models.org import AgentAgentRelationship, OrgDepartment, OrgMember
+from app.models.tool import AgentTool, Tool
 from app.models.user import User as UserModel
+from app.services.builtin_tool_definitions import builtin_policy, builtin_readiness
 
 DirectoryMemberType = Literal["all", "agent", "human"]
 
@@ -97,6 +99,7 @@ def format_roster_agent(
     target_agent: AgentModel,
     *,
     authorized_custom_target: bool = False,
+    capabilities: list[dict] | None = None,
 ) -> dict | None:
     visibility = evaluate_roster_agent_visibility(
         source_agent,
@@ -110,7 +113,8 @@ def format_roster_agent(
         "target_agent_id": str(target_agent.id),
         "display_name": target_agent.name,
         "role_description": target_agent.role_description or "",
-        "capabilities": [],
+        "capabilities": capabilities or [],
+        "capability_summary_version": 1,
         "department": None,
         "skills": [],
         "access_mode": getattr(target_agent, "access_mode", None) or "company",
@@ -118,6 +122,59 @@ def format_roster_agent(
         "contact_tools": ["send_message_to_agent"] if visibility.can_contact else [],
         "unavailable_reason": visibility.unavailable_reason,
     }
+
+
+def _safe_capability_summary(tool: Tool) -> dict:
+    """Project one granted tool without leaking schemas, credentials, or config."""
+    tool_type = str(getattr(tool, "type", None) or "builtin")
+    if tool_type == "builtin":
+        readiness = builtin_readiness(tool.name) or "runtime_preflight"
+        policy = builtin_policy(tool.name)
+    else:
+        readiness = "mcp_runtime"
+        policy = {"effect": "external_write"}
+    available = readiness == "local"
+    return {
+        "name": tool.name,
+        "display_name": tool.display_name,
+        "category": tool.category,
+        "type": tool_type,
+        "effect": policy["effect"],
+        "availability": "available" if available else "requires_preflight",
+        "readiness": readiness,
+        "reason": None if available else "runtime_preflight_required",
+    }
+
+
+async def _load_agent_capability_summaries(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID | None,
+    agent_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[dict]]:
+    """Batch-load enabled grants for the current Directory page.
+
+    This is an assignment/readiness projection, not a promise that an external
+    provider will succeed. Credential- or channel-dependent tools explicitly
+    require a Runtime preflight.
+    """
+    if not agent_ids:
+        return {}
+    result = await db.execute(
+        select(AgentTool.agent_id, Tool)
+        .join(Tool, Tool.id == AgentTool.tool_id)
+        .where(
+            AgentTool.agent_id.in_(agent_ids),
+            AgentTool.enabled.is_(True),
+            Tool.enabled.is_(True),
+            or_(Tool.tenant_id.is_(None), Tool.tenant_id == tenant_id),
+        )
+        .order_by(AgentTool.agent_id.asc(), Tool.category.asc(), Tool.name.asc())
+    )
+    summaries: dict[uuid.UUID, list[dict]] = {agent_id: [] for agent_id in agent_ids}
+    for agent_id, tool in result.all():
+        summaries.setdefault(agent_id, []).append(_safe_capability_summary(tool))
+    return summaries
 
 
 def format_roster_human(
@@ -440,9 +497,15 @@ async def query_agent_directory(
         human_ids = [member_id for member_type_value, member_id in page_entries if member_type_value == "human"]
 
         agents_by_id: dict[uuid.UUID, AgentModel] = {}
+        capabilities_by_agent: dict[uuid.UUID, list[dict]] = {}
         if agent_ids:
             agent_detail_result = await db.execute(select(AgentModel).where(AgentModel.id.in_(agent_ids)))
             agents_by_id = {agent.id: agent for agent in agent_detail_result.scalars().all()}
+            capabilities_by_agent = await _load_agent_capability_summaries(
+                db,
+                tenant_id=source.tenant_id,
+                agent_ids=agent_ids,
+            )
 
         humans_by_id: dict[uuid.UUID, tuple[OrgMember, IdentityProvider | None, OrgDepartment | None, UserModel | None]] = {}
         if human_ids:
@@ -464,6 +527,7 @@ async def query_agent_directory(
                     source,
                     target_agent,
                     authorized_custom_target=(getattr(target_agent, "access_mode", None) == "custom"),
+                    capabilities=capabilities_by_agent.get(target_agent.id, []),
                 )
             else:
                 human_row = humans_by_id.get(member_id)
@@ -510,11 +574,18 @@ async def query_agent_directory(
             .limit(fetch_size)
         )
         agent_rows = agent_result.scalars().all()
-        for target_agent in agent_rows[:limit]:
+        page_agents = list(agent_rows[:limit])
+        capabilities_by_agent = await _load_agent_capability_summaries(
+            db,
+            tenant_id=source.tenant_id,
+            agent_ids=[agent.id for agent in page_agents],
+        )
+        for target_agent in page_agents:
             payload = format_roster_agent(
                 source,
                 target_agent,
                 authorized_custom_target=(getattr(target_agent, "access_mode", None) == "custom"),
+                capabilities=capabilities_by_agent.get(target_agent.id, []),
             )
             if payload and (include_uncontactable or payload["can_contact"]):
                 members.append(payload)

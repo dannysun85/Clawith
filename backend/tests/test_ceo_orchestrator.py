@@ -13,14 +13,17 @@ import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import uuid
 
 import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from fastapi import HTTPException
 
 from app import database
+from app.api import ceo as ceo_api
 from app.config import Settings
 from app.services import agent_tools, ceo_briefing, ceo_orchestrator
 from app.services.agent_template_contract import (
@@ -88,6 +91,9 @@ def test_ceo_rollout_defaults_closed() -> None:
     assert s.CEO_ORCHESTRATOR_ENABLED is False
     assert s.CEO_ORCHESTRATOR_TENANT_IDS == ""
     assert s.CEO_ORCHESTRATOR_AGENT_IDS == ""
+    assert s.CEO_COORDINATION_ENABLED is False
+    assert s.CEO_COORDINATION_TENANT_IDS == ""
+    assert s.CEO_COORDINATION_AGENT_IDS == ""
     assert s.CEO_BRIEF_SNAPSHOT_MAX_CHARS == 4000
 
 
@@ -105,9 +111,123 @@ def _settings_row(**overrides: object) -> SimpleNamespace:
         "daily_credit_cap": 20,
         "monthly_credit_cap": 300,
         "meeting_member_agent_ids": [],
+        "coordination_enabled": False,
+        "auto_dispatch_enabled": False,
+        "coordination_enabled_by_user_id": None,
+        "coordination_enabled_at": None,
+        "max_parallel_delegations": 3,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+@pytest.mark.asyncio
+async def test_ceo_settings_read_requires_company_governor() -> None:
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        role="member",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ceo_api.get_ceo_orchestrator_settings(
+            current_user=user,
+            db=SimpleNamespace(),
+        )
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_ceo_status_read_exposes_only_member_safe_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    row = _settings_row(
+        tenant_id=tenant_id,
+        enabled_by_user_id=uuid.uuid4(),
+        meeting_member_agent_ids=[uuid.uuid4()],
+        coordination_enabled=True,
+        auto_dispatch_enabled=True,
+    )
+    monkeypatch.setattr(ceo_api, "get_ceo_settings", AsyncMock(return_value=row))
+    monkeypatch.setattr(ceo_api, "ceo_orchestrator_allowed", lambda **_kwargs: True)
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id, role="member")
+
+    result = await ceo_api.get_ceo_orchestrator_status(
+        current_user=user,
+        db=SimpleNamespace(),
+    )
+
+    assert result.model_dump(mode="json") == {
+        "feature_available": True,
+        "configured": True,
+        "ceo_agent_id": str(row.ceo_agent_id),
+        "enabled": True,
+    }
+
+
+def test_ceo_coordination_gate_and_operating_mode_truth_table() -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    row = _settings_row(tenant_id=tenant_id, ceo_agent_id=agent_id)
+    p1_only = _settings(
+        CEO_ORCHESTRATOR_ENABLED=True,
+        CEO_ORCHESTRATOR_TENANT_IDS=str(tenant_id),
+    )
+    assert ceo_briefing.ceo_operating_mode(row, runtime_settings=p1_only) == "observer"
+    assert not ceo_briefing.ceo_coordination_allowed(row, runtime_settings=p1_only)
+
+    p2_open = _settings(
+        CEO_ORCHESTRATOR_ENABLED=True,
+        CEO_ORCHESTRATOR_TENANT_IDS=str(tenant_id),
+        CEO_COORDINATION_ENABLED=True,
+        CEO_COORDINATION_TENANT_IDS=str(tenant_id),
+    )
+    assert ceo_briefing.ceo_operating_mode(row, runtime_settings=p2_open) == "observer"
+    row.coordination_enabled = True
+    assert ceo_briefing.ceo_coordination_allowed(row, runtime_settings=p2_open)
+    assert ceo_briefing.ceo_operating_mode(row, runtime_settings=p2_open) == "coordinator"
+    row.auto_dispatch_enabled = True
+    assert ceo_briefing.ceo_operating_mode(row, runtime_settings=p2_open) == "coordinator_auto"
+
+
+@pytest.mark.asyncio
+async def test_update_ceo_coordination_requires_canary_and_disabling_clears_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _settings_row(auto_dispatch_enabled=True)
+    actor = SimpleNamespace(id=uuid.uuid4())
+    db = SimpleNamespace(flush=AsyncMock())
+    monkeypatch.setattr(ceo_orchestrator, "_sync_ceo_triggers", AsyncMock())
+    monkeypatch.setattr(
+        ceo_orchestrator,
+        "ceo_coordination_rollout_allowed",
+        lambda **_: False,
+    )
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as exc:
+        await ceo_orchestrator.update_ceo_settings(
+            db,
+            settings=row,
+            actor=actor,
+            coordination_enabled=True,
+        )
+    assert exc.value.code == "ceo_coordination_not_available"
+
+    monkeypatch.setattr(
+        ceo_orchestrator,
+        "ceo_coordination_rollout_allowed",
+        lambda **_: True,
+    )
+    row.coordination_enabled = True
+    await ceo_orchestrator.update_ceo_settings(
+        db,
+        settings=row,
+        actor=actor,
+        coordination_enabled=False,
+    )
+    assert row.coordination_enabled is False
+    assert row.auto_dispatch_enabled is False
 
 
 def test_trigger_triple_gate_truth_table(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -661,6 +781,13 @@ _MIGRATION_PATH = (
     / "202608192100_add_ceo_orchestrator_settings.py"
 )
 
+_COORDINATION_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "202608200900_add_ceo_coordination_mode.py"
+)
+
 _EXPECTED_COLUMNS = {
     "tenant_id",
     "ceo_agent_id",
@@ -689,6 +816,17 @@ def _load_migration():
     spec = importlib.util.spec_from_file_location(
         "ceo_orchestrator_settings_migration",
         _MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_coordination_migration():
+    spec = importlib.util.spec_from_file_location(
+        "ceo_coordination_mode_migration",
+        _COORDINATION_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -736,3 +874,33 @@ def test_ceo_settings_migration_chains_single_head() -> None:
     migration = _load_migration()
     assert migration.revision == "ceo_orchestrator_settings"
     assert migration.down_revision == "subscription_change_kind"
+
+
+def test_ceo_coordination_migration_defaults_existing_rows_closed_on_sqlite() -> None:
+    base_migration = _load_migration()
+    migration = _load_coordination_migration()
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        for ddl in _PARENT_TABLE_DDL:
+            connection.exec_driver_sql(ddl)
+        _run(base_migration, connection, "upgrade")
+        _run(migration, connection, "upgrade")
+        columns = {
+            column["name"]
+            for column in sa.inspect(connection).get_columns("ceo_orchestrator_settings")
+        }
+        assert {
+            "coordination_enabled",
+            "auto_dispatch_enabled",
+            "coordination_enabled_by_user_id",
+            "coordination_enabled_at",
+            "max_parallel_delegations",
+        }.issubset(columns)
+        _run(migration, connection, "downgrade")
+        columns = {
+            column["name"]
+            for column in sa.inspect(connection).get_columns("ceo_orchestrator_settings")
+        }
+        assert "coordination_enabled" not in columns
+        assert migration.revision == "ceo_coordination_mode"
+        assert migration.down_revision == "ceo_orchestrator_settings"

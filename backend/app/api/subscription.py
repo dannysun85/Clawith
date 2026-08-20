@@ -53,7 +53,11 @@ from app.schemas.subscription import (
     UsageOut,
 )
 from app.services.billing_events import process_billing_webhook_event
-from app.services.billing_provider import get_billing_provider, resolved_payment_base_url
+from app.services.billing_provider import (
+    billing_provider_readiness,
+    get_billing_provider,
+    resolved_payment_base_url,
+)
 from app.services.credit_service import (
     SUBSCRIPTION_PLAN_CHANGE_REF_TYPE,
     get_credit_balance,
@@ -126,12 +130,37 @@ def _enforce_payment_origin(request: Request) -> None:
 
 @router.get("/config", response_model=BillingConfigOut)
 async def get_billing_config(current_user: User = Depends(get_current_user)):
-    """Frontend billing display config: active payment provider + USD→CNY rate."""
+    """Frontend billing config; reports readiness without exposing secrets."""
     settings = get_settings()
+    readiness = billing_provider_readiness(settings)
     return BillingConfigOut(
-        provider=(settings.BILLING_PROVIDER or "manual").lower(),
+        provider=readiness.provider,
         usd_cny_rate=settings.BILLING_USD_CNY_RATE,
+        status=readiness.status,
+        checkout_enabled=readiness.checkout_enabled,
+        native_payment_enabled=readiness.native_payment_enabled,
+        webhook_ready=readiness.webhook_ready,
+        missing_config=list(readiness.missing_config),
+        issues=list(readiness.issues),
+        next_action=readiness.next_action,
         payment_host=_payment_host(),
+    )
+
+
+def _require_checkout_provider_ready() -> None:
+    readiness = billing_provider_readiness(get_settings())
+    if readiness.checkout_enabled:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "code": "BILLING_PROVIDER_NOT_READY",
+            "provider": readiness.provider,
+            "status": readiness.status,
+            "issues": list(readiness.issues),
+            "missing_config": list(readiness.missing_config),
+            "next_action": readiness.next_action,
+        },
     )
 
 
@@ -680,6 +709,7 @@ async def checkout_subscribe(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a subscription checkout order."""
+    _require_checkout_provider_ready()
     _enforce_payment_origin(request)
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User has no tenant")
@@ -743,6 +773,7 @@ async def checkout_topup(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a credit top-up checkout order."""
+    _require_checkout_provider_ready()
     _enforce_payment_origin(request)
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User has no tenant")
@@ -823,6 +854,16 @@ async def billing_webhook(
             payload=payload,
             signature=stripe_signature,
             provider=provider,
+            signature_headers={
+                key: value
+                for key in (
+                    "Wechatpay-Signature",
+                    "Wechatpay-Timestamp",
+                    "Wechatpay-Nonce",
+                    "Wechatpay-Serial",
+                )
+                if (value := request.headers.get(key))
+            },
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -1,3 +1,60 @@
+# v1.12.0 — Governed CEO Coordination and Production Readiness
+
+## CEO coordination and workforce visibility
+
+- CEO orchestration keeps observer, human-initiated coordinator, and autonomous
+  coordinator modes behind separate tenant and rollout gates. Delegation uses
+  current Directory capability evidence and the existing durable A2A runtime;
+  it does not grant the CEO or target employee any new Tool authority.
+- The digital-employee topology projects authoritative live execution from
+  Agent Runs, Work tasks, deliverables, and media jobs. It keeps company-visible
+  redacted execution, viewer-owned work, and governed analytics as three
+  explicit scopes, and refreshes while the employee page is open.
+- CEO status remains member-safe while complete settings, member selection,
+  budgets, coordination, and auto-dispatch controls require a company governor.
+
+## Tenant recovery and control-plane safety
+
+- Company governors can request a tenant-scoped, secret-free legacy CEO
+  migration preview. It classifies formal, absent, clean legacy, contaminated
+  legacy, and ambiguous states without changing data or copying message,
+  Memory, trigger, Tool, or credential content.
+- Agent `soul.md`, Memory, and Skill control-plane files now require manage
+  authority for mutation, revision restore, and related locking operations.
+  Workspace paths are canonicalized before both authorization and storage so
+  aliases such as `workspace/../memory.md` cannot bypass those controls.
+- Long Memory context keeps a bounded beginning and latest tail, making recent
+  approved corrections visible without silently importing prior chat history.
+
+## Payment readiness
+
+- WeChat Pay exposes a secret-free readiness contract and fails closed before
+  creating an order when the selected provider is incomplete. Local development
+  remains valid with `BILLING_PROVIDER=manual`; production credentials are never
+  copied into local configuration.
+- Native checkout now requires merchant request signing, APIv3 resource
+  decryption, WeChat platform signature verification, serial and timestamp
+  checks, tenant/order/amount binding, and exactly-once settlement.
+- Runtime readiness, real-provider verification, deployment, and production
+  verification remain separate release gates. This version bump does not by
+  itself enable WeChat Pay or create a real order.
+
+## Creative deliverables
+
+- Poster, video, and presentation v2 flows add structured brief approvals,
+  resumable stages, candidate QA, and clearer preflight/degraded states while
+  preserving the existing canary-off rollout boundary.
+
+## Operations
+
+- Includes Alembic migrations up to `ceo_coordination_mode`.
+- Registration-code business-flow smoke now follows the governed platform
+  registration-credential contract and its structured error responses.
+- The production release must use an immutable reviewed commit and separately
+  prove active-container configuration, migration head, provider readiness, and
+  browser business flows. Rollback is the normal immutable-release rollback to
+  v1.11.42.
+
 # v1.11.42 — Subscription Lifecycle and Creative Deliverables v2
 
 ## Stability fixes

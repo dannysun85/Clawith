@@ -30,6 +30,7 @@ import {
 import { useAuthStore } from '../stores';
 import type { Agent } from '../types';
 import { hasEffectiveCapability } from '../utils/productAccess';
+import { topologyExecutionWorkGroup } from '../utils/workforceTopology';
 import { SUBSCRIPTION_UPGRADE_PATH } from '../hooks/useAgentCreationLimit';
 import './employees.css';
 
@@ -93,14 +94,16 @@ function healthLabel(status: string, isChinese: boolean): string {
 function workLabel(node: WorkforceTopologyNode, isChinese: boolean): string {
     const labels: Record<string, [string, string]> = {
         executing: ['执行中', 'Executing'],
+        waiting: ['等待中', 'Waiting'],
         review: ['待复核', 'In review'],
         approval: ['待审批', 'Awaiting approval'],
         blocked: ['受阻', 'Blocked'],
         completed: ['已完成', 'Completed'],
     };
-    if (!node.work) return isChinese ? '暂无工作' : 'No current work';
-    const label = labels[node.work.stage];
-    return label ? label[isChinese ? 0 : 1] : node.work.stage;
+    if (!node.execution && !node.work) return isChinese ? '暂无工作' : 'No current work';
+    const group = topologyExecutionWorkGroup(node);
+    const label = labels[group];
+    return label ? label[isChinese ? 0 : 1] : group;
 }
 
 function visibilityLabel(visibility: WorkforceTopologyNode['visibility'], isChinese: boolean): string {
@@ -137,16 +140,17 @@ function EmployeeDirectory({
         const normalized = query.trim().toLocaleLowerCase();
         return [...topology.nodes]
             .filter((node) => {
+                const workGroup = topologyExecutionWorkGroup(node);
                 if (normalized && !`${node.name} ${node.role_description}`.toLocaleLowerCase().includes(normalized)) {
                     return false;
                 }
                 if (health === 'running' && node.status !== 'running') return false;
                 if (health === 'idle' && node.status !== 'idle') return false;
                 if (health === 'attention' && !['creating', 'stopped', 'error'].includes(node.status)) return false;
-                if (work === 'active' && !node.work?.stage.match(/^(executing|review|approval)$/)) return false;
-                if (work === 'blocked' && node.work?.stage !== 'blocked') return false;
-                if (work === 'completed' && node.work?.stage !== 'completed') return false;
-                if (work === 'no_work' && node.work) return false;
+                if (work === 'active' && !['executing', 'waiting', 'review', 'approval'].includes(workGroup)) return false;
+                if (work === 'blocked' && workGroup !== 'blocked') return false;
+                if (work === 'completed' && workGroup !== 'completed') return false;
+                if (work === 'no_work' && workGroup !== 'no_work') return false;
                 return true;
             })
             .sort((left, right) => {
@@ -253,7 +257,9 @@ function EmployeeDirectory({
                             </span>
                             <span className="employee-directory__field employee-directory__work" data-label={isChinese ? '当前工作' : 'Current work'}>
                                 <strong>{workLabel(node, isChinese)}</strong>
-                                {node.work?.title && <small>{node.work.title}</small>}
+                                {(node.execution?.title || node.work?.title) && (
+                                    <small>{node.execution?.title || node.work?.title}</small>
+                                )}
                             </span>
                             <span className="employee-directory__field" data-label={isChinese ? '可见范围' : 'Visibility'}>
                                 {visibilityLabel(node.visibility, isChinese)}
@@ -347,7 +353,11 @@ export default function Employees() {
         queryKey: ['workforce-topology', currentTenant, 24],
         queryFn: () => workforceApi.topology(24),
         retry: false,
-        refetchInterval: (query) => query.state.status === 'error' ? false : 15_000,
+        refetchInterval: (query) => query.state.status === 'error' ? false : 5_000,
+        refetchIntervalInBackground: false,
+        refetchOnMount: 'always',
+        refetchOnWindowFocus: 'always',
+        refetchOnReconnect: 'always',
     });
 
     const { data: allAgents = [] } = useQuery({
@@ -535,6 +545,12 @@ export default function Employees() {
                 )}
             </div>
 
+            <p className="employees-page__scope-contract" data-testid="workforce-scope-contract">
+                {isChinese
+                    ? '执行状态：公司可见，敏感详情按权限脱敏；当前工作：仅显示你拥有或可见的工作；关系与活动：仅管理员或受托管理范围。'
+                    : 'Execution status is company-visible with sensitive details redacted by permission; current work is limited to work you own or may view; relationships and activity are limited to governors or delegated management scope.'}
+            </p>
+
             <div className="employees-page__tabs" role="tablist" aria-label={isChinese ? '员工视图' : 'Employee views'}>
                 <button
                     type="button"
@@ -602,13 +618,17 @@ export default function Employees() {
                 <div className="employees-page__ceo-card" data-testid="ceo-orchestrator-entry">
                     <div>
                         <div className="employees-page__ceo-card-title">
-                            {isChinese ? '公司 CEO（观察型）' : 'Company CEO (observer)'}
+                            {isChinese ? '公司 CEO' : 'Company CEO'}
                         </div>
                         <div className="employees-page__ceo-card-desc">
                             {ceoSettings.enabled
                                 ? (isChinese
-                                    ? '已启用。CEO 只读汇总业务全景、生成简报并可主持晨会；行动项仅为文本建议。'
-                                    : 'Enabled. The CEO reads the business panorama, publishes briefings, and chairs meetings; action items are advisory text only.')
+                                    ? (ceoSettings.coordination_enabled
+                                        ? '已启用协调型。CEO 可在人工对话中依据能力目录委派任务；自动派发由独立开关控制。'
+                                        : '已启用观察型。CEO 汇总业务全景、生成简报并主持晨会；不会下发任务。')
+                                    : (ceoSettings.coordination_enabled
+                                        ? 'Coordinator enabled. The CEO may delegate from human chat using Directory evidence; autonomous dispatch has a separate switch.'
+                                        : 'Observer enabled. The CEO reads the panorama, publishes briefings, and chairs meetings without dispatching work.'))
                                 : (isChinese
                                     ? '每家公司可启用一位系统岗位 CEO：业务全景、日报/周报节奏、晨会纪要。不占员工席位，消耗租户 Credits。'
                                     : 'Enable one system-role CEO per company: business panorama, daily/weekly briefings, meeting minutes. Uses no employee seat; consumes tenant Credits.')}
@@ -626,7 +646,7 @@ export default function Employees() {
                         <button
                             type="button"
                             className="btn btn-primary"
-                            onClick={() => navigate('/enterprise#okr')}
+                            onClick={() => navigate('/company-admin/settings/okr')}
                         >
                             {isChinese ? '启用公司 CEO' : 'Enable company CEO'}
                         </button>

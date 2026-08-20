@@ -198,6 +198,7 @@
       "openAgent": "Open {{name}}, {{status}}",
       "work": {
         "executing": "Executing",
+        "waiting": "Waiting",
         "review": "In review",
         "approval": "Awaiting approval",
         "blocked": "Blocked",
@@ -205,11 +206,35 @@
         "no_work": "No active work"
       },
       "health": "Runtime status",
+      "executionStatusLabel": "Execution status",
+      "executionSourceLabel": "Execution source",
       "workStage": "Work stage",
       "relationships": "Relationships",
       "interactions24h": "24h interactions",
       "statusOverview": "Employee status overview",
+      "currentExecution": "Current execution",
       "currentWork": "Work overview",
+      "executionPhase": "Phase: {{phase}}",
+      "executionStatus": {
+        "queued": "Queued",
+        "running": "Executing",
+        "waiting_user": "Waiting for user",
+        "waiting_agent": "Waiting for agent",
+        "waiting_external": "Waiting for external system",
+        "completed": "Completed",
+        "failed": "Failed",
+        "cancelled": "Cancelled"
+      },
+      "executionSource": {
+        "direct_chat": "Direct conversation",
+        "group": "Group collaboration",
+        "a2a": "Agent delegation",
+        "task": "Workbench task",
+        "trigger": "Scheduled trigger",
+        "heartbeat": "Heartbeat",
+        "deliverable": "Formal deliverable",
+        "media": "Media generation"
+      },
       "latestActivity": "Latest activity",
       "moreActiveWork": "{{count}} more active items",
       "sendMessage": "Send message",

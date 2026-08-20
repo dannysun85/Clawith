@@ -274,12 +274,30 @@ async def test_default_finalizer_emits_a_source_bound_session_delta() -> None:
                 "code": "ok",
                 "artifact_refs": ["artifact://verified"],
                 "evidence_refs": ["evidence://verified"],
+                "tool_receipts": [
+                    {
+                        "tool_call_id": "call-1",
+                        "tool_name": "web_search",
+                        "status": "succeeded",
+                    }
+                ],
+                "delivery_receipts": [
+                    {
+                        "version": 1,
+                        "kind": "agent_workspace_file",
+                        "sha256": "a" * 64,
+                    }
+                ],
+                "delegation_contract_id": str(uuid.uuid4()),
             },
         ),
     )
 
     assert finalized.result_summary["artifact_refs"] == ["artifact://verified"]
     assert finalized.result_summary["evidence_refs"] == ["evidence://verified"]
+    assert finalized.result_summary["tool_receipts"][0]["tool_name"] == "web_search"
+    assert finalized.result_summary["delivery_receipts"][0]["sha256"] == "a" * 64
+    assert "delegation_contract_id" in finalized.result_summary
     assert finalized.session_context_delta == {
         "source_run_id": str(run_id),
         "new_requirements": [],

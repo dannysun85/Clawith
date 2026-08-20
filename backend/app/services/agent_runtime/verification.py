@@ -29,6 +29,7 @@ from app.services.workspace_collaboration import normalize_workspace_path
 
 ReferenceExists = Callable[[str, uuid.UUID, uuid.UUID], Awaitable[bool]]
 _STABLE_REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _HTTP_EVIDENCE_TOOL_NAMES = frozenset(
     {"read_webpage", "upload_image", "publish_page"}
 )
@@ -43,6 +44,119 @@ def _refs(metadata: object, field: str) -> tuple[str, ...] | None:
     if any(not isinstance(item, str) or not item.strip() for item in value):
         return None
     return tuple(str(item).strip() for item in value)
+
+
+def _delivery_receipts(
+    metadata: object,
+    *,
+    source_agent_id: str,
+) -> tuple[dict, ...] | None:
+    """Return safe, structurally verified Agent-workspace delivery receipts."""
+    if not isinstance(metadata, Mapping):
+        return ()
+    value = metadata.get("delivery_receipts", [])
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    normalized: list[dict] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        source_id = item.get("source_agent_id")
+        target_id = item.get("target_agent_id")
+        source_path = item.get("source_path")
+        delivered_path = item.get("delivered_path")
+        note_path = item.get("inbox_note_path")
+        size_bytes = item.get("size_bytes")
+        digest = item.get("sha256")
+        try:
+            parsed_source_id = uuid.UUID(str(source_id))
+            parsed_target_id = uuid.UUID(str(target_id))
+        except (TypeError, ValueError):
+            return None
+        if (
+            item.get("version") != 1
+            or item.get("kind") != "agent_workspace_file"
+            or str(parsed_source_id) != source_agent_id
+            or parsed_source_id == parsed_target_id
+            or not isinstance(source_path, str)
+            or not source_path.strip()
+            or len(source_path) > 1000
+            or not isinstance(delivered_path, str)
+            or not delivered_path.startswith("workspace/inbox/files/")
+            or len(delivered_path) > 1000
+            or not isinstance(note_path, str)
+            or not note_path.startswith("workspace/inbox/")
+            or len(note_path) > 1000
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+        ):
+            return None
+        normalized.append(
+            {
+                "version": 1,
+                "kind": "agent_workspace_file",
+                "source_agent_id": str(parsed_source_id),
+                "target_agent_id": str(parsed_target_id),
+                "source_path": source_path.strip(),
+                "delivered_path": delivered_path,
+                "inbox_note_path": note_path,
+                "size_bytes": size_bytes,
+                "sha256": digest,
+            }
+        )
+    return tuple(normalized)
+
+
+def _delegation_contract(state: RuntimeGraphState, context: RuntimeContext) -> dict | None:
+    # Direct/legacy verification callers can provide the minimal lifecycle
+    # state without Runtime snapshots.  Absence means there is no A2A
+    # delegation contract; only a present-but-invalid contract must fail
+    # closed.
+    snapshots = state.get("snapshots")
+    if snapshots is None:
+        return None
+    initial_input = getattr(snapshots, "initial_input", None)
+    if not isinstance(initial_input, Mapping):
+        return {}
+    raw = initial_input.get("delegation_contract")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or raw.get("version") != 1:
+        return {}
+    required = raw.get("required_capabilities")
+    requires_delivery = raw.get("requires_artifact_delivery")
+    contract_id = raw.get("contract_id")
+    source_agent_id = raw.get("source_agent_id")
+    target_agent_id = raw.get("target_agent_id")
+    if (
+        not isinstance(required, Sequence)
+        or isinstance(required, (str, bytes, bytearray))
+        or not required
+        or any(not isinstance(item, str) or not item.strip() for item in required)
+        or not isinstance(requires_delivery, bool)
+    ):
+        return {}
+    try:
+        parsed_contract_id = uuid.UUID(str(contract_id))
+        parsed_source_agent_id = uuid.UUID(str(source_agent_id))
+        parsed_target_agent_id = uuid.UUID(str(target_agent_id))
+        context_agent_id = uuid.UUID(context.agent_id)
+    except (TypeError, ValueError):
+        return {}
+    if parsed_target_agent_id != context_agent_id:
+        return {}
+    return {
+        "contract_id": str(parsed_contract_id),
+        "source_agent_id": str(parsed_source_agent_id),
+        "target_agent_id": str(parsed_target_agent_id),
+        "required_capabilities": list(
+            dict.fromkeys(str(item).strip() for item in required)
+        ),
+        "requires_artifact_delivery": requires_delivery,
+    }
 
 
 def _async_pending_operation(execution: AgentToolExecution) -> dict | None:
@@ -511,6 +625,13 @@ class ToolLedgerRuntimeVerifier:
                 reason="Runtime verification identity is invalid",
                 details={"code": "invalid_runtime_identity", "error_class": type(exc).__name__},
             )
+        delegation_contract = _delegation_contract(state, context)
+        if delegation_contract == {}:
+            return VerificationResult(
+                outcome="fail",
+                reason="server-owned delegation contract is malformed or mis-scoped",
+                details={"code": "invalid_delegation_contract"},
+            )
 
         async with self._session_factory() as db:
             result = await db.execute(
@@ -576,12 +697,27 @@ class ToolLedgerRuntimeVerifier:
 
         artifact_refs: list[str] = []
         evidence_refs: list[str] = []
+        delivery_receipts: list[dict] = []
+        tool_receipts: list[dict] = []
         for execution in executions:
+            metadata = getattr(execution, "result_metadata", None)
+            receipt_artifacts = _refs(metadata, "artifact_refs")
+            receipt_evidence = _refs(metadata, "evidence_refs")
+            error_code = metadata.get("error_code") if isinstance(metadata, Mapping) else None
+            tool_receipts.append(
+                {
+                    "tool_call_id": execution.tool_call_id,
+                    "tool_name": execution.tool_name,
+                    "status": execution.status,
+                    "error_code": error_code if isinstance(error_code, str) else None,
+                    "artifact_refs": list(receipt_artifacts or ()),
+                    "evidence_refs": list(receipt_evidence or ()),
+                }
+            )
             if execution.status != "succeeded":
                 continue
-            metadata = getattr(execution, "result_metadata", None)
-            execution_artifacts = _refs(metadata, "artifact_refs")
-            execution_evidence = _refs(metadata, "evidence_refs")
+            execution_artifacts = receipt_artifacts
+            execution_evidence = receipt_evidence
             if execution_artifacts is None or execution_evidence is None:
                 return VerificationResult(
                     outcome="repair",
@@ -593,6 +729,20 @@ class ToolLedgerRuntimeVerifier:
                 )
             artifact_refs.extend(execution_artifacts)
             evidence_refs.extend(execution_evidence)
+            execution_deliveries = _delivery_receipts(
+                metadata,
+                source_agent_id=context.agent_id,
+            )
+            if execution_deliveries is None:
+                return VerificationResult(
+                    outcome="repair",
+                    reason="a succeeded tool has a malformed Agent file delivery receipt",
+                    details={
+                        "code": "malformed_delivery_receipt",
+                        "tool_call_id": execution.tool_call_id,
+                    },
+                )
+            delivery_receipts.extend(execution_deliveries)
             if execution.result_ref and execution.result_ref.startswith("tool-result://"):
                 if self._result_store is None:
                     return VerificationResult(
@@ -621,6 +771,45 @@ class ToolLedgerRuntimeVerifier:
 
         artifact_refs = list(dict.fromkeys(artifact_refs))
         evidence_refs = list(dict.fromkeys(evidence_refs))
+        if delegation_contract is not None:
+            succeeded_tools = {
+                execution.tool_name
+                for execution in executions
+                if execution.status == "succeeded"
+            }
+            missing_capabilities = sorted(
+                set(delegation_contract["required_capabilities"]) - succeeded_tools
+            )
+            if missing_capabilities:
+                return VerificationResult(
+                    outcome="repair",
+                    reason=(
+                        "delegated task is missing successful tool receipts for: "
+                        + ", ".join(missing_capabilities)
+                    ),
+                    details={
+                        "code": "delegation_capability_receipt_missing",
+                        "contract_id": delegation_contract["contract_id"],
+                        "missing_capabilities": missing_capabilities,
+                        "tool_receipts": tool_receipts,
+                    },
+                )
+            if (
+                delegation_contract["requires_artifact_delivery"]
+                and not delivery_receipts
+            ):
+                return VerificationResult(
+                    outcome="repair",
+                    reason=(
+                        "delegated task requires a confirmed send_file_to_agent "
+                        "delivery receipt before finish"
+                    ),
+                    details={
+                        "code": "delegation_artifact_delivery_missing",
+                        "contract_id": delegation_contract["contract_id"],
+                        "tool_receipts": tool_receipts,
+                    },
+                )
         for reference in (*artifact_refs, *evidence_refs):
             if reference.startswith("tool-result://"):
                 if self._result_store is None:
@@ -683,6 +872,13 @@ class ToolLedgerRuntimeVerifier:
                 "code": "deterministic_checks_passed",
                 "artifact_refs": artifact_refs,
                 "evidence_refs": evidence_refs,
+                "tool_receipts": tool_receipts,
+                "delivery_receipts": delivery_receipts,
+                "delegation_contract_id": (
+                    delegation_contract["contract_id"]
+                    if delegation_contract is not None
+                    else None
+                ),
             },
         )
 

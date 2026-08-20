@@ -217,7 +217,7 @@ class PaymentOrder(Base):
     provider_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_payment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
-    # pending / paid / failed / canceled
+    # pending / paid / failed / canceled / refunded
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -23,12 +23,13 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["ceo_orchestrator_settings"]
+    assert _script_directory().get_heads() == ["ceo_coordination_mode"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("ceo_orchestrator_settings")
+    release_head = script.get_revision("ceo_coordination_mode")
+    ceo_orchestrator_revision = script.get_revision("ceo_orchestrator_settings")
     subscription_change_revision = script.get_revision("subscription_change_kind")
     payment_order_period_revision = script.get_revision("payment_order_period")
     selection_receipts_revision = script.get_revision("deliverable_selection_receipts")
@@ -71,7 +72,8 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("subscription_change_kind",)
+    assert release_head._normalized_down_revisions == ("ceo_orchestrator_settings",)
+    assert ceo_orchestrator_revision._normalized_down_revisions == ("subscription_change_kind",)
     assert subscription_change_revision._normalized_down_revisions == ("payment_order_period",)
     assert payment_order_period_revision._normalized_down_revisions == ("deliverable_selection_receipts",)
     assert selection_receipts_revision._normalized_down_revisions == ("creative_brief_receipts",)
@@ -150,8 +152,8 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         BACKEND_ROOT.parent / "scripts/tenant-purge-postgres-smoke.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_orchestrator_settings' in smoke
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_orchestrator_settings' in purge_smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_coordination_mode' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_coordination_mode' in purge_smoke
     assert 'grep -F "${release_head} (head)"' in purge_smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke

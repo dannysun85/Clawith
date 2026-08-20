@@ -52,6 +52,7 @@ import {
 import {
     deliverableLaunchMessage,
     deliverableLaunchUsesIsolatedInputs,
+    deliverableNextAction,
     deliverableRouteTier,
     isDeliverableAwaitingContinuation,
     latestPendingDeliverable,
@@ -8530,7 +8531,10 @@ export default function AgentDetailPage() {
                                                             }}
                                                             onOpen={() => {
                                                                 if (!pendingDeliverable.launchable) {
-                                                                    toast.info(pendingDeliverable.request.goal);
+                                                                    toast.info(
+                                                                        deliverableNextAction(pendingDeliverable.request)
+                                                                            || pendingDeliverable.request.goal,
+                                                                    );
                                                                     return;
                                                                 }
                                                                 setChatInput(deliverableLaunchMessage(

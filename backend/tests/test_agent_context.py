@@ -10,7 +10,7 @@ from app.services.storage import StorageEntry
 def _context_patches(*, soul: str = "", memory: str = "", skills: str = ""):
     agent_id_holder: dict[str, uuid.UUID] = {}
 
-    async def fake_read_file(key, _max_chars=3000):
+    async def fake_read_file(key, _max_chars=3000, **_kwargs):
         agent_id = agent_id_holder["agent_id"]
         if key == f"{agent_id}/soul.md":
             return soul
@@ -36,6 +36,19 @@ def _context_patches(*, soul: str = "", memory: str = "", skills: str = ""):
             return_value="UTC",
         ),
     )
+
+
+def test_memory_context_truncation_keeps_identity_and_latest_corrections():
+    from app.services.agent_context import _truncate_context_text
+
+    content = "# Memory\n" + ("old-history\n" * 400) + "LATEST CORRECTION: use the new policy"
+
+    bounded = _truncate_context_text(content, 2000, preserve_tail=True)
+
+    assert len(bounded) <= 2000
+    assert bounded.startswith("# Memory")
+    assert "older middle content omitted" in bounded
+    assert bounded.endswith("LATEST CORRECTION: use the new policy")
 
 
 def test_active_trigger_prompt_omits_internal_routing_and_webhook_secrets():

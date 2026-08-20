@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import hashlib
+from types import SimpleNamespace
 import uuid
 from unittest.mock import AsyncMock, Mock
 
@@ -613,6 +615,95 @@ async def test_send_file_to_agent_rejects_scope_escape_before_storage_read(
     storage_factory.assert_not_called()
     is_file.assert_not_awaited()
     read_bytes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_file_to_agent_returns_readback_verified_delivery_receipt(
+    monkeypatch,
+) -> None:
+    source_agent_id = uuid.uuid4()
+    target_agent_id = uuid.uuid4()
+    source_content = b"verified report"
+    storage = MemoryStorageBackend(
+        {f"{source_agent_id}/workspace/report.md": source_content}
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    source_agent = SimpleNamespace(
+        id=source_agent_id,
+        tenant_id=uuid.uuid4(),
+        name="Researcher",
+        creator_id=uuid.uuid4(),
+    )
+    target_agent = SimpleNamespace(id=target_agent_id, name="CEO")
+    participant = SimpleNamespace(id=uuid.uuid4())
+    chat_session = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=source_agent_id,
+        last_message_at=None,
+    )
+
+    class ScalarResult:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    class DB:
+        def __init__(self, results=()):
+            self.results = list(results)
+            self.added = []
+
+        async def execute(self, _statement):
+            return ScalarResult(self.results.pop(0))
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    databases = iter([DB([source_agent]), DB(), DB([participant])])
+
+    @asynccontextmanager
+    async def fake_session():
+        yield next(databases)
+
+    monkeypatch.setattr(agent_tools, "async_session", fake_session)
+    monkeypatch.setattr(
+        agent_tools,
+        "_resolve_a2a_target_by_id",
+        AsyncMock(return_value=(target_agent, None)),
+    )
+    monkeypatch.setattr(
+        agent_tools,
+        "_ensure_a2a_session",
+        AsyncMock(return_value=(chat_session, str(chat_session.id))),
+    )
+    monkeypatch.setattr(
+        "app.services.activity_logger.log_activity",
+        AsyncMock(return_value=None),
+    )
+
+    outcome = await agent_tools._send_file_to_agent_outcome(
+        source_agent_id,
+        {
+            "target_agent_id": str(target_agent_id),
+            "file_path": "workspace/report.md",
+            "message": "Final report",
+        },
+    )
+
+    assert outcome.status == "succeeded"
+    receipt = outcome.metadata["delivery_receipts"][0]
+    assert receipt["source_agent_id"] == str(source_agent_id)
+    assert receipt["target_agent_id"] == str(target_agent_id)
+    assert receipt["size_bytes"] == len(source_content)
+    assert receipt["sha256"] == hashlib.sha256(source_content).hexdigest()
+    assert await storage.read_bytes(
+        f"{target_agent_id}/{receipt['delivered_path']}"
+    ) == source_content
 
 
 @pytest.mark.asyncio

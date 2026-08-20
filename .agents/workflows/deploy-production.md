@@ -1,7 +1,8 @@
 # 生产部署固定流程
 
 适用目标：`opc.reeftotem.ai`，应用目录 `/opt/astra-poc`。本流程是生产变更
-门禁，不代表任何代理已获得部署权限。
+门禁，不代表任何代理已获得部署权限。切流操作红线见
+`.agents/workflows/production-cutover-operating-procedure.md`。
 
 ## 1. 授权边界
 
@@ -119,8 +120,11 @@ network subnet、规则顺序和 watchdog marker；缺失或漂移时停止发�
   Credits 扣减与失败退款；`tests pass` 不能替代业务流证明。
 - 产品域名 `opc.reeftotem.ai` 与支付域名 `opc.rama-server.com` 均可打开应用；
   套餐购买与微信 Native 回调只走 `PAYMENT_BASE_URL`（默认后者）。生产 `.env`
-  必须是 `BILLING_PROVIDER=wechat` 且 `WECHAT_PAY_*` 完整，否则市场页只会生成
-  人工 pending 单，不会出现付款二维码。`CORS_ORIGINS` 需同时包含这两个 origin。
+  在未获真实支付授权时保持 `BILLING_PROVIDER=manual`，市场页只提交明确标注的人工
+  pending 单。切换 `BILLING_PROVIDER=wechat` 前，必须补齐商户请求签名、APIv3
+  解密、微信平台公钥/serial、HTTPS 回调和 5 分钟时间窗配置，并运行
+  `python -m app.scripts.check_billing_readiness --require-native-ready`。配置不完整会在
+  写订单前返回 `503`，不会静默降级成人工单。`CORS_ORIGINS` 需同时包含两个 origin。
 - 检查生产问题监控、错误率、队列积压、Credits ledger drift 和媒体任务超时。
 - Code 未获独立授权时，验证平台开关为 false、tenant 白名单为空、历史 Agent
   Code 分配已由迁移关闭。

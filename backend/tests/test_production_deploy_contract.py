@@ -203,6 +203,8 @@ def test_wechat_pay_env_is_propagated_on_backend_compose_paths():
     assert "BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}" in production
     assert "WECHAT_PAY_APPID: ${WECHAT_PAY_APPID:-}" in production
     assert "WECHAT_PAY_NOTIFY_URL: ${WECHAT_PAY_NOTIFY_URL:-}" in production
+    assert "WECHAT_PAY_PLATFORM_PUBLIC_KEY: ${WECHAT_PAY_PLATFORM_PUBLIC_KEY:-}" in production
+    assert "WECHAT_PAY_PLATFORM_SERIAL_NO: ${WECHAT_PAY_PLATFORM_SERIAL_NO:-}" in production
     assert production.count("PAYMENT_BASE_URL: ${") == 1
     assert "<<: *backend-environment" in production
 
@@ -215,11 +217,15 @@ def test_wechat_pay_env_is_propagated_on_backend_compose_paths():
         assert "PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-}" in compose, compose_file
         assert "BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}" in compose, compose_file
         assert "WECHAT_PAY_NOTIFY_URL: ${WECHAT_PAY_NOTIFY_URL:-}" in compose, compose_file
+        assert "WECHAT_PAY_PLATFORM_PUBLIC_KEY: ${WECHAT_PAY_PLATFORM_PUBLIC_KEY:-}" in compose, compose_file
+        assert "WECHAT_PAY_PLATFORM_SERIAL_NO: ${WECHAT_PAY_PLATFORM_SERIAL_NO:-}" in compose, compose_file
 
     for env_example in (ROOT / ".env.example", ROOT / "deploy/.env.example"):
         example = env_example.read_text(encoding="utf-8")
         assert "PAYMENT_BASE_URL=" in example
         assert "BILLING_PROVIDER=" in example
+        assert "WECHAT_PAY_PLATFORM_PUBLIC_KEY=" in example
+        assert "WECHAT_PAY_PLATFORM_SERIAL_NO=" in example
 
 
 def test_production_code_execution_defaults_fail_closed():
@@ -1411,6 +1417,9 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
     assert "OnUnitActiveSec=30s" in guard
     assert "Normal application deployment only verifies this contract" in contract
 
+    data_plane = deploy_script.index(
+        'echo "[remote] verifying unique production data-plane DNS"'
+    )
     gate = deploy_script.index('echo "[remote] verifying host-level MCP egress contract"')
     recovery = deploy_script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', gate)
     backup = deploy_script.index('echo "[remote] backing up database')
@@ -1419,7 +1428,7 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
         gate,
     )
     migration = deploy_script.index("backend upgrade head", maintenance)
-    assert gate < recovery < backup < maintenance < migration
+    assert data_plane < gate < recovery < backup < maintenance < migration
     assert 'manage-production-mcp-egress-guard.sh" verify' in deploy_script
     assert 'DOCKER_NETWORK_NAME="astra_network"' not in deploy_script
     assert "current release environment must define DOCKER_NETWORK" in deploy_script
@@ -4866,3 +4875,410 @@ def test_alert_canary_evidence_is_bound_to_the_actual_worker_actor():
     assert "ASTRA_RELEASE_COMMIT" in inspect_identity
     assert 'delivery.get("attribution_version") != 1' in canary
     assert 'delivered_by.get("worker_actor_id") != sys.argv[9]' in canary
+
+
+DATA_PLANE_CHECKER = ROOT / "scripts/assert_production_data_plane_dns.py"
+FAKE_DOCKER = r"""
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+spec = json.loads(Path(__file__).with_name("docker-spec.json").read_text(encoding="utf-8"))
+args = sys.argv[1:]
+log_path = Path(__file__).with_name("docker-calls.log")
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\n")
+
+if args[:2] == ["network", "inspect"]:
+    network = spec["networks"].get(args[2])
+    if network is None:
+        print("network not found", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps([network]))
+    raise SystemExit(0)
+
+if args and args[0] == "ps":
+    filters = []
+    index = 1
+    while index < len(args):
+        if args[index] == "--filter" and index + 1 < len(args):
+            filters.append(args[index + 1])
+            index += 2
+            continue
+        index += 1
+    key = filters[0] if len(filters) == 1 else "|".join(filters)
+    for container_id in spec.get("ps", {}).get(key, []):
+        print(container_id)
+    raise SystemExit(0)
+
+if args and args[0] == "inspect":
+    containers = []
+    for container_id in args[1:]:
+        container = spec.get("containers", {}).get(container_id)
+        if container is None:
+            print("no such container", file=sys.stderr)
+            raise SystemExit(1)
+        containers.append(container)
+    print(json.dumps(containers))
+    raise SystemExit(0)
+
+if args[:1] == ["exec"] and args[2:4] == ["getent", "hosts"]:
+    payload = spec.get("getent", {}).get(args[1], {}).get(args[4], {})
+    sys.stdout.write(payload.get("stdout", ""))
+    sys.stderr.write(payload.get("stderr", ""))
+    raise SystemExit(payload.get("returncode", 1))
+
+print("forbidden docker command: " + " ".join(args), file=sys.stderr)
+raise SystemExit(99)
+"""
+
+
+def _data_plane_container(
+    container_id: str,
+    name: str,
+    *,
+    project: str,
+    service: str,
+    ip: str,
+    aliases: list[str],
+    network: str = "astra_network",
+    network_id: str = "netid",
+) -> dict:
+    return {
+        "Id": container_id,
+        "Name": f"/{name}",
+        "Config": {
+            "Labels": {
+                "com.docker.compose.project": project,
+                "com.docker.compose.service": service,
+            }
+        },
+        "NetworkSettings": {
+            "Networks": {
+                network: {
+                    "NetworkID": network_id,
+                    "IPAddress": ip,
+                    "Aliases": aliases,
+                }
+            }
+        },
+    }
+
+
+def _write_fake_docker(tmp_path: Path, spec: dict) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    docker_path = tmp_path / "docker"
+    (tmp_path / "docker-spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    docker_path.write_text(FAKE_DOCKER.strip() + "\n", encoding="utf-8")
+    docker_path.chmod(docker_path.stat().st_mode | stat.S_IXUSR)
+    return docker_path
+
+
+def _healthy_data_plane_spec(*, getent: dict | None = None) -> dict:
+    postgres = _data_plane_container(
+        "id-postgres",
+        "astra-poc-postgres-1",
+        project="astra-poc",
+        service="postgres",
+        ip="172.18.0.2",
+        aliases=["postgres", "astra-poc-postgres-1"],
+    )
+    redis = _data_plane_container(
+        "id-redis",
+        "astra-poc-redis-1",
+        project="astra-poc",
+        service="redis",
+        ip="172.18.0.3",
+        aliases=["redis", "astra-poc-redis-1"],
+    )
+    backend = _data_plane_container(
+        "id-backend",
+        "astra-poc-app-b-backend-1",
+        project="astra-poc-app-b",
+        service="backend",
+        ip="172.18.0.10",
+        aliases=["backend", "astra-poc-app-b-backend"],
+    )
+    containers = {
+        "id-postgres": postgres,
+        "id-redis": redis,
+        "id-backend": backend,
+    }
+    ps = {
+        "network=astra_network": ["id-postgres", "id-redis", "id-backend"],
+        "label=com.docker.compose.service=postgres": ["id-postgres"],
+        "label=com.docker.compose.service=redis": ["id-redis"],
+    }
+    return {
+        "networks": {
+            "astra_network": {"Id": "netid", "Name": "astra_network"},
+        },
+        "ps": ps,
+        "containers": containers,
+        "getent": getent
+        if getent is not None
+        else {
+            "id-backend": {
+                "postgres": {
+                    "stdout": "172.18.0.2\tpostgres\n",
+                    "returncode": 0,
+                },
+                "redis": {
+                    "stdout": "172.18.0.3\tredis\n",
+                    "returncode": 0,
+                },
+            }
+        },
+    }
+
+
+def _run_data_plane_checker(
+    tmp_path: Path, spec: dict, *cli_args: str
+) -> subprocess.CompletedProcess[str]:
+    docker_path = _write_fake_docker(tmp_path, spec)
+    return subprocess.run(
+        [
+            sys.executable,
+            str(DATA_PLANE_CHECKER),
+            "--docker",
+            str(docker_path),
+            *cli_args,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=ROOT,
+    )
+
+
+def test_production_cutover_operating_procedure_is_registered_and_fail_closed():
+    procedure = (
+        ROOT / ".agents/workflows/production-cutover-operating-procedure.md"
+    ).read_text(encoding="utf-8")
+    skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+    workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".agents/workflows/production-cutover-operating-procedure.md" in skill
+    assert "production-cutover-operating-procedure.md" in workflow
+    assert "REQUEST CHANGES" in procedure
+    assert "--no-deps" in procedure
+    assert "astra-poc" in procedure
+    assert "SMOKE_TENANT_" in procedure
+    assert "cutover-state" in procedure
+    assert "已经改了" in procedure
+    assert len(skill.splitlines()) < 250
+
+
+def test_slot_compose_up_never_publishes_a_second_postgres_dns_name():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ALLOW_DIRTY" not in script
+    assert "working tree is dirty; production releases require a reviewed commit" in script
+    assert "postgres:\n        condition: service_healthy" in compose
+    assert "redis:\n        condition: service_healthy" in compose
+
+    up_lines = [
+        line.strip()
+        for line in script.splitlines()
+        if re.search(r"\bup -d\b", line)
+    ]
+    assert up_lines
+    for line in up_lines:
+        assert "--no-deps" in line
+        assert "postgres" not in line
+        assert "redis" not in line
+
+    assert 'compose_project "$COMPOSE_PROJECT"' in script
+    assert "exec -T postgres" in script
+    assert not re.search(
+        r'compose_project "\$CANDIDATE_PROJECT".*up(?: -d)?(?: --no-deps)? postgres',
+        script,
+        flags=re.DOTALL,
+    )
+    assert not re.search(
+        r'compose_project "\$OLD_PROJECT".*up(?: -d)?(?: --no-deps)? postgres',
+        script,
+        flags=re.DOTALL,
+    )
+
+
+def test_production_data_plane_preflight_is_local_and_remote_and_read_only():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    checker = DATA_PLANE_CHECKER.read_text(encoding="utf-8")
+
+    local = script.index('echo "[local] verifying unique production data-plane DNS"')
+    remote = script.index('echo "[remote] verifying unique production data-plane DNS"')
+    upload = script.index('echo "[remote] uploading package"')
+    alembic = script.index('echo "[local] checking Alembic heads"')
+    mcp = script.index('echo "[remote] verifying host-level MCP egress contract"')
+    recovery = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', mcp)
+
+    assert local < alembic < upload < remote < mcp < recovery
+    assert '< "$ROOT_DIR/scripts/assert_production_data_plane_dns.py"' in script
+    assert 'python3 "$RELEASE/scripts/assert_production_data_plane_dns.py"' in script
+    assert '--expected-network "$DOCKER_NETWORK_NAME"' in script
+    assert "--app-root" in script
+    assert "docker start" not in checker
+    assert "docker stop" not in checker
+    assert "docker rm" not in checker
+    assert "compose up" not in checker
+
+
+def test_data_plane_dns_preflight_accepts_unique_shared_postgres(tmp_path):
+    result = _run_data_plane_checker(
+        tmp_path,
+        _healthy_data_plane_spec(),
+        "--network",
+        "astra_network",
+        "--compose-project",
+        "astra-poc",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    calls = [
+        json.loads(line)
+        for line in (tmp_path / "docker-calls.log").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert calls
+    assert all(call[0] in {"network", "ps", "inspect", "exec"} for call in calls)
+    assert not any(call[0] in {"start", "stop", "rm", "kill", "compose"} for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (
+            lambda spec: spec["ps"].__setitem__(
+                "network=astra_network",
+                ["id-postgres", "id-slot-postgres", "id-redis", "id-backend"],
+            )
+            or spec["ps"].__setitem__(
+                "label=com.docker.compose.service=postgres",
+                ["id-postgres", "id-slot-postgres"],
+            )
+            or spec["containers"].__setitem__(
+                "id-slot-postgres",
+                _data_plane_container(
+                    "id-slot-postgres",
+                    "astra-poc-app-a-postgres-1",
+                    project="astra-poc-app-a",
+                    service="postgres",
+                    ip="172.18.0.22",
+                    aliases=["postgres", "astra-poc-app-a-postgres-1"],
+                ),
+            ),
+            "slot compose must not publish postgres DNS",
+        ),
+        (
+            lambda spec: spec["ps"].__setitem__(
+                "network=astra_network",
+                ["id-redis", "id-backend"],
+            )
+            or spec["ps"].__setitem__(
+                "label=com.docker.compose.service=postgres",
+                [],
+            )
+            or spec["containers"].pop("id-postgres", None),
+            "exactly one 'postgres' alias",
+        ),
+        (
+            lambda spec: spec["getent"].__setitem__(
+                "id-backend",
+                {
+                    "postgres": {
+                        "stdout": "172.18.0.2\tpostgres\n172.18.0.22\tpostgres\n",
+                        "returncode": 0,
+                    },
+                    "redis": {
+                        "stdout": "172.18.0.3\tredis\n",
+                        "returncode": 0,
+                    },
+                },
+            ),
+            "resolved 2 addresses for 'postgres'",
+        ),
+    ],
+    ids=["dual_postgres", "zero_postgres", "split_getent"],
+)
+def test_data_plane_dns_preflight_fails_closed(tmp_path, mutate, needle):
+    spec = _healthy_data_plane_spec()
+    mutate(spec)
+    result = _run_data_plane_checker(
+        tmp_path,
+        spec,
+        "--network",
+        "astra_network",
+        "--compose-project",
+        "astra-poc",
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert needle in result.stderr
+    assert "supersecret" not in result.stderr
+    assert "POSTGRES_PASSWORD" not in result.stderr
+
+
+def test_data_plane_dns_preflight_reads_current_env_and_redacts_secrets(tmp_path):
+    app_root = tmp_path / "app"
+    release = app_root / "releases" / "live"
+    release.mkdir(parents=True)
+    (release / ".env").write_text(
+        'POSTGRES_PASSWORD="supersecret"\nDOCKER_NETWORK="astra_network"\n',
+        encoding="utf-8",
+    )
+    (app_root / "current").symlink_to(release)
+    spec = _healthy_data_plane_spec()
+    spec["ps"]["network=astra_network"] = ["id-redis", "id-backend"]
+    spec["ps"]["label=com.docker.compose.service=postgres"] = []
+    spec["containers"].pop("id-postgres")
+
+    result = _run_data_plane_checker(
+        tmp_path / "docker-home",
+        spec,
+        "--app-root",
+        str(app_root),
+        "--compose-project",
+        "astra-poc",
+        "--expected-network",
+        "astra_network",
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "exactly one 'postgres' alias" in result.stderr
+    assert "supersecret" not in result.stdout
+    assert "supersecret" not in result.stderr
+
+
+def test_data_plane_dns_preflight_skips_missing_getent_when_inspect_is_unique(tmp_path):
+    spec = _healthy_data_plane_spec(
+        getent={
+            "id-backend": {
+                "postgres": {
+                    "stderr": "getent: not found\n",
+                    "returncode": 127,
+                },
+                "redis": {
+                    "stderr": "executable file not found\n",
+                    "returncode": 127,
+                },
+            }
+        }
+    )
+    result = _run_data_plane_checker(
+        tmp_path,
+        spec,
+        "--network",
+        "astra_network",
+        "--compose-project",
+        "astra-poc",
+    )
+
+    assert result.returncode == 0, result.stderr

@@ -1570,6 +1570,16 @@ async def mark_order_paid(
         raise HTTPException(status_code=404, detail="Order not found")
     if order.status == "paid":
         return order
+    if order.provider != "manual":
+        raise HTTPException(
+            status_code=409,
+            detail="Provider-backed orders can only be finalized by a verified provider event",
+        )
+    if order.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Manual order cannot be paid from status {order.status}",
+        )
 
     before = _snapshot(order, ["status", "provider", "provider_session_id", "provider_payment_id", "paid_at"])
     await finalize_order_in_session(db, order, actor_user_id=current_user.id)

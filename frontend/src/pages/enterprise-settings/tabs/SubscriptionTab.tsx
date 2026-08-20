@@ -164,6 +164,15 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
         if (billingConfigLoading) {
             throw new Error(t('enterprise.subscription.configLoading', '支付配置加载中，请稍后再试'));
         }
+        if (!billingConfig) {
+            throw new Error(t('enterprise.subscription.configUnavailable', '无法确认支付配置，已阻止下单'));
+        }
+        if (!billingConfig.checkout_enabled) {
+            throw new Error(
+                billingConfig.next_action
+                || t('enterprise.subscription.providerUnavailable', '支付通道尚未就绪，请联系平台管理员'),
+            );
+        }
         return redirectToPaymentDomain();
     };
     const reportCheckoutError = (error: unknown) => {
@@ -296,28 +305,61 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
             return { label: t('enterprise.subscription.ownerOnly', '仅公司所有者可购买'), disabled: true, primary: false };
         }
         const isCurrentPlan = plan.code === planCode || plan.id === ent?.plan_id;
+        if (isCurrentPlan && plan.price_cents === 0) {
+            return { label: t('enterprise.subscription.current', '当前使用的套餐'), disabled: true, primary: false };
+        }
+        if (billingConfigLoading || !billingConfig) {
+            return { label: t('enterprise.subscription.configLoading', '支付配置检查中'), disabled: true, primary: false };
+        }
+        if (!billingConfig.checkout_enabled) {
+            return { label: t('enterprise.subscription.providerUnavailable', '支付暂不可用'), disabled: true, primary: false };
+        }
+        const manualMode = billingConfig.provider === 'manual';
         if (isCurrentPlan) {
-            if (plan.price_cents === 0) {
-                return { label: t('enterprise.subscription.current', '当前使用的套餐'), disabled: true, primary: false };
-            }
             if (billingPeriod === currentPeriod) {
-                return { label: t('enterprise.subscription.renew', '续费'), disabled: false, primary: false };
+                return {
+                    label: manualMode
+                        ? t('enterprise.subscription.manualRenew', '提交续费申请')
+                        : t('enterprise.subscription.renew', '续费'),
+                    disabled: false,
+                    primary: false,
+                };
             }
             return {
-                label: billingPeriod === 'yearly'
-                    ? t('enterprise.subscription.switchYearly', '转年付')
-                    : t('enterprise.subscription.switchMonthly', '转月付'),
+                label: manualMode
+                    ? t('enterprise.subscription.manualPeriodSwitch', '提交周期变更申请')
+                    : billingPeriod === 'yearly'
+                        ? t('enterprise.subscription.switchYearly', '转年付')
+                        : t('enterprise.subscription.switchMonthly', '转月付'),
                 disabled: false,
                 primary: true,
             };
         }
         if (currentPlan && plan.tier > currentPlan.tier) {
-            return { label: t('enterprise.subscription.upgrade', '升级'), disabled: false, primary: true };
+            return {
+                label: manualMode
+                    ? t('enterprise.subscription.manualUpgrade', '提交升级申请')
+                    : t('enterprise.subscription.upgrade', '升级'),
+                disabled: false,
+                primary: true,
+            };
         }
         if (currentPlan && plan.tier < currentPlan.tier) {
-            return { label: t('enterprise.subscription.downgrade', '降级（下个周期生效）'), disabled: false, primary: false };
+            return {
+                label: manualMode
+                    ? t('enterprise.subscription.manualDowngrade', '提交降级申请（下个周期）')
+                    : t('enterprise.subscription.downgrade', '降级（下个周期生效）'),
+                disabled: false,
+                primary: false,
+            };
         }
-        return { label: t('enterprise.subscription.upgrade', '升级'), disabled: false, primary: true };
+        return {
+            label: manualMode
+                ? t('enterprise.subscription.manualUpgrade', '提交升级申请')
+                : t('enterprise.subscription.upgrade', '升级'),
+            disabled: false,
+            primary: true,
+        };
     };
 
     const CHANGE_KIND_TEXT: Record<string, string> = {
@@ -331,6 +373,39 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     if (showMarketplace) {
         return (
             <div style={{ padding: '16px 0 30px' }}>
+                {billingConfig?.native_payment_enabled && billingConfig.payment_host && needsPaymentDomainRedirect(billingConfig.payment_host, window.location.hostname) && (
+                    <div className="card" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
+                        {t(
+                            'enterprise.subscription.paymentDomainHint',
+                            '支付必须在 {{host}} 完成。请先跳转后再购买，当前登录会一并带过去。',
+                            { host: billingConfig.payment_host },
+                        )}
+                        <button
+                            type="button"
+                            className="btn btn-primary"
+                            style={{ marginLeft: 12 }}
+                            onClick={() => redirectToPaymentDomain()}
+                        >
+                            {t('enterprise.subscription.goToPaymentDomain', '前往支付页')}
+                        </button>
+                    </div>
+                )}
+                {(billingConfig?.provider || 'manual') === 'manual' && (
+                    <div className="card" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
+                        {t(
+                            'enterprise.subscription.manualProviderHint',
+                            '当前是人工订单模式：提交后由平台管理员线下处理，不会生成在线付款或微信二维码。',
+                        )}
+                    </div>
+                )}
+                {billingConfig && !billingConfig.checkout_enabled && (
+                    <div className="card" role="alert" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13, color: 'var(--warning)' }}>
+                        {billingConfig.next_action || t(
+                            'enterprise.subscription.providerUnavailableHint',
+                            '支付通道尚未就绪，系统已阻止创建订单。请联系平台管理员。',
+                        )}
+                    </div>
+                )}
                 <section style={{ border: '1px solid var(--border-subtle)', borderRadius: 8, background: 'var(--bg-primary)', padding: '32px 40px 30px' }}>
                     <div style={{ textAlign: 'center', marginBottom: 28 }}>
                         <h2 style={{ margin: '0 0 8px', fontSize: 24, fontWeight: 700 }}>{t('enterprise.subscription.marketTitle', '和你一起成长的套餐')}</h2>
@@ -457,10 +532,14 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                     {formatMoneyCny(pack.currency, pack.price_cents, cnyRate)}
                                     <span style={{ color: 'var(--text-tertiary)', fontSize: 12, marginLeft: 5 }}>{formatUnitPrice(pack.currency, pack.price_cents, pack.credits, cnyRate)}</span>
                                 </div>
-                                <button className="btn btn-primary" disabled={checkoutTopup.isPending || !canManageCompanyBilling} style={{ marginTop: 8, width: '100%', justifyContent: 'center' }} onClick={() => checkoutTopup.mutate(pack.id)}>
+                                <button className="btn btn-primary" disabled={checkoutTopup.isPending || !canManageCompanyBilling || !billingConfig?.checkout_enabled} style={{ marginTop: 8, width: '100%', justifyContent: 'center' }} onClick={() => checkoutTopup.mutate(pack.id)}>
                                     <IconShoppingCart size={15} />
                                     {canManageCompanyBilling
-                                        ? t('enterprise.subscription.buyNow', '立即购买')
+                                        ? billingConfig?.provider === 'manual'
+                                            ? t('enterprise.subscription.manualOrderSubmit', '提交人工订单')
+                                            : billingConfig?.checkout_enabled
+                                                ? t('enterprise.subscription.buyNow', '立即购买')
+                                                : t('enterprise.subscription.providerUnavailable', '支付暂不可用')
                                         : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
                                 </button>
                             </div>
@@ -539,7 +618,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
             {showMarketplace && (
                 <>
-                    {billingConfig?.payment_host && needsPaymentDomainRedirect(billingConfig.payment_host, window.location.hostname) && (
+                    {billingConfig?.native_payment_enabled && billingConfig.payment_host && needsPaymentDomainRedirect(billingConfig.payment_host, window.location.hostname) && (
                         <div className="card" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
                             {t(
                                 'enterprise.subscription.paymentDomainHint',
@@ -560,7 +639,15 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                         <div className="card" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
                             {t(
                                 'enterprise.subscription.manualProviderHint',
-                                '当前未开通微信支付，下单后由平台管理员处理，不会出现付款二维码。',
+                                '当前是人工订单模式：提交后由平台管理员线下处理，不会生成在线付款或微信二维码。',
+                            )}
+                        </div>
+                    )}
+                    {billingConfig && !billingConfig.checkout_enabled && (
+                        <div className="card" role="alert" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13, color: 'var(--warning)' }}>
+                            {billingConfig.next_action || t(
+                                'enterprise.subscription.providerUnavailableHint',
+                                '支付通道尚未就绪，系统已阻止创建订单。请联系平台管理员。',
                             )}
                         </div>
                     )}
@@ -638,9 +725,13 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                 <strong>{pack.name}</strong>
                                 <div style={{ fontSize: 22, fontWeight: 700 }}>{pack.credits.toLocaleString()} <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>额度</span></div>
                                 <div style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>{formatMoneyCny(pack.currency, pack.price_cents, cnyRate)}</div>
-                                <button className="btn btn-primary" disabled={checkoutTopup.isPending || !canManageCompanyBilling} onClick={() => checkoutTopup.mutate(pack.id)}>
+                                <button className="btn btn-primary" disabled={checkoutTopup.isPending || !canManageCompanyBilling || !billingConfig?.checkout_enabled} onClick={() => checkoutTopup.mutate(pack.id)}>
                                     {canManageCompanyBilling
-                                        ? t('enterprise.subscription.buyNow', '立即购买')
+                                        ? billingConfig?.provider === 'manual'
+                                            ? t('enterprise.subscription.manualOrderSubmit', '提交人工订单')
+                                            : billingConfig?.checkout_enabled
+                                                ? t('enterprise.subscription.buyNow', '立即购买')
+                                                : t('enterprise.subscription.providerUnavailable', '支付暂不可用')
                                         : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
                                 </button>
                             </div>

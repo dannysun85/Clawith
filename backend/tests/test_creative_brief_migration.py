@@ -138,6 +138,6 @@ def test_migration_keeps_a_single_alembic_head() -> None:
         for parent in ((down,) if isinstance(down, str) else (down or ()))
     }
     heads = sorted(set(revisions) - referenced)
-    assert heads == ["ceo_orchestrator_settings"], (
+    assert heads == ["ceo_coordination_mode"], (
         f"expected a single head, found {heads}"
     )

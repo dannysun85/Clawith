@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -10,7 +11,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.subscription import BillingWebhookEvent, PaymentOrder, Plan, Subscription
+from app.models.subscription import (
+    BillingWebhookEvent,
+    CreditBalance,
+    CreditTransaction,
+    PaymentOrder,
+    Plan,
+    Subscription,
+)
 from app.services.credit_service import grant_credits_in_session
 
 
@@ -23,6 +31,12 @@ class PaymentProviderEventState:
     status: str
     provider_session_id: str | None = None
     provider_payment_id: str | None = None
+    amount_cents: int | None = None
+    currency: str | None = None
+    merchant_id: str | None = None
+    app_id: str | None = None
+    trade_type: str | None = None
+    tenant_id: uuid.UUID | None = None
 
 
 def _utcnow() -> datetime:
@@ -119,6 +133,109 @@ async def finalize_order_in_session(
     return order
 
 
+async def refund_order_in_session(
+    db: AsyncSession,
+    order: PaymentOrder,
+    *,
+    provider_payment_id: str | None = None,
+) -> PaymentOrder:
+    """Record a provider refund and claw back only still-available granted Credits.
+
+    The caller holds the payment-order row lock.  In-flight reservations remain
+    protected, consumed Credits are never made negative, and the order-scoped
+    ``refund_clawback`` ledger row makes retries idempotent.
+    """
+    if order.status == "refunded":
+        return order
+    if provider_payment_id:
+        order.provider_payment_id = provider_payment_id
+    if order.status != "paid":
+        order.status = "refunded"
+        return order
+
+    grant_reason = "subscribe" if order.type == "subscribe" else "topup"
+    original_grant_result = await db.execute(
+        select(CreditTransaction)
+        .where(
+            CreditTransaction.tenant_id == order.tenant_id,
+            CreditTransaction.reason == grant_reason,
+            CreditTransaction.ref_type == "order",
+            CreditTransaction.ref_id == order.id,
+        )
+        .limit(1)
+    )
+    original_grant = original_grant_result.scalar_one_or_none()
+    clawback_result = await db.execute(
+        select(CreditTransaction)
+        .where(
+            CreditTransaction.tenant_id == order.tenant_id,
+            CreditTransaction.reason == "refund_clawback",
+            CreditTransaction.ref_type == "order",
+            CreditTransaction.ref_id == order.id,
+        )
+        .limit(1)
+    )
+    existing_clawback = clawback_result.scalar_one_or_none()
+    if original_grant is not None and existing_clawback is None:
+        balance_result = await db.execute(
+            select(CreditBalance)
+            .where(CreditBalance.tenant_id == order.tenant_id)
+            .with_for_update()
+        )
+        balance = balance_result.scalar_one_or_none()
+        if balance is None:
+            raise ValueError("Credit balance missing for refunded payment order")
+        available = max(int(balance.balance or 0) - int(balance.reserved or 0), 0)
+        clawback = min(max(int(original_grant.delta or 0), 0), available)
+        balance.balance -= clawback
+        balance.updated_at = _utcnow()
+        db.add(
+            CreditTransaction(
+                tenant_id=order.tenant_id,
+                delta=-clawback,
+                balance_after=balance.balance,
+                reason="refund_clawback",
+                ref_type="order",
+                ref_id=order.id,
+            )
+        )
+
+    if order.type == "subscribe" and order.plan_id and order.change_kind != "downgrade":
+        paid_at = order.paid_at or order.created_at or _utcnow()
+        newer_order_result = await db.execute(
+            select(PaymentOrder.id)
+            .where(
+                PaymentOrder.tenant_id == order.tenant_id,
+                PaymentOrder.type == "subscribe",
+                PaymentOrder.status == "paid",
+                PaymentOrder.id != order.id,
+                PaymentOrder.paid_at > paid_at,
+            )
+            .limit(1)
+        )
+        if newer_order_result.scalar_one_or_none() is None:
+            subscription_result = await db.execute(
+                select(Subscription)
+                .where(
+                    Subscription.tenant_id == order.tenant_id,
+                    Subscription.plan_id == order.plan_id,
+                    Subscription.status.in_(("active", "trialing")),
+                )
+                .with_for_update()
+            )
+            subscription = subscription_result.scalar_one_or_none()
+            if subscription is not None:
+                subscription.status = "canceled"
+                subscription.period_end = _utcnow()
+                subscription.auto_renew = False
+                subscription.cancel_at_period_end = False
+                subscription.scheduled_plan_id = None
+                subscription.scheduled_period = None
+
+    order.status = "refunded"
+    return order
+
+
 async def process_billing_webhook_event(
     db: AsyncSession,
     *,
@@ -126,50 +243,67 @@ async def process_billing_webhook_event(
     payload: bytes,
     signature: str | None,
     provider: Any,
+    signature_headers: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Verify, store, and apply a provider webhook exactly once."""
-    event = await provider.verify_webhook(payload, signature)
+    event = await provider.verify_webhook(payload, signature, headers=signature_headers)
     event_id = str(event.get("id") or "")
     event_type = str(event.get("type") or "")
     if not event_id or not event_type:
         raise ValueError("Billing webhook event must include id and type")
 
-    existing_result = await db.execute(
-        select(BillingWebhookEvent)
-        .where(
-            BillingWebhookEvent.provider == provider_name,
-            BillingWebhookEvent.event_id == event_id,
+    async def find_webhook_event() -> BillingWebhookEvent | None:
+        result = await db.execute(
+            select(BillingWebhookEvent)
+            .where(
+                BillingWebhookEvent.provider == provider_name,
+                BillingWebhookEvent.event_id == event_id,
+            )
+            .limit(1)
         )
-        .limit(1)
-    )
-    webhook_event = existing_result.scalar_one_or_none() or _find_added_webhook_event(db, provider_name, event_id)
-    if webhook_event and webhook_event.status == "processed":
-        return {"status": "duplicate", "event_id": event_id}
+        return result.scalar_one_or_none() or _find_added_webhook_event(db, provider_name, event_id)
 
-    if not webhook_event:
-        webhook_event = BillingWebhookEvent(
-            provider=provider_name,
-            event_id=event_id,
-            event_type=event_type,
-            raw=event,
-            status="processing",
-        )
-        db.add(webhook_event)
+    webhook_event = await find_webhook_event()
+    if webhook_event is not None and webhook_event.status == "processed":
+        return {"status": "duplicate", "event_id": event_id}
 
     try:
         state = await provider.load_remote_event_state(event)
+        order = None
+        if state.order_id:
+            # The order lock is also the financial idempotency fence.  After a
+            # concurrent callback waits here, re-read the event row so it sees
+            # the first transaction's processed marker instead of inserting a
+            # conflicting duplicate event.
+            order = await db.get(PaymentOrder, state.order_id, with_for_update=True)
+            webhook_event = await find_webhook_event()
+            if webhook_event is not None and webhook_event.status == "processed":
+                return {"status": "duplicate", "event_id": event_id}
+
+        if webhook_event is None:
+            webhook_event = BillingWebhookEvent(
+                provider=provider_name,
+                event_id=event_id,
+                event_type=event_type,
+                raw=event,
+                status="processing",
+            )
+            db.add(webhook_event)
+
         if not state.order_id:
             webhook_event.status = "processed"
             webhook_event.processed_at = _utcnow()
             return {"status": "ignored", "event_id": event_id}
 
-        order = await db.get(PaymentOrder, state.order_id, with_for_update=True)
         if not order:
             raise ValueError(f"Payment order not found for webhook event {event_id}")
         if order.provider != provider_name:
             raise ValueError(f"Payment order provider mismatch: expected {order.provider}, got {provider_name}")
         if state.provider_session_id and order.provider_session_id and state.provider_session_id != order.provider_session_id:
             raise ValueError("Payment order provider session mismatch")
+        validate_state = getattr(provider, "validate_event_state", None)
+        if validate_state:
+            validate_state(order, state)
 
         if state.status == "paid":
             await finalize_order_in_session(
@@ -183,13 +317,20 @@ async def process_billing_webhook_event(
             order.status = "failed" if state.status == "failed" else "canceled"
             if state.provider_payment_id:
                 order.provider_payment_id = state.provider_payment_id
+        elif state.status == "refunded" and order.status in {"pending", "paid"}:
+            await refund_order_in_session(
+                db,
+                order,
+                provider_payment_id=state.provider_payment_id,
+            )
 
         webhook_event.status = "processed"
         webhook_event.processed_at = _utcnow()
         return {"status": "processed", "event_id": event_id, "order_id": str(state.order_id)}
     except Exception as exc:
-        webhook_event.status = "failed"
-        webhook_event.error = str(exc)[:500]
+        if webhook_event is not None:
+            webhook_event.status = "failed"
+            webhook_event.error = str(exc)[:500]
         raise
 
 
@@ -219,6 +360,9 @@ async def sync_pending_order_from_provider(db: AsyncSession, order: PaymentOrder
     locked = locked_result.scalar_one_or_none()
     if locked is None or locked.status != "pending":
         return False
+    validate_state = getattr(provider, "validate_event_state", None)
+    if validate_state:
+        validate_state(locked, state)
 
     if state.status == "paid":
         await finalize_order_in_session(
@@ -234,4 +378,30 @@ async def sync_pending_order_from_provider(db: AsyncSession, order: PaymentOrder
         if state.provider_payment_id:
             locked.provider_payment_id = state.provider_payment_id
         return True
+    if state.status == "refunded":
+        await refund_order_in_session(
+            db,
+            locked,
+            provider_payment_id=state.provider_payment_id,
+        )
+        return True
     return False
+
+
+async def close_expired_pending_order(db: AsyncSession, order: PaymentOrder) -> bool:
+    """Close an expired pending order at the provider before canceling locally."""
+    from app.services.billing_provider import get_billing_provider
+
+    if order.status != "pending" or not order.provider or order.provider == "manual":
+        return False
+    provider = get_billing_provider(order.provider)
+    locked_result = await db.execute(
+        select(PaymentOrder).where(PaymentOrder.id == order.id).with_for_update(skip_locked=True)
+    )
+    locked = locked_result.scalar_one_or_none()
+    if locked is None or locked.status != "pending":
+        return False
+    if not await provider.close_order(locked):
+        return False
+    locked.status = "canceled"
+    return True

@@ -1237,6 +1237,21 @@ export type WorkforceTopologyWork = {
     updated_at: string;
 };
 
+export type WorkforceTopologyExecution = {
+    id: string;
+    run_id?: string | null;
+    source_type: 'direct_chat' | 'group' | 'a2a' | 'task' | 'trigger' | 'heartbeat' | 'deliverable' | 'media';
+    status: 'queued' | 'running' | 'waiting_user' | 'waiting_agent' | 'waiting_external' | 'completed' | 'failed' | 'cancelled';
+    phase?: string | null;
+    title: string;
+    summary: string;
+    details_visible: boolean;
+    active_count: number;
+    recently_finished_count: number;
+    deep_link: string;
+    updated_at: string;
+};
+
 export type WorkforceTopologyNode = {
     id: string;
     name: string;
@@ -1251,6 +1266,7 @@ export type WorkforceTopologyNode = {
     is_system: boolean;
     visibility: 'company' | 'private' | 'custom';
     can_manage: boolean;
+    execution?: WorkforceTopologyExecution | null;
     work?: WorkforceTopologyWork | null;
 };
 
@@ -1281,6 +1297,11 @@ export type WorkforceTopology = {
     company_name: string;
     window_hours: number;
     generated_at: string;
+    scope_contract: {
+        execution: 'company_visible_redacted';
+        work: 'viewer_owned';
+        analytics: 'governor_or_managed';
+    };
     nodes: WorkforceTopologyNode[];
     relationship_edges: WorkforceTopologyRelationshipEdge[];
     activity_edges: WorkforceTopologyActivityEdge[];
@@ -1292,9 +1313,10 @@ export const workforceApi = {
         request<WorkforceTopology>(`/workforce/topology?window_hours=${windowHours}`),
 };
 
-// ─── CEO Orchestrator (P1 observer) ──────────────────
+// ─── Company CEO (P1 observer + opt-in P2 coordinator) ─────────────
 export type CeoOrchestratorSettings = {
     feature_available: boolean;
+    coordination_feature_available: boolean;
     configured: boolean;
     ceo_agent_id: string | null;
     enabled: boolean;
@@ -1306,6 +1328,19 @@ export type CeoOrchestratorSettings = {
     daily_credit_cap: number;
     monthly_credit_cap: number;
     meeting_member_agent_ids: string[];
+    coordination_enabled: boolean;
+    auto_dispatch_enabled: boolean;
+    coordination_enabled_by_user_id: string | null;
+    coordination_enabled_at: string | null;
+    max_parallel_delegations: number;
+    operating_mode: 'disabled' | 'observer' | 'coordinator' | 'coordinator_auto';
+};
+
+export type CeoOrchestratorStatus = {
+    feature_available: boolean;
+    configured: boolean;
+    ceo_agent_id: string | null;
+    enabled: boolean;
 };
 
 export type CeoCompanyBrief = {
@@ -1331,6 +1366,8 @@ export type CeoCompanyBrief = {
 };
 
 export const ceoApi = {
+    status: () => request<CeoOrchestratorStatus>('/companies/current/ceo/status'),
+
     settings: () => request<CeoOrchestratorSettings>('/companies/current/ceo/settings'),
 
     enable: (data: {
@@ -1354,6 +1391,9 @@ export const ceoApi = {
         daily_credit_cap: number;
         monthly_credit_cap: number;
         member_agent_ids: string[];
+        coordination_enabled: boolean;
+        auto_dispatch_enabled: boolean;
+        max_parallel_delegations: number;
     }>) => request<CeoOrchestratorSettings>('/companies/current/ceo/settings', {
         method: 'PATCH',
         body: JSON.stringify(data),

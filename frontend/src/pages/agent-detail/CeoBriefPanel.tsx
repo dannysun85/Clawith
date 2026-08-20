@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router';
 
 import { ceoApi } from '../../services/api';
 
@@ -16,22 +15,21 @@ import { ceoApi } from '../../services/api';
 export default function CeoBriefPanel({ agentId }: { agentId: string | undefined }) {
     const { i18n } = useTranslation();
     const zh = i18n.language?.startsWith('zh');
-    const navigate = useNavigate();
     const queryClient = useQueryClient();
     const [meetingMessage, setMeetingMessage] = useState('');
 
-    const { data: settings } = useQuery({
-        queryKey: ['ceo-orchestrator-settings'],
-        queryFn: () => ceoApi.settings(),
+    const { data: ceoStatus } = useQuery({
+        queryKey: ['ceo-orchestrator-status'],
+        queryFn: () => ceoApi.status(),
         retry: false,
     });
 
     const visible = Boolean(
         agentId
-        && settings?.feature_available
-        && settings.configured
-        && settings.enabled
-        && settings.ceo_agent_id === agentId,
+        && ceoStatus?.feature_available
+        && ceoStatus.configured
+        && ceoStatus.enabled
+        && ceoStatus.ceo_agent_id === agentId,
     );
 
     const {
@@ -62,7 +60,7 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
         },
     });
 
-    if (!visible || !settings) return null;
+    if (!visible || !ceoStatus) return null;
 
     const snapshot = brief?.snapshot;
 
@@ -172,17 +170,6 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
                 </div>
             )}
 
-            {settings.meeting_group_id && (
-                <div style={{ marginTop: 10, fontSize: 12 }}>
-                    <button
-                        type="button"
-                        className="btn btn-ghost"
-                        onClick={() => navigate(`/groups/${settings.meeting_group_id}`)}
-                    >
-                        {zh ? '打开会议群组' : 'Open meeting group'}
-                    </button>
-                </div>
-            )}
         </section>
     );
 }

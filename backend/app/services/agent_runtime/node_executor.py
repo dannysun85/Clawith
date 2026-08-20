@@ -242,6 +242,30 @@ class DefaultRuntimeFinalizer:
             )
         return list(dict.fromkeys(reference.strip() for reference in raw_refs))
 
+    @staticmethod
+    def _verified_objects(
+        verification: VerificationResult,
+        field_name: str,
+    ) -> list[JsonValue]:
+        raw_items = verification.details.get(field_name, [])
+        if not isinstance(raw_items, list) or any(
+            not isinstance(item, Mapping) for item in raw_items
+        ):
+            raise RuntimeNodeTransitionError(
+                "invalid_verification_result",
+                f"verified {field_name} must be a list of objects",
+            )
+        try:
+            copied = json.loads(
+                json.dumps(raw_items, ensure_ascii=False, allow_nan=False)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeNodeTransitionError(
+                "invalid_verification_result",
+                f"verified {field_name} must contain finite JSON values",
+            ) from exc
+        return cast(list[JsonValue], copied)
+
     async def finalize(
         self,
         state: RuntimeGraphState,
@@ -253,13 +277,33 @@ class DefaultRuntimeFinalizer:
         source_run_id = context.run_id
         artifact_refs = self._verified_refs(verification, "artifact_refs")
         evidence_refs = self._verified_refs(verification, "evidence_refs")
+        tool_receipts = self._verified_objects(verification, "tool_receipts")
+        delivery_receipts = self._verified_objects(
+            verification,
+            "delivery_receipts",
+        )
+        raw_contract_id = verification.details.get("delegation_contract_id")
+        if raw_contract_id is not None and (
+            not isinstance(raw_contract_id, str) or not raw_contract_id.strip()
+        ):
+            raise RuntimeNodeTransitionError(
+                "invalid_verification_result",
+                "verified delegation_contract_id must be a non-empty string or null",
+            )
+        result_summary: JsonObject = {
+            "summary": answer,
+            "verification": dict(verification.details),
+            "artifact_refs": artifact_refs,
+            "evidence_refs": evidence_refs,
+        }
+        if tool_receipts:
+            result_summary["tool_receipts"] = tool_receipts
+        if delivery_receipts:
+            result_summary["delivery_receipts"] = delivery_receipts
+        if raw_contract_id is not None:
+            result_summary["delegation_contract_id"] = raw_contract_id
         return FinalizationResult(
-            result_summary={
-                "summary": answer,
-                "verification": dict(verification.details),
-                "artifact_refs": artifact_refs,
-                "evidence_refs": evidence_refs,
-            },
+            result_summary=result_summary,
             session_context_delta={
                 "source_run_id": source_run_id,
                 "new_requirements": [],

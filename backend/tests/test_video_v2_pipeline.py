@@ -293,9 +293,14 @@ async def test_launchable_workflows_follow_the_video_v2_allowlist(monkeypatch) -
         AsyncMock(return_value=True),
     )
     allowed = {"value": False}
+    stage_gate = {"value": False}
     monkeypatch.setattr(
         "app.services.deliverable_workflows.video_v2_workflow_allowed",
         lambda tenant_id, agent_id: allowed["value"],
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.deliverable_stage_approvals_enabled",
+        lambda: stage_gate["value"],
     )
 
     listing = await list_agent_launchable_workflows(
@@ -309,6 +314,19 @@ async def test_launchable_workflows_follow_the_video_v2_allowlist(monkeypatch) -
     assert "builtin.video.v2" not in ids
 
     allowed["value"] = True
+    listing = await list_agent_launchable_workflows(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        tier="pro",
+    )
+    ids = [workflow.workflow_id for workflow in listing]
+    # A partial rollout must keep v1 visible rather than exposing a v2 flow
+    # that will dead-end at its mandatory storyboard approval.
+    assert "builtin.video.v1" in ids
+    assert "builtin.video.v2" not in ids
+
+    stage_gate["value"] = True
     listing = await list_agent_launchable_workflows(
         SimpleNamespace(),  # type: ignore[arg-type]
         tenant_id=uuid.uuid4(),
@@ -368,6 +386,10 @@ def _mock_video_preflight_capability(monkeypatch, video_providers) -> None:
         "app.services.deliverable_workflows.video_v2_workflow_allowed",
         lambda tenant_id, agent_id: True,
     )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.deliverable_stage_approvals_enabled",
+        lambda: True,
+    )
 
 
 @pytest.mark.asyncio
@@ -388,6 +410,31 @@ async def test_in_scene_dialogue_requires_a_native_audio_route(monkeypatch) -> N
     assert result["launchable"] is False
     assert result["capability_status"] == "unavailable"
     assert "audio_mode_route_mismatch" in result["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_video_v2_preflight_requires_the_stage_approval_gate(monkeypatch) -> None:
+    _mock_video_preflight_capability(monkeypatch, ["minimax"])
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.deliverable_stage_approvals_enabled",
+        lambda: False,
+    )
+    workflow = require_workflow("video", "builtin.video.v2", "2.0.0")
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        spec=_spec(),
+        goal="为新款极光保温杯制作抖音投放短视频",
+    )
+
+    assert result["available"] is False
+    assert result["launchable"] is False
+    assert "deliverable_stage_approvals_disabled" in result["reasons"]
+    assert "阶段审批" in result["next_action"]
 
 
 @pytest.mark.asyncio
@@ -450,7 +497,7 @@ async def test_video_v2_preflight_gates_allowlist_and_brief(monkeypatch) -> None
     assert result["launchable"] is False
     assert "deliverable_video_v2_not_allowlisted" in result["reasons"]
 
-    _mock_video_preflight_capability(monkeypatch, ["minimax"])
+    _mock_video_preflight_capability(monkeypatch, ["volcengine_agent_plan", "minimax"])
     # The manifest already fail-closes missing required fields; the brief
     # clarification seam catches the conditional contract the manifest cannot
     # express: in-scene dialogue without a dialogue script.
@@ -465,7 +512,9 @@ async def test_video_v2_preflight_gates_allowlist_and_brief(monkeypatch) -> None
         goal="为新款极光保温杯制作抖音投放短视频",
     )
     assert result["launchable"] is False
+    assert result["available"] is True
     assert "brief_missing:dialogue_script" in result["reasons"]
+    assert "dialogue_script" in result["next_action"]
     assert result["creative_brief"]["status"] == "clarifying"
 
 
@@ -593,6 +642,45 @@ async def test_first_launch_drafts_storyboard_without_paid_work(monkeypatch) -> 
     from app.models.deliverable import DeliverablePromptCompilation
 
     assert not any(isinstance(item, DeliverablePromptCompilation) for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_storyboard_revision_relaunches_planning_without_paid_shots(monkeypatch) -> None:
+    request = _request()
+    execution = _execution(request, kind="revision")
+    execution.contract_snapshot = {
+        "revision_stage": "storyboard",
+        "target_units": [],
+    }
+    shot_units = [
+        _unit(request, execution, "shot_generate", f"shot-{index:02d}")
+        for index in (1, 2)
+    ]
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.preflight_workflow",
+        AsyncMock(return_value={"launchable": True, "reasons": []}),
+    )
+    approval = AsyncMock(side_effect=AssertionError("planning revision must not require prior approval"))
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.storyboard_approved",
+        approval,
+    )
+    db = _Session(request, execution, shot_units)
+
+    prepared = await prepare_deliverable_launch(
+        db,  # type: ignore[arg-type]
+        request_id=request.id,
+        tenant_id=request.tenant_id,
+        user_id=request.created_by_user_id,
+        agent_id=request.agent_id,
+        session_id=request.session_id,
+        message_id=uuid.uuid4(),
+    )
+
+    assert request.current_stage == "storyboard_draft"
+    assert "Do not call any generation Tool" in prepared.prompt
+    approval.assert_not_awaited()
+    assert not db.added
 
 
 @pytest.mark.asyncio
@@ -942,6 +1030,66 @@ async def test_v2_storyboard_gate_requires_the_review_state(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_storyboard_revision_records_planning_stage_without_targets(monkeypatch) -> None:
+    request = _request(status="waiting_approval", current_stage="storyboard_review")
+    execution = _execution(request)
+    user = _mock_approval_api(monkeypatch, request, execution, stage_approvals_enabled=True)
+    next_execution = SimpleNamespace(id=uuid.uuid4())
+    revision = AsyncMock(return_value=(next_execution, True))
+    monkeypatch.setattr(deliverables, "create_revision_execution", revision)
+    monkeypatch.setattr(
+        deliverables,
+        "_supersede_quality_reviews_for_revision",
+        AsyncMock(return_value=()),
+    )
+    db = _Session(None)
+    data = DeliverableApprovalIn(
+        expected_version=request.version,
+        client_action_id=uuid.uuid4(),
+        stage="storyboard",
+        action="request_changes",
+        instruction="第二镜头改成更近的产品特写",
+    )
+
+    await deliverables.record_deliverable_approval(
+        request.id,
+        data,
+        user,  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+    )
+
+    assert revision.await_args.kwargs["revision_stage"] == "storyboard"
+    assert revision.await_args.kwargs["target_units"] == []
+
+
+@pytest.mark.asyncio
+async def test_storyboard_revision_rejects_production_targets(monkeypatch) -> None:
+    request = _request(status="waiting_approval", current_stage="storyboard_review")
+    execution = _execution(request)
+    user = _mock_approval_api(monkeypatch, request, execution, stage_approvals_enabled=True)
+    db = _Session(None)
+    data = DeliverableApprovalIn(
+        expected_version=request.version,
+        client_action_id=uuid.uuid4(),
+        stage="storyboard",
+        action="request_changes",
+        instruction="调整第二个分镜",
+        target_units=["shot-02"],
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await deliverables.record_deliverable_approval(
+            request.id,
+            data,
+            user,  # type: ignore[arg-type]
+            db,  # type: ignore[arg-type]
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == "deliverable_revision_target_not_allowed"
+
+
+@pytest.mark.asyncio
 async def test_shot_review_revision_entry_creates_targeted_revision(monkeypatch) -> None:
     request = _request(status="ready", current_stage="shot_review")
     execution = _execution(request)
@@ -954,7 +1102,8 @@ async def test_shot_review_revision_entry_creates_targeted_revision(monkeypatch)
         "_supersede_quality_reviews_for_revision",
         AsyncMock(return_value=()),
     )
-    db = _Session(None)
+    failed_shot = _unit(request, execution, "shot_qa", "shot-02", status="failed")
+    db = _Session(None, [failed_shot])
     data = DeliverableApprovalIn(
         expected_version=request.version,
         client_action_id=uuid.uuid4(),
@@ -972,6 +1121,47 @@ async def test_shot_review_revision_entry_creates_targeted_revision(monkeypatch)
     revision.assert_awaited_once()
     kwargs = revision.await_args.kwargs
     assert kwargs["target_units"] == ["shot-02"]
+    assert kwargs["revision_stage"] == "shot"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_units", "expected_code"),
+    [
+        ([], "deliverable_failed_shot_target_required"),
+        (["shot-01"], "deliverable_failed_shot_target_invalid"),
+    ],
+)
+async def test_shot_review_revision_rejects_empty_or_passed_targets(
+    monkeypatch,
+    target_units,
+    expected_code,
+) -> None:
+    request = _request(status="ready", current_stage="shot_review")
+    execution = _execution(request)
+    user = _mock_approval_api(monkeypatch, request, execution, stage_approvals_enabled=True)
+    failed_shot = _unit(request, execution, "shot_qa", "shot-02", status="failed")
+    passed_shot = _unit(request, execution, "shot_qa", "shot-01", status="succeeded")
+    db = _Session(None, [failed_shot, passed_shot])
+    data = DeliverableApprovalIn(
+        expected_version=request.version,
+        client_action_id=uuid.uuid4(),
+        stage="final",
+        action="request_changes",
+        instruction="只重做失败镜头",
+        target_units=target_units,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await deliverables.record_deliverable_approval(
+            request.id,
+            data,
+            user,  # type: ignore[arg-type]
+            db,  # type: ignore[arg-type]
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == expected_code
 
 
 # ─── FR-V4 Credits reconciliation facts ─────────────────────────

@@ -28,6 +28,8 @@ from app.services.access_control import is_company_governor
 from app.services.ceo_briefing import (
     CeoBriefingError,
     build_company_brief_snapshot,
+    ceo_coordination_rollout_allowed,
+    ceo_operating_mode,
     ceo_orchestrator_allowed,
 )
 from app.services.ceo_orchestrator import (
@@ -40,6 +42,7 @@ from app.services.ceo_orchestrator import (
     start_ceo_meeting,
     update_ceo_settings,
 )
+from app.services.ceo_migration import build_ceo_migration_preview
 
 router = APIRouter(prefix="/api", tags=["ceo"])
 
@@ -58,15 +61,29 @@ class CeoSettingsPatchIn(BaseModel):
     daily_credit_cap: int | None = Field(default=None, ge=0)
     monthly_credit_cap: int | None = Field(default=None, ge=0)
     member_agent_ids: list[uuid.UUID] | None = Field(default=None, max_length=12)
+    coordination_enabled: bool | None = None
+    auto_dispatch_enabled: bool | None = None
+    max_parallel_delegations: int | None = Field(default=None, ge=1, le=12)
+
+
+class CeoStatusOut(BaseModel):
+    """Member-safe CEO identity and availability projection."""
+
+    feature_available: bool
+    configured: bool
+    ceo_agent_id: uuid.UUID | None
+    enabled: bool
 
 
 def _settings_out(
     row: CeoOrchestratorSettings | None,
     *,
     feature_available: bool,
+    coordination_feature_available: bool = False,
 ) -> dict:
     base = {
         "feature_available": feature_available,
+        "coordination_feature_available": coordination_feature_available,
         "configured": row is not None,
         "ceo_agent_id": None,
         "enabled": False,
@@ -78,6 +95,12 @@ def _settings_out(
         "daily_credit_cap": 20,
         "monthly_credit_cap": 300,
         "meeting_member_agent_ids": [],
+        "coordination_enabled": False,
+        "auto_dispatch_enabled": False,
+        "coordination_enabled_by_user_id": None,
+        "coordination_enabled_at": None,
+        "max_parallel_delegations": 3,
+        "operating_mode": "disabled",
     }
     if row is None:
         return base
@@ -99,6 +122,22 @@ def _settings_out(
             "meeting_member_agent_ids": [
                 str(value) for value in (row.meeting_member_agent_ids or [])
             ],
+            "coordination_enabled": bool(getattr(row, "coordination_enabled", False)),
+            "auto_dispatch_enabled": bool(getattr(row, "auto_dispatch_enabled", False)),
+            "coordination_enabled_by_user_id": (
+                str(row.coordination_enabled_by_user_id)
+                if getattr(row, "coordination_enabled_by_user_id", None)
+                else None
+            ),
+            "coordination_enabled_at": (
+                row.coordination_enabled_at.isoformat()
+                if getattr(row, "coordination_enabled_at", None)
+                else None
+            ),
+            "max_parallel_delegations": int(
+                getattr(row, "max_parallel_delegations", 3) or 3
+            ),
+            "operating_mode": ceo_operating_mode(row),
         }
     )
     return base
@@ -156,10 +195,32 @@ def _translate_ceo_error(exc: CeoOrchestratorError) -> HTTPException:
         "ceo_meeting_kind_invalid": status.HTTP_422_UNPROCESSABLE_ENTITY,
         "ceo_meeting_member_invalid": status.HTTP_400_BAD_REQUEST,
         "ceo_meeting_member_limit": status.HTTP_400_BAD_REQUEST,
+        "ceo_coordination_not_available": status.HTTP_403_FORBIDDEN,
+        "ceo_coordination_required": status.HTTP_409_CONFLICT,
+        "ceo_parallel_delegation_limit_invalid": status.HTTP_422_UNPROCESSABLE_ENTITY,
     }
     return HTTPException(
         status_code=status_by_code.get(exc.code, status.HTTP_409_CONFLICT),
         detail={"code": exc.code, "message": str(exc)},
+    )
+
+
+@router.get("/companies/current/ceo/status", response_model=CeoStatusOut)
+async def get_ceo_orchestrator_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CeoStatusOut:
+    """Return only the CEO fields every company member may read."""
+    tenant_id = _tenant_id(current_user)
+    row = await get_ceo_settings(db, tenant_id)
+    return CeoStatusOut(
+        feature_available=ceo_orchestrator_allowed(
+            tenant_id=tenant_id,
+            agent_id=row.ceo_agent_id if row else None,
+        ),
+        configured=row is not None,
+        ceo_agent_id=row.ceo_agent_id if row else None,
+        enabled=bool(row.enabled) if row else False,
     )
 
 
@@ -168,6 +229,7 @@ async def get_ceo_orchestrator_settings(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    _require_governor(current_user)
     tenant_id = _tenant_id(current_user)
     row = await get_ceo_settings(db, tenant_id)
     return _settings_out(
@@ -176,6 +238,23 @@ async def get_ceo_orchestrator_settings(
             tenant_id=tenant_id,
             agent_id=row.ceo_agent_id if row else None,
         ),
+        coordination_feature_available=ceo_coordination_rollout_allowed(
+            tenant_id=tenant_id,
+            agent_id=row.ceo_agent_id if row else None,
+        ),
+    )
+
+
+@router.get("/companies/current/ceo/migration-preview")
+async def get_ceo_migration_preview(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a governor-only, secret-free CEO migration dry run."""
+    _require_governor(current_user)
+    return await build_ceo_migration_preview(
+        db,
+        tenant_id=_tenant_id(current_user),
     )
 
 
@@ -220,7 +299,14 @@ async def enable_ceo(
             "member_agent_ids": [str(value) for value in (row.meeting_member_agent_ids or [])],
         },
     )
-    return _settings_out(row, feature_available=True)
+    return _settings_out(
+        row,
+        feature_available=True,
+        coordination_feature_available=ceo_coordination_rollout_allowed(
+            tenant_id=tenant.id,
+            agent_id=row.ceo_agent_id,
+        ),
+    )
 
 
 @router.post("/companies/current/ceo/disable")
@@ -244,6 +330,10 @@ async def disable_ceo(
     return _settings_out(
         row,
         feature_available=ceo_orchestrator_allowed(
+            tenant_id=tenant_id,
+            agent_id=row.ceo_agent_id,
+        ),
+        coordination_feature_available=ceo_coordination_rollout_allowed(
             tenant_id=tenant_id,
             agent_id=row.ceo_agent_id,
         ),
@@ -276,6 +366,9 @@ async def patch_ceo_settings(
             daily_credit_cap=body.daily_credit_cap,
             monthly_credit_cap=body.monthly_credit_cap,
             member_agent_ids=body.member_agent_ids,
+            coordination_enabled=body.coordination_enabled,
+            auto_dispatch_enabled=body.auto_dispatch_enabled,
+            max_parallel_delegations=body.max_parallel_delegations,
         )
     except CeoOrchestratorError as exc:
         raise _translate_ceo_error(exc) from exc
@@ -290,9 +383,19 @@ async def patch_ceo_settings(
             "daily_credit_cap": row.daily_credit_cap,
             "monthly_credit_cap": row.monthly_credit_cap,
             "member_agent_ids": [str(value) for value in (row.meeting_member_agent_ids or [])],
+            "coordination_enabled": bool(row.coordination_enabled),
+            "auto_dispatch_enabled": bool(row.auto_dispatch_enabled),
+            "max_parallel_delegations": row.max_parallel_delegations,
         },
     )
-    return _settings_out(row, feature_available=True)
+    return _settings_out(
+        row,
+        feature_available=True,
+        coordination_feature_available=ceo_coordination_rollout_allowed(
+            tenant_id=tenant_id,
+            agent_id=row.ceo_agent_id,
+        ),
+    )
 
 
 async def _load_enabled_ceo_agent(

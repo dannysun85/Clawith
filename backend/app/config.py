@@ -241,12 +241,17 @@ class Settings(BaseSettings):
     # claim yet and remains separately quarantined.
     SUPERVISION_EXECUTION_ENABLED: bool = False
     OKR_AUTOMATION_ENABLED: bool = False
-    # CEO orchestrator (P1 observer) is an explicit tenant/Agent canary: the
+    # CEO orchestrator P1 (observer) is an explicit tenant/Agent canary: the
     # global switch stays false and both allowlists stay empty so no deployment
     # gets a CEO Agent unless an operator opts in deliberately.
     CEO_ORCHESTRATOR_ENABLED: bool = False
     CEO_ORCHESTRATOR_TENANT_IDS: str = ""
     CEO_ORCHESTRATOR_AGENT_IDS: str = ""
+    # P2 coordination is a second, independent rollout gate. A tenant must pass
+    # both P1 and P2 and then explicitly opt in before its CEO may dispatch.
+    CEO_COORDINATION_ENABLED: bool = False
+    CEO_COORDINATION_TENANT_IDS: str = ""
+    CEO_COORDINATION_AGENT_IDS: str = ""
     # Hard length bound for the CEO business snapshot / briefing projections.
     CEO_BRIEF_SNAPSHOT_MAX_CHARS: int = 4000
     TRIGGER_MAX_CONCURRENCY: int = 8
@@ -303,8 +308,14 @@ class Settings(BaseSettings):
     WECHAT_PAY_PRIVATE_KEY: str = ""  # apiclient_key.pem content ("\n" escapes allowed)
     WECHAT_PAY_PRIVATE_KEY_PATH: str = ""  # alternative to WECHAT_PAY_PRIVATE_KEY
     WECHAT_PAY_API_V3_KEY: str = ""  # 32-byte APIv3 key, decrypts webhook resources
+    # WeChat platform certificate/public key used to verify callback HTTP
+    # signatures.  This is distinct from the merchant private key above.
+    WECHAT_PAY_PLATFORM_PUBLIC_KEY: str = ""  # PEM public key or platform certificate
+    WECHAT_PAY_PLATFORM_PUBLIC_KEY_PATH: str = ""  # alternative to inline PEM
+    WECHAT_PAY_PLATFORM_SERIAL_NO: str = ""  # certificate serial or PUB_KEY_ID_*
     WECHAT_PAY_NOTIFY_URL: str = ""  # defaults to PAYMENT_BASE_URL or PUBLIC_BASE_URL + webhook path
     WECHAT_PAY_API_BASE_URL: str = "https://api.mch.weixin.qq.com"
+    WECHAT_PAY_WEBHOOK_MAX_SKEW_SECONDS: int = 300
     # Native order validity sent as time_expire; 0 keeps WeChat's 2h default.
     WECHAT_PAY_ORDER_EXPIRE_MINUTES: int = 120
     # WeChat Pay only settles in CNY; USD-priced plans/packs convert at this rate.

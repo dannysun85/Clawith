@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -34,6 +35,129 @@ def make_agent(creator_id: uuid.UUID, **overrides):
     }
     values.update(overrides)
     return Agent(**values)
+
+
+@pytest.mark.parametrize(
+    ("path", "requires_manage"),
+    [
+        ("soul.md", True),
+        ("SOUL.md", True),
+        ("memory.md", True),
+        ("memory/memory.md", True),
+        ("memory/daily/2026-08-20.md", True),
+        ("skills/review/SKILL.md", True),
+        ("workspace/../memory.md", True),
+        ("workspace/../soul.md", True),
+        ("workspace/../skills/review/SKILL.md", True),
+        ("workspace/report.md", False),
+    ],
+)
+def test_agent_control_plane_paths_require_manage_access(path, requires_manage):
+    assert files_api._requires_agent_file_manage_access(path) is requires_manage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["soul.md", "memory.md", "memory/memory.md"])
+async def test_use_access_cannot_write_agent_identity_or_memory(monkeypatch, path):
+    user = make_user()
+    agent = make_agent(uuid.uuid4(), tenant_id=user.tenant_id)
+
+    async def fake_check_agent_access(_db, _current_user, _agent_id, **kwargs):
+        if kwargs.get("required_level") == "manage":
+            raise HTTPException(status_code=403, detail="Manage access required")
+        return agent, "use"
+
+    monkeypatch.setattr(files_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        await files_api.write_file(
+            agent_id=agent.id,
+            path=path,
+            data=files_api.FileWrite(content="unapproved behavior change"),
+            current_user=user,
+            db=object(),
+        )
+
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "workspace/../memory.md",
+        "workspace/../soul.md",
+        "workspace/../skills/review/SKILL.md",
+    ],
+)
+@pytest.mark.asyncio
+async def test_use_access_cannot_write_control_plane_through_path_alias(monkeypatch, path):
+    user = make_user()
+    agent = make_agent(uuid.uuid4(), tenant_id=user.tenant_id)
+
+    async def fake_check_agent_access(_db, _current_user, _agent_id, **kwargs):
+        if kwargs.get("required_level") == "manage":
+            raise HTTPException(status_code=403, detail="Manage access required")
+        return agent, "use"
+
+    monkeypatch.setattr(files_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        await files_api.write_file(
+            agent_id=agent.id,
+            path=path,
+            data=files_api.FileWrite(content="unapproved behavior change"),
+            current_user=user,
+            db=object(),
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_internal_skill_metadata_rejects_path_alias():
+    assert files_api._is_internal_skill_metadata_path(
+        "foo/../skills/review/.astra-managed.json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_use_access_cannot_restore_agent_memory_revision(monkeypatch):
+    user = make_user()
+    agent = make_agent(uuid.uuid4(), tenant_id=user.tenant_id)
+    revision_id = uuid.uuid4()
+    access_levels: list[str] = []
+
+    async def fake_check_agent_access(_db, _current_user, _agent_id, **kwargs):
+        required_level = kwargs.get("required_level", "use")
+        access_levels.append(required_level)
+        if required_level == "manage":
+            raise HTTPException(status_code=403, detail="Manage access required")
+        return agent, "use"
+
+    class QueryResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(
+                id=revision_id,
+                agent_id=agent.id,
+                path="memory/memory.md",
+                after_content="old memory",
+            )
+
+    class DB:
+        async def execute(self, _query):
+            return QueryResult()
+
+    monkeypatch.setattr(files_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        await files_api.restore_file_revision(
+            agent_id=agent.id,
+            data=files_api.RestoreRevisionBody(revision_id=revision_id),
+            current_user=user,
+            db=DB(),
+        )
+
+    assert exc.value.status_code == 403
+    assert access_levels == ["use", "manage"]
 
 
 @pytest.mark.asyncio

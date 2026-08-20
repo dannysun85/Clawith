@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PlanOut(BaseModel):
@@ -268,10 +268,17 @@ class BillingProfileIn(BaseModel):
 
 
 class BillingConfigOut(BaseModel):
-    """Frontend billing display config (payment provider + FX rate)."""
+    """Secret-free billing provider readiness for frontend decisions."""
 
     provider: str
     usd_cny_rate: float
+    status: str
+    checkout_enabled: bool
+    native_payment_enabled: bool
+    webhook_ready: bool
+    missing_config: list[str] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+    next_action: str = ""
     # Hostname of PAYMENT_BASE_URL (else PUBLIC_BASE_URL): real-money checkout
     # is only accepted from it. Product aliases such as opc.reeftotem.ai may
     # serve the app, but checkout must happen on this host.

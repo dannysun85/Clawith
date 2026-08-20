@@ -204,6 +204,7 @@
             "openAgent": "打开 {{name}}，{{status}}",
             "work": {
                 "executing": "执行中",
+                "waiting": "等待中",
                 "review": "待检查",
                 "approval": "待审批",
                 "blocked": "已阻塞",
@@ -211,11 +212,35 @@
                 "no_work": "暂无工作"
             },
             "health": "运行状态",
+            "executionStatusLabel": "执行状态",
+            "executionSourceLabel": "任务来源",
             "workStage": "工作阶段",
             "relationships": "协作关系",
             "interactions24h": "24 小时互动",
             "statusOverview": "员工状态概览",
+            "currentExecution": "当前执行",
             "currentWork": "工作进展",
+            "executionPhase": "阶段：{{phase}}",
+            "executionStatus": {
+                "queued": "排队中",
+                "running": "执行中",
+                "waiting_user": "等待用户",
+                "waiting_agent": "等待其他 Agent",
+                "waiting_external": "等待外部系统",
+                "completed": "已完成",
+                "failed": "失败",
+                "cancelled": "已取消"
+            },
+            "executionSource": {
+                "direct_chat": "单聊任务",
+                "group": "群组协作",
+                "a2a": "Agent 委派",
+                "task": "工作台任务",
+                "trigger": "定时触发",
+                "heartbeat": "心跳任务",
+                "deliverable": "正式交付",
+                "media": "媒体生成"
+            },
             "latestActivity": "最新动态",
             "moreActiveWork": "另有 {{count}} 项进行中工作",
             "sendMessage": "发消息",

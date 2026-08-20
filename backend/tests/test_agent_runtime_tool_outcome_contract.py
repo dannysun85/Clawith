@@ -139,13 +139,15 @@ def _execution(
     tenant_id: uuid.UUID,
     run_id: uuid.UUID,
     status: str = "started",
+    tool_name: str = "read_file",
+    tool_call_id: str = "call-1",
 ) -> AgentToolExecution:
     return AgentToolExecution(
         id=uuid.uuid4(),
         tenant_id=tenant_id,
         run_id=run_id,
-        tool_call_id="call-1",
-        tool_name="read_file",
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
         assistant_message_id="assistant-1",
         arguments_hash="hash",
         sanitized_arguments={},
@@ -157,7 +159,12 @@ def _execution(
     )
 
 
-def _state(tenant_id: uuid.UUID, run_id: uuid.UUID) -> RuntimeGraphState:
+def _state(
+    tenant_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    initial_input: dict | None = None,
+) -> RuntimeGraphState:
     del tenant_id, run_id
     return {
         "snapshots": RunInputSnapshots(
@@ -165,7 +172,7 @@ def _state(tenant_id: uuid.UUID, run_id: uuid.UUID) -> RuntimeGraphState:
             session_context_version=0,
             recent_session_messages=(),
             related_run_summaries=(),
-            initial_input={},
+            initial_input=initial_input or {},
         ),
         "lifecycle": {
             "status": "verifying",
@@ -175,12 +182,18 @@ def _state(tenant_id: uuid.UUID, run_id: uuid.UUID) -> RuntimeGraphState:
     }
 
 
-def _context(tenant_id: uuid.UUID, run_id: uuid.UUID) -> RuntimeContext:
+def _context(
+    tenant_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    agent_id: uuid.UUID | None = None,
+) -> RuntimeContext:
     return RuntimeContext(
         tenant_id=str(tenant_id),
         run_id=str(run_id),
         command_id="command-1",
         executor=object(),  # type: ignore[arg-type]
+        agent_id=str(agent_id) if agent_id is not None else None,
     )
 
 
@@ -897,6 +910,120 @@ async def test_verifier_uses_invocation_context_without_checkpoint_registry() ->
 
     assert passed.outcome == "pass"
     assert passed.details["code"] == "deterministic_checks_passed"
+
+
+def _server_delegation_contract(
+    *,
+    source_agent_id: uuid.UUID,
+    target_agent_id: uuid.UUID,
+    requires_delivery: bool,
+) -> dict:
+    return {
+        "version": 1,
+        "contract_id": str(uuid.uuid4()),
+        "source_run_id": str(uuid.uuid4()),
+        "source_agent_id": str(source_agent_id),
+        "target_agent_id": str(target_agent_id),
+        "title": "Research facts",
+        "objective": "Use the required capability and return verified evidence.",
+        "required_capabilities": ["web_search"],
+        "acceptance_criteria": ["Facts are grounded in the tool result."],
+        "expected_artifacts": ["report.md"] if requires_delivery else [],
+        "requires_artifact_delivery": requires_delivery,
+    }
+
+
+@pytest.mark.asyncio
+async def test_verifier_requires_real_capability_receipts_for_delegated_contract() -> None:
+    tenant_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    source_agent_id = uuid.uuid4()
+    target_agent_id = uuid.uuid4()
+    contract = _server_delegation_contract(
+        source_agent_id=source_agent_id,
+        target_agent_id=target_agent_id,
+        requires_delivery=False,
+    )
+    narrative_only = _execution(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        status="succeeded",
+        tool_name="read_file",
+    )
+    narrative_only.result_metadata = {}
+    verifier = ToolLedgerRuntimeVerifier(
+        session_factory=_factory(_ManyResult([narrative_only])),
+    )
+
+    result = await verifier.verify(
+        _state(tenant_id, run_id, initial_input={"delegation_contract": contract}),
+        _context(tenant_id, run_id, agent_id=target_agent_id),
+        "I searched the web and finished.",
+    )
+
+    assert result.outcome == "repair"
+    assert result.details["code"] == "delegation_capability_receipt_missing"
+    assert result.details["missing_capabilities"] == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_verifier_returns_capability_and_file_delivery_receipts() -> None:
+    tenant_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    source_agent_id = uuid.uuid4()
+    target_agent_id = uuid.uuid4()
+    contract = _server_delegation_contract(
+        source_agent_id=source_agent_id,
+        target_agent_id=target_agent_id,
+        requires_delivery=True,
+    )
+    search = _execution(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        status="succeeded",
+        tool_name="web_search",
+        tool_call_id="search-call",
+    )
+    search.result_metadata = {"evidence_refs": []}
+    transfer = _execution(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        status="succeeded",
+        tool_name="send_file_to_agent",
+        tool_call_id="delivery-call",
+    )
+    transfer.result_metadata = {
+        "delivery_receipts": [
+            {
+                "version": 1,
+                "kind": "agent_workspace_file",
+                "source_agent_id": str(target_agent_id),
+                "target_agent_id": str(source_agent_id),
+                "source_path": "workspace/report.md",
+                "delivered_path": "workspace/inbox/files/report.md",
+                "inbox_note_path": "workspace/inbox/delivery.md",
+                "size_bytes": 42,
+                "sha256": "a" * 64,
+            }
+        ]
+    }
+    verifier = ToolLedgerRuntimeVerifier(
+        session_factory=_factory(_ManyResult([search, transfer])),
+    )
+
+    result = await verifier.verify(
+        _state(tenant_id, run_id, initial_input={"delegation_contract": contract}),
+        _context(tenant_id, run_id, agent_id=target_agent_id),
+        "Verified report delivered.",
+    )
+
+    assert result.outcome == "pass"
+    assert result.details["delegation_contract_id"] == contract["contract_id"]
+    assert [item["tool_name"] for item in result.details["tool_receipts"]] == [
+        "web_search",
+        "send_file_to_agent",
+    ]
+    assert result.details["delivery_receipts"][0]["sha256"] == "a" * 64
 
 
 async def _true_reference(

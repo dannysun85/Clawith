@@ -63,6 +63,7 @@ _RESULT_METADATA_KEYS = frozenset(
         "retryable",
         "artifact_refs",
         "evidence_refs",
+        "delivery_receipts",
         "nul_replacements",
         "control_replacements",
         "redaction_count",

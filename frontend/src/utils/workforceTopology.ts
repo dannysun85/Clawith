@@ -17,6 +17,7 @@ export type TopologyHealthFilter =
 export type TopologyWorkFilter =
     | 'all'
     | 'executing'
+    | 'waiting'
     | 'review'
     | 'approval'
     | 'blocked'
@@ -33,6 +34,19 @@ export type TopologyLayout = {
     bounds: { minX: number; minY: number; maxX: number; maxY: number };
 };
 
+export function topologyExecutionWorkGroup(
+    node: WorkforceTopologyNode,
+): TopologyWorkGroup {
+    const status = node.execution?.status;
+    if (status === 'queued' || status === 'running') return 'executing';
+    if (status === 'waiting_user' || status === 'waiting_agent' || status === 'waiting_external') {
+        return 'waiting';
+    }
+    if (status === 'failed') return 'blocked';
+    if (status === 'completed' || status === 'cancelled') return 'completed';
+    return node.work?.stage ?? 'no_work';
+}
+
 export function filterTopologyNodes(
     nodes: WorkforceTopologyNode[],
     options: {
@@ -44,7 +58,7 @@ export function filterTopologyNodes(
     const normalizedQuery = options.query.trim().toLocaleLowerCase();
     return nodes.filter((node) => {
         if (options.health !== 'all' && node.status !== options.health) return false;
-        const workGroup = node.work?.stage ?? 'no_work';
+        const workGroup = topologyExecutionWorkGroup(node);
         if (options.work !== 'all' && workGroup !== options.work) return false;
         if (!normalizedQuery) return true;
         return `${node.name} ${node.role_description}`

@@ -499,6 +499,12 @@ def presentation_v2_workflow_allowed(tenant_id: uuid.UUID, agent_id: uuid.UUID) 
     )
 
 
+def deliverable_stage_approvals_enabled() -> bool:
+    """Return the server-owned gate required by staged video/deck workflows."""
+
+    return bool(get_settings().DELIVERABLE_STAGE_APPROVALS_ENABLED)
+
+
 async def list_agent_launchable_workflows(
     db: AsyncSession,
     *,
@@ -517,8 +523,19 @@ async def list_agent_launchable_workflows(
 
     available: list[WorkflowManifest] = []
     poster_v2_allowed = poster_v2_workflow_allowed(tenant_id, agent_id)
-    video_v2_allowed = video_v2_workflow_allowed(tenant_id, agent_id)
-    presentation_v2_allowed = presentation_v2_workflow_allowed(tenant_id, agent_id)
+    stage_approvals_enabled = deliverable_stage_approvals_enabled()
+    # Video/PPT v2 are only usable when both the canary allowlist and their
+    # approval state machine are enabled.  Keeping v1 visible under a partial
+    # rollout prevents users from entering a workflow that cannot pass its
+    # mandatory storyboard/outline gate.
+    video_v2_allowed = (
+        video_v2_workflow_allowed(tenant_id, agent_id)
+        and stage_approvals_enabled
+    )
+    presentation_v2_allowed = (
+        presentation_v2_workflow_allowed(tenant_id, agent_id)
+        and stage_approvals_enabled
+    )
     for workflow in _WORKFLOWS:
         # The v2 poster pipeline replaces the v1 manifest for allowlisted
         # tenants/Agents only; by default the v1 contract is the only poster
@@ -1755,6 +1772,8 @@ async def preflight_workflow(
         # FR-V1: same clarification seam for the structured video brief.
         if not video_v2_workflow_allowed(tenant_id, agent_id):
             reasons.append("deliverable_video_v2_not_allowlisted")
+        if not deliverable_stage_approvals_enabled():
+            reasons.append("deliverable_stage_approvals_disabled")
         video_brief, video_missing = compile_video_brief(
             goal,
             normalized_spec,
@@ -1767,6 +1786,8 @@ async def preflight_workflow(
         # FR-P1: same clarification seam for the structured presentation brief.
         if not presentation_v2_workflow_allowed(tenant_id, agent_id):
             reasons.append("deliverable_presentation_v2_not_allowlisted")
+        if not deliverable_stage_approvals_enabled():
+            reasons.append("deliverable_stage_approvals_disabled")
         presentation_brief, presentation_missing = compile_presentation_brief(
             goal,
             normalized_spec,
@@ -1937,14 +1958,45 @@ async def preflight_workflow(
 
     if workflow.launch_policy == "dry_run":
         reasons.append("workflow_execution_not_enabled")
-    soft_reasons = {
+    non_capability_reasons = {
         "workflow_execution_not_enabled",
         "degraded_route_requires_confirmation",
+        "poster_exact_copy_contract_invalid",
+        "poster_layout_unfit",
     }
     reasons = list(dict.fromkeys(reasons))
-    hard_reasons = [reason for reason in reasons if reason not in soft_reasons]
+    capability_reasons = [
+        reason
+        for reason in reasons
+        if reason not in non_capability_reasons
+        and not reason.startswith("brief_missing:")
+    ]
+    if "deliverable_stage_approvals_disabled" in reasons:
+        next_action = (
+            "阶段审批总闸尚未开启；请继续使用 V1，或由管理员同时开启阶段审批与该账号的 V2 灰度后再试。"
+        )
+    elif any(reason.endswith("_not_allowlisted") for reason in reasons):
+        next_action = (
+            "该账号不在此 V2 工作流灰度范围；请继续使用 V1，或由管理员将当前公司或数字员工加入灰度白名单。"
+        )
+    else:
+        missing_fields = [
+            reason.split(":", 1)[1]
+            for reason in reasons
+            if reason.startswith("brief_missing:")
+        ]
+        if missing_fields:
+            next_action = (
+                "请补充工作说明中的必要字段："
+                + "、".join(missing_fields)
+                + "。补充完成前不会调用生成服务或扣除 Credits。"
+            )
+        elif "poster_exact_copy_contract_invalid" in reasons:
+            next_action = "请按精确文案字段重新整理海报文字；修正前不会提交图片生成。"
+        elif "poster_layout_unfit" in reasons:
+            next_action = "当前文案无法安全排入所选画幅；请减少文案或调整画面比例后重新检查。"
     result: dict[str, Any] = {
-        "available": not hard_reasons,
+        "available": not capability_reasons,
         "launchable": not reasons and workflow.launch_policy == "agent_runtime",
         "reasons": reasons,
         "capability_status": capability_status,
@@ -2544,7 +2596,19 @@ async def prepare_deliverable_launch(
             if execution is not None
             else []
         )
-        if execution is not None and execution.kind == "revision" and shot_units:
+        revision_snapshot = (
+            execution.contract_snapshot
+            if execution is not None
+            and isinstance(execution.contract_snapshot, Mapping)
+            else {}
+        )
+        revision_stage = str(revision_snapshot.get("revision_stage") or "")
+        if (
+            execution is not None
+            and execution.kind == "revision"
+            and revision_stage != "storyboard"
+            and shot_units
+        ):
             if not await storyboard_approved(
                 db,
                 tenant_id=request.tenant_id,
@@ -2636,7 +2700,10 @@ async def prepare_deliverable_launch(
                 str(item) for item in raw_targets if str(item).strip()
             ) if isinstance(raw_targets, (list, tuple)) else ()
             revision_instruction = execution.revision_instruction
-        if revision_targets:
+            revision_stage = str(snapshot.get("revision_stage") or "")
+        else:
+            revision_stage = ""
+        if revision_targets and revision_stage != "outline":
             prompt = build_deliverable_prompt(
                 request,
                 presentation_v2_stage="slide_revision",

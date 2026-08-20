@@ -286,7 +286,7 @@ async def reconcile_pending_payment_orders(
             await session.commit()
             return report
 
-    from app.services.billing_events import sync_pending_order_from_provider
+    from app.services.billing_events import close_expired_pending_order, sync_pending_order_from_provider
 
     result = await db.execute(
         select(PaymentOrder).where(
@@ -323,12 +323,26 @@ async def reconcile_pending_payment_orders(
                 order.provider,
             )
             continue
+        closed_expired = False
+        if not changed and order.status == "pending" and order.provider == "wechat":
+            expire_minutes = int(get_settings().WECHAT_PAY_ORDER_EXPIRE_MINUTES) or 120
+            expires_at = order.created_at + timedelta(minutes=expire_minutes) if order.created_at else None
+            if expires_at and expires_at <= now:
+                try:
+                    changed = await close_expired_pending_order(db, order)
+                    closed_expired = changed
+                except Exception:
+                    logger.exception(
+                        "[billing] provider close failed during reconciliation order_id={} provider={}",
+                        order.id,
+                        order.provider,
+                    )
         if changed:
             await db.commit()
             from app.services.subscription_lifecycle import apply_paid_subscribe_effects
 
             recovered = await db.get(PaymentOrder, order.id)
-            if recovered is not None:
+            if recovered is not None and recovered.status == "paid":
                 await apply_paid_subscribe_effects(recovered)
             logger.info(
                 "[billing] pending order recovered via provider query order_id={} provider={}",
@@ -337,12 +351,16 @@ async def reconcile_pending_payment_orders(
             )
             report.issues.append(
                 PaymentReconciliationIssue(
-                    code="recovered_via_provider_query",
+                    code="expired_order_closed" if closed_expired else "recovered_via_provider_query",
                     order_id=order.id,
                     tenant_id=order.tenant_id,
                     provider=order.provider,
-                    status="synced",
-                    message="pending order state was recovered by querying the provider",
+                    status="canceled" if closed_expired else "synced",
+                    message=(
+                        "expired pending order was closed at the provider"
+                        if closed_expired
+                        else "pending order state was recovered by querying the provider"
+                    ),
                 )
             )
     if report.issues:

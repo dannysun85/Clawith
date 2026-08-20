@@ -337,9 +337,14 @@ async def test_launchable_workflows_follow_the_presentation_v2_allowlist(monkeyp
         AsyncMock(return_value=True),
     )
     allowed = {"value": False}
+    stage_gate = {"value": False}
     monkeypatch.setattr(
         "app.services.deliverable_workflows.presentation_v2_workflow_allowed",
         lambda tenant_id, agent_id: allowed["value"],
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.deliverable_stage_approvals_enabled",
+        lambda: stage_gate["value"],
     )
 
     listing = await list_agent_launchable_workflows(
@@ -354,6 +359,17 @@ async def test_launchable_workflows_follow_the_presentation_v2_allowlist(monkeyp
     assert PRESENTATION_V2_WORKFLOW_ID not in ids
 
     allowed["value"] = True
+    listing = await list_agent_launchable_workflows(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        tier="pro",
+    )
+    ids = [workflow.workflow_id for workflow in listing]
+    assert "builtin.presentation.v1" in ids
+    assert PRESENTATION_V2_WORKFLOW_ID not in ids
+
+    stage_gate["value"] = True
     listing = await list_agent_launchable_workflows(
         SimpleNamespace(),  # type: ignore[arg-type]
         tenant_id=uuid.uuid4(),
@@ -380,6 +396,10 @@ def _mock_presentation_preflight(monkeypatch, *, allowed: bool = True) -> None:
     monkeypatch.setattr(
         "app.services.deliverable_workflows.presentation_v2_workflow_allowed",
         lambda tenant_id, agent_id: allowed,
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.deliverable_stage_approvals_enabled",
+        lambda: True,
     )
 
 
@@ -493,6 +513,36 @@ async def test_first_launch_drafts_outline_without_paid_work(monkeypatch) -> Non
     assert "call no generation or conversion Tool" in prepared.prompt
     # No prompt compilation receipts are written before outline approval.
     assert not any(isinstance(item, DeliverablePromptCompilation) for item in db.added)
+
+
+@pytest.mark.asyncio
+async def test_outline_revision_relaunches_planning_even_with_stale_targets(monkeypatch) -> None:
+    request = _request()
+    execution = _execution(request, kind="revision")
+    execution.contract_snapshot = {
+        "revision_stage": "outline",
+        "target_units": ["slide-02"],
+    }
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.preflight_workflow",
+        AsyncMock(return_value={"launchable": True, "reasons": []}),
+    )
+    db = _Session(request, execution, None)
+
+    prepared = await prepare_deliverable_launch(
+        db,  # type: ignore[arg-type]
+        request_id=request.id,
+        tenant_id=request.tenant_id,
+        user_id=request.created_by_user_id,
+        agent_id=request.agent_id,
+        session_id=request.session_id,
+        message_id=uuid.uuid4(),
+    )
+
+    assert request.current_stage == "outline_draft"
+    assert "call no generation or conversion Tool" in prepared.prompt
+    assert "slide_revision" not in prepared.prompt
+    assert not db.added
 
 
 @pytest.mark.asyncio
@@ -843,6 +893,66 @@ async def test_v2_outline_gate_requires_the_review_state(monkeypatch) -> None:
         )
     assert error.value.status_code == 409
     assert error.value.detail["code"] == "deliverable_stage_approval_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_outline_revision_records_planning_stage_without_targets(monkeypatch) -> None:
+    request = _request(status="waiting_approval", current_stage="outline_review")
+    execution = _execution(request)
+    user = _mock_approval_api(monkeypatch, request, execution, stage_approvals_enabled=True)
+    next_execution = SimpleNamespace(id=uuid.uuid4())
+    revision = AsyncMock(return_value=(next_execution, True))
+    monkeypatch.setattr(deliverables, "create_revision_execution", revision)
+    monkeypatch.setattr(
+        deliverables,
+        "_supersede_quality_reviews_for_revision",
+        AsyncMock(return_value=()),
+    )
+    db = _Session(None)
+    data = DeliverableApprovalIn(
+        expected_version=request.version,
+        client_action_id=uuid.uuid4(),
+        stage="outline",
+        action="request_changes",
+        instruction="调整第 2 页逻辑，但先重新确认大纲",
+    )
+
+    await deliverables.record_deliverable_approval(
+        request.id,
+        data,
+        user,  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+    )
+
+    assert revision.await_args.kwargs["revision_stage"] == "outline"
+    assert revision.await_args.kwargs["target_units"] == []
+
+
+@pytest.mark.asyncio
+async def test_outline_revision_rejects_slide_targets_before_approval(monkeypatch) -> None:
+    request = _request(status="waiting_approval", current_stage="outline_review")
+    execution = _execution(request)
+    user = _mock_approval_api(monkeypatch, request, execution, stage_approvals_enabled=True)
+    db = _Session(None)
+    data = DeliverableApprovalIn(
+        expected_version=request.version,
+        client_action_id=uuid.uuid4(),
+        stage="outline",
+        action="request_changes",
+        instruction="重新调整大纲",
+        target_units=["slide-02"],
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await deliverables.record_deliverable_approval(
+            request.id,
+            data,
+            user,  # type: ignore[arg-type]
+            db,  # type: ignore[arg-type]
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == "deliverable_revision_target_not_allowed"
 
 
 # ─── paid-work tool gates ───────────────────────────────────────

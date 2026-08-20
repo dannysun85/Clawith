@@ -59,6 +59,7 @@ def execution_contract_snapshot(
     *,
     revision_instruction: str | None = None,
     target_units: Sequence[str] = (),
+    revision_stage: str | None = None,
 ) -> dict[str, Any]:
     """Freeze the customer and platform-owned contract for one execution."""
 
@@ -77,6 +78,7 @@ def execution_contract_snapshot(
         "output_contract": list(request.output_contract or []),
         "revision_instruction": revision_instruction,
         "target_units": list(target_units),
+        "revision_stage": revision_stage,
     }
 
 
@@ -246,11 +248,13 @@ def build_execution_shadow(
     current_stage: str,
     revision_instruction: str | None = None,
     target_units: Sequence[str] = (),
+    revision_stage: str | None = None,
 ) -> tuple[DeliverableExecution, tuple[DeliverableExecutionUnit, ...]]:
     contract_snapshot = execution_contract_snapshot(
         request,
         revision_instruction=revision_instruction,
         target_units=target_units,
+        revision_stage=revision_stage,
     )
     execution = DeliverableExecution(
         id=uuid.uuid4(),
@@ -540,6 +544,7 @@ async def create_revision_execution(
     client_revision_id: uuid.UUID,
     instruction: str,
     target_units: Sequence[str] = (),
+    revision_stage: str | None = None,
 ) -> tuple[DeliverableExecution, bool]:
     """Create a new execution without mutating prior run or Artifact facts."""
 
@@ -555,6 +560,7 @@ async def create_revision_execution(
         request,
         revision_instruction=cleaned_instruction,
         target_units=normalized_targets,
+        revision_stage=revision_stage,
     )
     revision_fingerprint = _canonical_sha256(revision_contract)
     existing_result = await db.execute(
@@ -608,6 +614,7 @@ async def create_revision_execution(
         current_stage="revision_ready",
         revision_instruction=cleaned_instruction,
         target_units=normalized_targets,
+        revision_stage=revision_stage,
     )
     # ``build_execution_shadow`` snapshots the incremented contract revision.
     if execution.request_fingerprint != revision_fingerprint:

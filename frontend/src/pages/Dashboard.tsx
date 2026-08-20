@@ -359,6 +359,10 @@ export default function Dashboard() {
         queryKey: ['workforce-topology', currentTenant, accessSignature, 24],
         queryFn: () => workforceApi.topology(24),
         refetchInterval: 15000,
+        refetchIntervalInBackground: false,
+        refetchOnMount: 'always',
+        refetchOnWindowFocus: 'always',
+        refetchOnReconnect: 'always',
     });
     const employeeAgents = topology?.nodes ?? [];
 

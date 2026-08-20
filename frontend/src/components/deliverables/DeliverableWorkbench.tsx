@@ -30,6 +30,7 @@ import {
 } from '../../services/api';
 import {
     deliverableApprovalBlocked,
+    deliverableNextAction,
 } from '../../utils/deliverables';
 import type { SaasTier } from '../TierSelector';
 
@@ -90,6 +91,7 @@ function preflightReasonLabel(reason: string, isZh: boolean) {
         deliverable_poster_v2_not_allowlisted: ['多候选图片流程尚未对该账号开放', 'The multi-candidate image pipeline is not enabled for this account'],
         deliverable_video_v2_not_allowlisted: ['分镜视频流程尚未对该账号开放', 'The storyboard-gated video pipeline is not enabled for this account'],
         deliverable_presentation_v2_not_allowlisted: ['大纲审批 PPT 流程尚未对该账号开放', 'The outline-gated presentation pipeline is not enabled for this account'],
+        deliverable_stage_approvals_disabled: ['阶段审批总闸尚未开启，V2 不可进入制作', 'Staged approvals are disabled, so V2 cannot enter production'],
         audio_mode_route_mismatch: ['镜头内同步对白需要具备原生音轨能力的线路，请改用旁白或静音模式', 'In-scene dialogue needs a native-audio route; switch to voiceover or silent'],
     };
     if (reason.startsWith('brief_missing:')) {
@@ -189,6 +191,7 @@ export function DeliverableLauncher({
     const [checking, setChecking] = useState(false);
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
+    const [preflight, setPreflight] = useState<DeliverablePreflight | null>(null);
     const [showAdvanced, setShowAdvanced] = useState(false);
     const [clientRequestId, setClientRequestId] = useState(() => crypto.randomUUID());
 
@@ -221,6 +224,7 @@ export function DeliverableLauncher({
                 if (initial) {
                     setSelectedType(initial.work_type);
                     setSpec(initialSpec(initial));
+                    setPreflight(null);
                 }
             })
             .catch((nextError) => {
@@ -268,6 +272,7 @@ export function DeliverableLauncher({
         setSpec(mergedSpec);
         setGoal(initialGoal.trim());
         setError('');
+        setPreflight(null);
         setShowAdvanced(
             Object.keys(initialSpecOverrides || {}).some((key) => optionalFieldKeys.has(key)),
         );
@@ -337,12 +342,14 @@ export function DeliverableLauncher({
         setSelectedType(workflow.work_type);
         setSpec(initialSpec(workflow));
         setError('');
+        setPreflight(null);
         setClientRequestId(crypto.randomUUID());
     };
 
     const updateField = (key: string, value: string | number) => {
         setSpec((current) => ({ ...current, [key]: value }));
         setError('');
+        setPreflight(null);
     };
 
     const renderWorkflowField = (field: DeliverableWorkflow['fields'][number]) => {
@@ -425,19 +432,21 @@ export function DeliverableLauncher({
                 tier,
             });
             setSpec(result.normalized_spec);
+            setPreflight(result);
             if (!result.available) {
                 const reasonText = result.reasons.length > 0
                     ? result.reasons.map((reason) => preflightReasonLabel(reason, isZh)).join(isZh ? '；' : '; ')
                     : (isZh ? '当前账号没有可用的执行路由' : 'No execution route is available for this account');
                 setError(
                     isZh
-                        ? `当前账号或档位暂不支持立即启动这项交付；工作说明仍可保存，不会扣 Credits。原因：${reasonText}`
-                        : `This account or tier cannot start this delivery right now. The brief can still be saved and no Credits will be spent. Reason: ${reasonText}`,
+                        ? `当前账号或档位暂不支持立即启动这项交付；工作说明仍可保存，不会扣 Credits。原因：${reasonText}。下一步：${result.next_action}`
+                        : `This account or tier cannot start this delivery right now. The brief can still be saved and no Credits will be spent. Reason: ${reasonText}. Next: ${result.next_action}`,
                 );
             }
             return result;
         } catch (nextError) {
             const message = nextError instanceof Error ? nextError.message : String(nextError);
+            setPreflight(null);
             setError(message);
             return null;
         } finally {
@@ -480,7 +489,12 @@ export function DeliverableLauncher({
                 approval_policy: selectedWorkflow.approval_policy,
                 output_contract: selectedWorkflow.output_contract,
             });
-            onCreated(request, result.launchable);
+            const requestWithPreflight: DeliverableRequest = {
+                ...request,
+                latest_preflight: request.latest_preflight
+                    || result as unknown as Record<string, unknown>,
+            };
+            onCreated(requestWithPreflight, result.launchable);
             setOpen(false);
             setClientRequestId(crypto.randomUUID());
             toast.success(
@@ -493,6 +507,7 @@ export function DeliverableLauncher({
                     : result.launchable
                         ? (isZh ? '工作说明已保存，可在对话中确认启动' : 'Brief saved and ready to launch in chat')
                         : (isZh ? '工作说明已保存；当前阶段不会调用生成服务' : 'Brief saved; generation is not started in this phase'),
+                { details: result.next_action },
             );
             window.setTimeout(() => triggerRef.current?.focus(), 0);
         } catch (nextError) {
@@ -583,7 +598,7 @@ export function DeliverableLauncher({
                                     <span>{isZh ? '交付目标' : 'Outcome'} <em>*</em></span>
                                     <textarea
                                         value={goal}
-                                        onChange={(event) => { setGoal(event.target.value); setError(''); }}
+                                        onChange={(event) => { setGoal(event.target.value); setError(''); setPreflight(null); }}
                                         placeholder={isZh ? '例如：用上传的产品资料制作一份面向经销商的招商演示，突出卖点、渠道政策和合作方式' : 'e.g. Create a partner pitch from the attached product material, focusing on benefits, channel terms, and next steps'}
                                         rows={3}
                                     />
@@ -603,6 +618,26 @@ export function DeliverableLauncher({
                                 )}
                                 {showAdvanced && optionalWorkflowFields.map(renderWorkflowField)}
                                 {error && <div className="deliverable-error" role="alert">{error}</div>}
+                                {preflight && (
+                                    <div className={`deliverable-preflight ${preflight.launchable ? 'is-ready' : 'is-blocked'}`}>
+                                        <span className="deliverable-preflight__icon">
+                                            {preflight.launchable
+                                                ? <IconCheck size={18} stroke={1.8} />
+                                                : <IconAlertCircle size={18} stroke={1.8} />}
+                                        </span>
+                                        <div>
+                                            <strong>
+                                                {preflight.launchable
+                                                    ? (isZh ? '能力检查通过' : 'Capability check passed')
+                                                    : (isZh ? '暂不可启动' : 'Not ready to launch')}
+                                            </strong>
+                                            {preflight.reasons.length > 0 && (
+                                                <p>{preflight.reasons.map((reason) => preflightReasonLabel(reason, isZh)).join(isZh ? '；' : '; ')}</p>
+                                            )}
+                                            <small>{preflight.next_action}</small>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                             <div className="deliverable-input-summary">
                                 <span>{isZh ? '已附加资料' : 'Attached references'}</span>
@@ -663,6 +698,7 @@ export function DeliverableRequestCard({ request, launchable, onRemove, onOpen, 
     const [clarifyError, setClarifyError] = useState('');
     const [clarifySaving, setClarifySaving] = useState(false);
     const clarifying = request.current_stage === 'brief_clarifying';
+    const nextAction = deliverableNextAction(request);
     const label = {
         presentation: isZh ? 'PPT 演示文稿' : 'Presentation',
         poster: isZh ? '海报 / 图片' : 'Poster / Image',
@@ -726,6 +762,7 @@ export function DeliverableRequestCard({ request, launchable, onRemove, onOpen, 
                                 ? (isZh ? '工作说明已保存 · 发送后启动' : 'Brief saved · send to launch')
                                 : (isZh ? '工作说明已保存 · 暂不启动生成' : 'Brief saved · generation not started')}
                     </small>
+                    {!launchable && nextAction && <small>{nextAction}</small>}
                 </span>
                 <em>{request.tier.toUpperCase()}</em>
             </button>
@@ -940,6 +977,20 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     const currentExecution = executions.find((item) => item.id === request.current_execution_id)
         || executions[0];
     const revisionUnits = uniqueRevisionUnits(currentExecution?.units || []);
+    const failedShotKeys = [...new Set(
+        (currentExecution?.units || [])
+            .filter((unit) => (
+                unit.status === 'failed'
+                && (unit.stage_key === 'shot_generate' || unit.stage_key === 'shot_qa')
+                && /^shot-\d+$/.test(unit.unit_key)
+            ))
+            .map((unit) => unit.unit_key),
+    )].sort();
+    const selectableRevisionUnits = storyboardReview || outlineReview
+        ? []
+        : shotReview
+            ? revisionUnits.filter((unit) => failedShotKeys.includes(unit.unit_key))
+            : revisionUnits;
     const candidateWallUnits = (currentExecution?.units || []).filter(
         (unit) => unit.stage_key === 'candidate_generate',
     );
@@ -1027,14 +1078,14 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         if (storyboardReview) {
             return {
                 title: isZh ? '分镜待批准' : 'Storyboard awaiting approval',
-                description: isZh ? '批准分镜后才开始付费生成；批准前零费用' : 'Paid generation starts only after you approve the storyboard',
+                description: isZh ? '批准只解除制作门禁；再发送一条聊天消息后才开始付费生成' : 'Approval only releases the gate; paid generation starts after your next chat message',
                 step: 1,
             };
         }
         if (outlineReview) {
             return {
                 title: isZh ? '大纲待批准' : 'Outline awaiting approval',
-                description: isZh ? '批准大纲后才开始排版制作；批准前零费用' : 'Production starts only after you approve the outline',
+                description: isZh ? '批准只解除制作门禁；再发送一条聊天消息后才开始排版制作' : 'Approval only releases the gate; production starts after your next chat message',
                 step: 1,
             };
         }
@@ -1234,7 +1285,14 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
             toast.error(isZh ? '请说明需要修改的内容' : 'Describe the requested changes');
             return;
         }
-        const fingerprint = JSON.stringify([instruction, selectedRevisionUnits]);
+        const revisionTargets = storyboardReview || outlineReview
+            ? []
+            : selectedRevisionUnits;
+        if (shotReview && revisionTargets.length === 0) {
+            toast.error(isZh ? '请选择至少一个失败镜头' : 'Select at least one failed shot');
+            return;
+        }
+        const fingerprint = JSON.stringify([instruction, revisionTargets]);
         if (revisionActionRef.current?.fingerprint !== fingerprint) {
             revisionActionRef.current = { fingerprint, id: crypto.randomUUID() };
         }
@@ -1248,7 +1306,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                 stage: storyboardReview ? 'storyboard' : outlineReview ? 'outline' : 'final',
                 action: 'request_changes',
                 instruction,
-                target_units: selectedRevisionUnits,
+                target_units: revisionTargets,
             });
             onUpdated(updated);
             setRevisionOpen(false);
@@ -1266,6 +1324,15 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         } finally {
             setActing(null);
         }
+    };
+
+    const toggleRevisionForm = () => {
+        if (revisionOpen) {
+            setRevisionOpen(false);
+            return;
+        }
+        setSelectedRevisionUnits(shotReview ? failedShotKeys : []);
+        setRevisionOpen(true);
     };
 
     useEffect(() => {
@@ -1819,13 +1886,15 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         placeholder={isZh ? '例如：第 3 页减少文字并突出核心数据，第 5 页更换人物主视觉。' : 'For example: simplify slide 3 and emphasize the key metric; replace the hero image on slide 5.'}
                         onChange={(event) => setRevisionInstruction(event.target.value)}
                     />
-                    {revisionUnits.length > 0 && (
+                    {selectableRevisionUnits.length > 0 && (
                         <fieldset>
                             <legend>
-                                {isZh ? '只修改指定部分（可选）' : 'Limit changes to selected items (optional)'}
+                                {shotReview
+                                    ? (isZh ? '选择需要重做的失败镜头（必选）' : 'Select failed shots to redo (required)')
+                                    : (isZh ? '只修改指定部分（可选）' : 'Limit changes to selected items (optional)')}
                             </legend>
                             <div className="deliverable-revision-form__units">
-                                {revisionUnits.map((unit) => {
+                                {selectableRevisionUnits.map((unit) => {
                                     const checked = selectedRevisionUnits.includes(unit.unit_key);
                                     return (
                                         <label key={unit.unit_key}>
@@ -1848,7 +1917,9 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                             <small>
                                 {selectedRevisionUnits.length > 0
                                     ? (isZh ? `已选择 ${selectedRevisionUnits.length} 项，其余内容沿用当前版本。` : `${selectedRevisionUnits.length} selected; other content carries forward.`)
-                                    : (isZh ? '不选择则按修改说明更新整份交付。' : 'Leave empty to revise the whole deliverable according to the instruction.')}
+                                    : shotReview
+                                        ? (isZh ? '必须选择失败镜头；已通过镜头不会被重新提交或计费。' : 'A failed shot is required; passed shots will not be resubmitted or re-billed.')
+                                        : (isZh ? '不选择则按修改说明更新整份交付。' : 'Leave empty to revise the whole deliverable according to the instruction.')}
                             </small>
                         </fieldset>
                     )}
@@ -1864,7 +1935,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         <button
                             type="button"
                             className="btn btn-primary"
-                            disabled={acting !== null || revisionInstruction.trim().length < 3}
+                            disabled={acting !== null || revisionInstruction.trim().length < 3 || (shotReview && selectedRevisionUnits.length === 0)}
                             onClick={() => void submitRevision()}
                         >
                             {acting === 'request_changes'
@@ -1880,7 +1951,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         type="button"
                         className="btn btn-secondary"
                         disabled={acting !== null}
-                        onClick={() => setRevisionOpen((open) => !open)}
+                        onClick={toggleRevisionForm}
                     >
                         {revisionOpen
                             ? (isZh ? '收起修改说明' : 'Hide revision form')
@@ -1904,7 +1975,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         type="button"
                         className="btn btn-secondary"
                         disabled={acting !== null}
-                        onClick={() => setRevisionOpen((open) => !open)}
+                        onClick={toggleRevisionForm}
                     >
                         {revisionOpen
                             ? (isZh ? '收起修改说明' : 'Hide revision form')
@@ -1918,7 +1989,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     >
                         {acting === 'approve'
                             ? (isZh ? '正在批准…' : 'Approving…')
-                            : (isZh ? '批准分镜并开始制作' : 'Approve storyboard')}
+                            : (isZh ? '批准分镜（下一步发送消息）' : 'Approve storyboard (send next)')}
                     </button>
                 </div>
             )}
@@ -1928,7 +1999,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         type="button"
                         className="btn btn-secondary"
                         disabled={acting !== null}
-                        onClick={() => setRevisionOpen((open) => !open)}
+                        onClick={toggleRevisionForm}
                     >
                         {revisionOpen
                             ? (isZh ? '收起修改说明' : 'Hide revision form')
@@ -1942,7 +2013,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     >
                         {acting === 'approve'
                             ? (isZh ? '正在批准…' : 'Approving…')
-                            : (isZh ? '批准大纲并开始制作' : 'Approve outline')}
+                            : (isZh ? '批准大纲（下一步发送消息）' : 'Approve outline (send next)')}
                     </button>
                 </div>
             )}
@@ -1951,8 +2022,8 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     <button
                         type="button"
                         className="btn btn-primary"
-                        disabled={acting !== null}
-                        onClick={() => setRevisionOpen((open) => !open)}
+                        disabled={acting !== null || failedShotKeys.length === 0}
+                        onClick={toggleRevisionForm}
                     >
                         {revisionOpen
                             ? (isZh ? '收起修改说明' : 'Hide revision form')

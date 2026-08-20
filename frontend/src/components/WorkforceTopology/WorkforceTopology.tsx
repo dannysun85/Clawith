@@ -25,12 +25,14 @@ import { useNavigate } from 'react-router';
 import type {
     WorkforceTopology as WorkforceTopologyData,
     WorkforceTopologyActivity,
+    WorkforceTopologyExecution,
     WorkforceTopologyNode,
     WorkforceTopologyWork,
 } from '../../services/api';
 import {
     computeTopologyLayout,
     filterTopologyNodes,
+    topologyExecutionWorkGroup,
     topologyNodeIdKey,
     TOPOLOGY_CENTER_HEIGHT,
     TOPOLOGY_CENTER_WIDTH,
@@ -83,6 +85,20 @@ function workGroupLabel(
     return t(`dashboard.topology.work.${group}`);
 }
 
+function executionStatusLabel(
+    status: WorkforceTopologyExecution['status'],
+    t: ReturnType<typeof useTranslation>['t'],
+): string {
+    return t(`dashboard.topology.executionStatus.${status}`);
+}
+
+function executionSourceLabel(
+    source: WorkforceTopologyExecution['source_type'],
+    t: ReturnType<typeof useTranslation>['t'],
+): string {
+    return t(`dashboard.topology.executionSource.${source}`);
+}
+
 function AgentAvatar({ node, size = 30 }: { node: WorkforceTopologyNode; size?: number }) {
     const initial = Array.from(node.name.trim())[0]?.toUpperCase() || 'A';
     return (
@@ -104,7 +120,8 @@ function NodeCard({
     onSelect: () => void;
 }) {
     const { t } = useTranslation();
-    const workGroup = work?.stage ?? 'no_work';
+    const workGroup = topologyExecutionWorkGroup(node);
+    const currentTitle = node.execution?.title || work?.title;
     return (
         <button
             type="button"
@@ -133,7 +150,7 @@ function NodeCard({
                     {workGroupLabel(workGroup, t)}
                 </span>
                 <span className="workforce-node__work-title">
-                    {work?.title || t('dashboard.topology.noCurrentWork')}
+                    {currentTitle || t('dashboard.topology.noCurrentWork')}
                 </span>
             </span>
         </button>
@@ -196,7 +213,8 @@ function WorkforceNodeDrawer({
         };
     }, [onClose]);
 
-    const workGroup = work?.stage ?? 'no_work';
+    const execution = node.execution ?? undefined;
+    const workGroup = topologyExecutionWorkGroup(node);
     return createPortal(
         <div className="workforce-drawer-layer">
             <button
@@ -241,6 +259,22 @@ function WorkforceNodeDrawer({
                             </strong>
                         </div>
                         <div>
+                            <span>{t('dashboard.topology.executionStatusLabel')}</span>
+                            <strong>
+                                {execution
+                                    ? executionStatusLabel(execution.status, t)
+                                    : t('dashboard.topology.noCurrentWork')}
+                            </strong>
+                        </div>
+                        <div>
+                            <span>{t('dashboard.topology.executionSourceLabel')}</span>
+                            <strong>
+                                {execution
+                                    ? executionSourceLabel(execution.source_type, t)
+                                    : '—'}
+                            </strong>
+                        </div>
+                        <div>
                             <span>{t('dashboard.topology.workStage')}</span>
                             <strong>
                                 <span className="workforce-work-chip" data-work={workGroup}>
@@ -259,8 +293,33 @@ function WorkforceNodeDrawer({
                     </section>
 
                     <section className="workforce-drawer__section">
-                        <h3>{t('dashboard.topology.currentWork')}</h3>
-                        {work ? (
+                        <h3>{t('dashboard.topology.currentExecution')}</h3>
+                        {execution ? (
+                            <button
+                                type="button"
+                                className="workforce-drawer__work-card"
+                                onClick={() => navigate(execution.deep_link)}
+                            >
+                                <span className="workforce-work-chip" data-work={workGroup}>
+                                    {executionStatusLabel(execution.status, t)}
+                                </span>
+                                <strong>{execution.title}</strong>
+                                <span>{execution.summary}</span>
+                                {execution.phase && (
+                                    <small>{t('dashboard.topology.executionPhase', { phase: execution.phase })}</small>
+                                )}
+                                {execution.active_count > 1 && (
+                                    <small>{t('dashboard.topology.moreActiveWork', { count: execution.active_count - 1 })}</small>
+                                )}
+                            </button>
+                        ) : (
+                            <p className="workforce-drawer__empty">{t('dashboard.topology.noCurrentWork')}</p>
+                        )}
+                    </section>
+
+                    {work && work.id !== execution?.id && (
+                        <section className="workforce-drawer__section">
+                            <h3>{t('dashboard.topology.currentWork')}</h3>
                             <button
                                 type="button"
                                 className="workforce-drawer__work-card"
@@ -271,14 +330,9 @@ function WorkforceNodeDrawer({
                                 </span>
                                 <strong>{work.title}</strong>
                                 <span>{work.summary}</span>
-                                {work.active_count > 1 && (
-                                    <small>{t('dashboard.topology.moreActiveWork', { count: work.active_count - 1 })}</small>
-                                )}
                             </button>
-                        ) : (
-                            <p className="workforce-drawer__empty">{t('dashboard.topology.noCurrentWork')}</p>
-                        )}
-                    </section>
+                        </section>
+                    )}
 
                     <section className="workforce-drawer__section">
                         <h3>{t('dashboard.topology.latestActivity')}</h3>
@@ -540,6 +594,7 @@ export default function WorkforceTopology({ topology }: WorkforceTopologyProps) 
                 >
                     <option value="all">{t('dashboard.topology.allWork')}</option>
                     <option value="executing">{t('dashboard.topology.work.executing')}</option>
+                    <option value="waiting">{t('dashboard.topology.work.waiting')}</option>
                     <option value="review">{t('dashboard.topology.work.review')}</option>
                     <option value="approval">{t('dashboard.topology.work.approval')}</option>
                     <option value="blocked">{t('dashboard.topology.work.blocked')}</option>
@@ -726,7 +781,7 @@ export default function WorkforceTopology({ topology }: WorkforceTopologyProps) 
 
                         <div className="workforce-topology__mobile-list">
                             {visibleNodes.map((node) => {
-                                const work = workByAgent.get(node.id);
+                                const workGroup = topologyExecutionWorkGroup(node);
                                 return (
                                     <button
                                         type="button"
@@ -739,8 +794,8 @@ export default function WorkforceTopology({ topology }: WorkforceTopologyProps) 
                                             <strong>{node.name}</strong>
                                             <small>{node.role_description || t('dashboard.topology.noRole')}</small>
                                         </span>
-                                        <span className="workforce-work-chip" data-work={work?.stage ?? 'no_work'}>
-                                            {workGroupLabel(work?.stage ?? 'no_work', t)}
+                                        <span className="workforce-work-chip" data-work={workGroup}>
+                                            {workGroupLabel(workGroup, t)}
                                         </span>
                                         <i className="workforce-node__status" data-status={node.status} />
                                     </button>

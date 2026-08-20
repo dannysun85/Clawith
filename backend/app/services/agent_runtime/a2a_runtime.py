@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -17,11 +18,14 @@ from app.core.permissions import (
 )
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
+from app.models.agent_run_event import AgentRunEvent
 from app.models.agent_tool_execution import AgentToolExecution
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.ceo import CeoOrchestratorSettings
 from app.models.gateway_message import GatewayMessage
 from app.models.org import AgentAgentRelationship
+from app.models.tool import AgentTool, Tool
 from app.services.agent_runtime.adapter import RuntimeCommandIntake
 from app.services.agent_runtime.command_worker import RuntimeSessionFactory
 from app.services.agent_runtime.config import decide_runtime_v2
@@ -42,6 +46,7 @@ from app.services.agent_runtime.tool_execution import (
     mark_tool_execution_succeeded,
 )
 from app.services import agent_directory
+from app.services.ceo_briefing import ceo_coordination_allowed
 from app.services.participant_identity import get_or_create_agent_participant
 
 
@@ -89,6 +94,109 @@ class _A2ARequest:
     target_name: str | None
     message: str
     mode: A2AMode
+    delegation_contract: dict | None
+
+
+def _bounded_string_list(
+    value: object,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int,
+    item_max_chars: int,
+) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            f"delegation_contract.{field} must be an array",
+        )
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item.strip()) > item_max_chars:
+            raise A2ARuntimeError(
+                "a2a_delegation_contract_invalid",
+                f"delegation_contract.{field} contains an invalid item",
+            )
+        normalized.append(item.strip())
+    normalized = list(dict.fromkeys(normalized))
+    if not minimum <= len(normalized) <= maximum:
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            f"delegation_contract.{field} must contain {minimum} to {maximum} items",
+        )
+    return normalized
+
+
+def _delegation_contract(arguments: Mapping[str, object], mode: A2AMode) -> dict | None:
+    raw = arguments.get("delegation_contract")
+    if raw is None:
+        return None
+    if mode != "task_delegate" or not isinstance(raw, Mapping):
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            "delegation_contract is supported only for task_delegate and must be an object",
+        )
+    if raw.get("version") != 1:
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            "delegation_contract.version must be 1",
+        )
+    title = raw.get("title")
+    objective = raw.get("objective")
+    if not isinstance(title, str) or not title.strip() or len(title.strip()) > 200:
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            "delegation_contract.title must be 1 to 200 characters",
+        )
+    if not isinstance(objective, str) or not objective.strip() or len(objective.strip()) > 2000:
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            "delegation_contract.objective must be 1 to 2000 characters",
+        )
+    required_capabilities = _bounded_string_list(
+        raw.get("required_capabilities"),
+        field="required_capabilities",
+        minimum=1,
+        maximum=8,
+        item_max_chars=100,
+    )
+    acceptance_criteria = _bounded_string_list(
+        raw.get("acceptance_criteria"),
+        field="acceptance_criteria",
+        minimum=1,
+        maximum=8,
+        item_max_chars=500,
+    )
+    expected_artifacts = _bounded_string_list(
+        raw.get("expected_artifacts", []),
+        field="expected_artifacts",
+        minimum=0,
+        maximum=8,
+        item_max_chars=200,
+    )
+    requires_artifact_delivery = raw.get(
+        "requires_artifact_delivery",
+        bool(expected_artifacts),
+    )
+    if not isinstance(requires_artifact_delivery, bool):
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            "delegation_contract.requires_artifact_delivery must be boolean",
+        )
+    if expected_artifacts and not requires_artifact_delivery:
+        raise A2ARuntimeError(
+            "a2a_delegation_contract_invalid",
+            "expected artifacts require an Agent file delivery receipt",
+        )
+    return {
+        "version": 1,
+        "title": title.strip(),
+        "objective": objective.strip(),
+        "required_capabilities": required_capabilities,
+        "acceptance_criteria": acceptance_criteria,
+        "expected_artifacts": expected_artifacts,
+        "requires_artifact_delivery": requires_artifact_delivery,
+    }
 
 
 def _request(arguments: dict) -> _A2ARequest:
@@ -115,11 +223,13 @@ def _request(arguments: dict) -> _A2ARequest:
             "a2a_mode_invalid",
             "A2A msg_type must be notify, consult, or task_delegate",
         )
+    mode = cast(A2AMode, raw_mode)
     return _A2ARequest(
         target_agent_id=target_agent_id,
         target_name=target_name or None,
         message=message,
-        mode=raw_mode,  # type: ignore[arg-type]
+        mode=mode,
+        delegation_contract=_delegation_contract(arguments, mode),
     )
 
 
@@ -157,7 +267,7 @@ def a2a_mode_from_correlation(correlation_id: str) -> A2AMode:
             "a2a_correlation_invalid",
             "A2A correlation ID has an invalid occurrence UUID",
         ) from exc
-    return mode  # type: ignore[return-value]
+    return cast(A2AMode, mode)
 
 
 def a2a_waiting_request(
@@ -198,6 +308,112 @@ def a2a_waiting_request(
         "reason": f"waiting_for_{request.mode}",
         ref_field: str(target_ref_id),
     }
+
+
+async def _enforce_ceo_dispatch_authority(
+    db: AsyncSession,
+    *,
+    source_agent: Agent,
+    source_run: AgentRun,
+    mode: A2AMode,
+    runtime_settings: Settings,
+    delegation_contract: dict | None = None,
+) -> CeoOrchestratorSettings | None:
+    """Keep P1 observer and P2 coordinator authority server-owned.
+
+    Ordinary Agents do not pay an extra query. A system Agent is treated as a
+    CEO only when it owns the tenant's persisted CEO settings row.
+    """
+    if not bool(getattr(source_agent, "is_system", False)):
+        return None
+    result = await db.execute(
+        select(CeoOrchestratorSettings).where(
+            CeoOrchestratorSettings.tenant_id == source_agent.tenant_id,
+            CeoOrchestratorSettings.ceo_agent_id == source_agent.id,
+        )
+    )
+    ceo_settings = result.scalar_one_or_none()
+    if ceo_settings is None:
+        return None
+    if mode == "consult":
+        return ceo_settings
+    if not ceo_coordination_allowed(
+        ceo_settings,
+        runtime_settings=runtime_settings,
+    ):
+        raise A2ARuntimeError(
+            "ceo_coordination_required",
+            "CEO observer mode may consult but cannot notify or delegate work",
+        )
+    if source_run.source_type != "chat" and not bool(
+        getattr(ceo_settings, "auto_dispatch_enabled", False)
+    ):
+        raise A2ARuntimeError(
+            "ceo_auto_dispatch_required",
+            "CEO non-chat Runs cannot dispatch until autonomous dispatch is enabled",
+        )
+    if mode == "task_delegate":
+        if delegation_contract is None:
+            raise A2ARuntimeError(
+                "ceo_delegation_contract_required",
+                "CEO task delegation requires a structured delegation_contract",
+            )
+        terminal_event = exists().where(
+            AgentRunEvent.tenant_id == AgentRun.tenant_id,
+            AgentRunEvent.run_id == AgentRun.id,
+            AgentRunEvent.event_type.in_(
+                ["run_completed", "run_failed", "run_cancelled"]
+            ),
+        )
+        active_result = await db.execute(
+            select(func.count(AgentRun.id)).where(
+                AgentRun.tenant_id == source_agent.tenant_id,
+                AgentRun.origin_agent_id == source_agent.id,
+                AgentRun.run_kind == "delegated",
+                ~terminal_event,
+            )
+        )
+        active_count = int(active_result.scalar_one() or 0)
+        maximum = int(getattr(ceo_settings, "max_parallel_delegations", 3) or 3)
+        if active_count >= maximum:
+            raise A2ARuntimeError(
+                "ceo_parallel_delegation_limit",
+                f"CEO already has {active_count} active delegated Runs (limit {maximum})",
+            )
+    return ceo_settings
+
+
+async def _validate_ceo_target_capabilities(
+    db: AsyncSession,
+    *,
+    ceo_settings: CeoOrchestratorSettings | None,
+    target: Agent,
+    delegation_contract: dict | None,
+) -> None:
+    """Require current enabled grants for every CEO-routed task capability."""
+    if ceo_settings is None or delegation_contract is None:
+        return
+    required = set(delegation_contract["required_capabilities"])
+    if delegation_contract["requires_artifact_delivery"]:
+        required.add("send_file_to_agent")
+    result = await db.execute(
+        select(Tool.name)
+        .join(AgentTool, AgentTool.tool_id == Tool.id)
+        .where(
+            AgentTool.agent_id == target.id,
+            AgentTool.enabled.is_(True),
+            Tool.enabled.is_(True),
+            Tool.name.in_(sorted(required)),
+            (Tool.tenant_id.is_(None) | (Tool.tenant_id == target.tenant_id)),
+        )
+    )
+    granted = set(result.scalars().all())
+    missing = sorted(required - granted)
+    if missing:
+        raise A2ARuntimeError(
+            "ceo_target_capability_missing",
+            "Target Agent lacks enabled capability grants: " + ", ".join(missing),
+        )
 
 
 def _session_id(tenant_id: uuid.UUID, first: uuid.UUID, second: uuid.UUID) -> uuid.UUID:
@@ -716,22 +932,68 @@ def _target_goal(source_agent: Agent, request: _A2ARequest) -> str:
         prefix = "Answer this concise consultation from another Agent"
     else:
         prefix = "Complete this delegated task and return a usable result"
+    if request.delegation_contract is not None:
+        return (
+            f"{prefix}. Source Agent: {source_agent.name}. "
+            f"Contract objective: {request.delegation_contract['objective']}"
+        )
     return f"{prefix}. Source Agent: {source_agent.name}. Request: {request.message}"
 
 
-def _target_runtime_instruction(mode: A2AMode) -> str:
+def _target_runtime_instruction(
+    mode: A2AMode,
+    *,
+    source_agent_id: uuid.UUID,
+    delegation_contract: dict | None,
+) -> str:
     if mode in _RESPONSE_MODES:
-        return (
+        instruction = (
             "This Run was initiated by another digital employee through Astra "
             "A2A. The verified final answer is returned to the source Run "
             "automatically. Do not call send_message_to_agent merely to return "
             "this answer."
         )
+        if delegation_contract is not None:
+            instruction += (
+                " This task has a server-owned delegation_contract in Source "
+                "Context. Satisfy every acceptance criterion and use every required "
+                "capability through its actual tool; a narrative claim is not a tool "
+                "receipt."
+            )
+            if delegation_contract["requires_artifact_delivery"]:
+                instruction += (
+                    " Before finish, deliver every requested artifact by calling "
+                    f"send_file_to_agent(target_agent_id=\"{source_agent_id}\", "
+                    "file_path=\"<path>\"). Do not finish until that call returns a "
+                    "confirmed delivery receipt."
+                )
+        return instruction
     return (
         "This is a one-way Astra A2A notification. Process it within the "
         "authorized scope and do not call send_message_to_agent merely to "
         "acknowledge receipt."
     )
+
+
+def _server_delegation_contract(
+    request: _A2ARequest,
+    *,
+    source_run_id: uuid.UUID,
+    source_agent_id: uuid.UUID,
+    target_agent_id: uuid.UUID,
+    tool_call_id: str,
+) -> dict | None:
+    if request.delegation_contract is None:
+        return None
+    return {
+        **request.delegation_contract,
+        "contract_id": str(
+            uuid.uuid5(source_run_id, f"a2a-delegation-contract:{tool_call_id}")
+        ),
+        "source_run_id": str(source_run_id),
+        "source_agent_id": str(source_agent_id),
+        "target_agent_id": str(target_agent_id),
+    }
 
 
 def _accepted_summary(target: Agent, mode: A2AMode) -> str:
@@ -819,6 +1081,14 @@ class RuntimeA2AService:
                             "a2a_source_agent_missing",
                             "A2A source Agent is unavailable",
                         )
+                    ceo_settings = await _enforce_ceo_dispatch_authority(
+                        db,
+                        source_agent=source_agent,
+                        source_run=source_run,
+                        mode=request.mode,
+                        runtime_settings=self._settings,
+                        delegation_contract=request.delegation_contract,
+                    )
                     owner_user_id = (
                         source_run.origin_user_id
                         or actor_user_id
@@ -831,7 +1101,29 @@ class RuntimeA2AService:
                         target_name=request.target_name,
                         actor_user_id=owner_user_id,
                     )
+                    await _validate_ceo_target_capabilities(
+                        db,
+                        ceo_settings=ceo_settings,
+                        target=target,
+                        delegation_contract=request.delegation_contract,
+                    )
                     is_openclaw = target.agent_type == "openclaw"
+                    if (
+                        is_openclaw
+                        and ceo_settings is not None
+                        and request.delegation_contract is not None
+                    ):
+                        raise A2ARuntimeError(
+                            "ceo_openclaw_delegation_contract_unsupported",
+                            "CEO contracted delegation requires a native Agent Runtime target",
+                        )
+                    server_delegation_contract = _server_delegation_contract(
+                        request,
+                        source_run_id=source_run_id,
+                        source_agent_id=source_agent.id,
+                        target_agent_id=target.id,
+                        tool_call_id=tool_call_id,
+                    )
                     if not is_openclaw:
                         decision = decide_runtime_v2(
                             agent_id=target.id,
@@ -968,8 +1260,11 @@ class RuntimeA2AService:
                                     ),
                                     "a2a_mode": request.mode,
                                     "runtime_instruction": _target_runtime_instruction(
-                                        request.mode
+                                        request.mode,
+                                        source_agent_id=source_agent.id,
+                                        delegation_contract=server_delegation_contract,
                                     ),
+                                    "delegation_contract": server_delegation_contract,
                                     "source_agent_id": str(source_agent.id),
                                     "source_agent_name": source_agent.name,
                                     "source_run_id": str(source_run.id),

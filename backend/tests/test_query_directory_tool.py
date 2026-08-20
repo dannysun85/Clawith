@@ -225,6 +225,35 @@ def test_format_roster_agent_returns_stable_id_and_contact_tool():
     assert payload["contact_tools"] == ["send_message_to_agent"]
 
 
+def test_directory_capability_summary_is_safe_and_honest_about_preflight():
+    local_tool = SimpleNamespace(
+        name="write_file",
+        display_name="Write File",
+        category="file",
+        type="builtin",
+        config={"secret": "must-not-leak"},
+        parameters_schema={"secret": "must-not-leak"},
+    )
+    configured_tool = SimpleNamespace(
+        name="send_email",
+        display_name="Send Email",
+        category="communication",
+        type="builtin",
+        config={"password": "must-not-leak"},
+        parameters_schema={},
+    )
+
+    local = agent_directory._safe_capability_summary(local_tool)
+    configured = agent_directory._safe_capability_summary(configured_tool)
+
+    assert local["availability"] == "available"
+    assert local["readiness"] == "local"
+    assert configured["availability"] == "requires_preflight"
+    assert configured["readiness"] == "email_configuration"
+    assert "config" not in local and "parameters_schema" not in local
+    assert "config" not in configured and "parameters_schema" not in configured
+
+
 def test_format_roster_agent_marks_stopped_agent_uncontactable():
     tenant_id = uuid.uuid4()
     source = _make_agent(tenant_id=tenant_id)

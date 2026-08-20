@@ -6,6 +6,7 @@ import {
     deliverableApprovalStatusMessage,
     deliverableLaunchMessage,
     deliverableLaunchUsesIsolatedInputs,
+    deliverableNextAction,
     deliverableRouteTier,
     isDeliverableAwaitingContinuation,
     isDeliverableStageVisible,
@@ -237,6 +238,28 @@ describe('deliverable composer selection', () => {
         expect(requestCanLaunchFromComposer(request({ workflow_id: 'builtin.poster.v1', work_type: 'poster' }))).toBe(true);
         expect(requestCanLaunchFromComposer(request({ workflow_version: '2.0.0' }))).toBe(false);
         expect(requestCanLaunchFromComposer(request({ status: 'running' }))).toBe(false);
+    });
+
+    it('restores persisted preflight readiness and its next action after refresh', () => {
+        const blocked = request({
+            latest_preflight: {
+                launchable: false,
+                next_action: 'Enable the full staged canary or use V1.',
+            },
+        });
+        expect(requestCanLaunchFromComposer(blocked)).toBe(false);
+        expect(deliverableNextAction(blocked)).toBe('Enable the full staged canary or use V1.');
+        expect(requestCanLaunchFromComposer(request({
+            current_stage: 'brief_clarifying',
+            latest_preflight: { launchable: true },
+        }))).toBe(false);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v2',
+            workflow_version: '2.0.0',
+            work_type: 'video',
+            current_stage: 'storyboard_approved',
+            latest_preflight: { launchable: false },
+        }))).toBe(true);
     });
 
     it('launches the v2 poster pipeline only with its exact version pair', () => {

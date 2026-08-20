@@ -358,6 +358,11 @@
   background: var(--info-subtle);
 }
 
+.workforce-work-chip[data-work="waiting"] {
+  color: var(--warning);
+  background: var(--warning-subtle);
+}
+
 .workforce-work-chip[data-work="review"] {
   color: var(--accent-text);
   background: var(--accent-subtle);

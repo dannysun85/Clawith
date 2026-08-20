@@ -61,17 +61,46 @@ def _terminal_result(checkpoint: CheckpointObservation) -> tuple[str, dict]:
             )
         result_summary = lifecycle.get("result_summary")
         artifact_refs: list = []
+        evidence_refs: list = []
+        tool_receipts: list = []
+        delivery_receipts: list = []
+        delegation_contract_id: str | None = None
         if isinstance(result_summary, Mapping):
             raw_refs = result_summary.get("artifact_refs")
             if isinstance(raw_refs, list):
                 artifact_refs = list(raw_refs)
+            raw_evidence = result_summary.get("evidence_refs")
+            if isinstance(raw_evidence, list):
+                evidence_refs = list(raw_evidence)
+            raw_tool_receipts = result_summary.get("tool_receipts")
+            if isinstance(raw_tool_receipts, list) and all(
+                isinstance(item, Mapping) for item in raw_tool_receipts
+            ):
+                tool_receipts = [dict(item) for item in raw_tool_receipts]
+            raw_delivery_receipts = result_summary.get("delivery_receipts")
+            if isinstance(raw_delivery_receipts, list) and all(
+                isinstance(item, Mapping) for item in raw_delivery_receipts
+            ):
+                delivery_receipts = [dict(item) for item in raw_delivery_receipts]
+            raw_contract_id = result_summary.get("delegation_contract_id")
+            if isinstance(raw_contract_id, str) and raw_contract_id.strip():
+                delegation_contract_id = raw_contract_id.strip()
         answer = answer.strip()
-        return answer, {
+        payload = {
             "status": "completed",
             "result_summary": answer,
             "artifact_refs": artifact_refs,
             "error": None,
         }
+        if evidence_refs:
+            payload["evidence_refs"] = evidence_refs
+        if tool_receipts:
+            payload["tool_receipts"] = tool_receipts
+        if delivery_receipts:
+            payload["delivery_receipts"] = delivery_receipts
+        if delegation_contract_id is not None:
+            payload["delegation_contract_id"] = delegation_contract_id
+        return answer, payload
 
     error = lifecycle.get("error")
     error_payload = dict(error) if isinstance(error, Mapping) else {}

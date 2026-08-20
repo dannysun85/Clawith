@@ -38,6 +38,23 @@ test('unavailable capability still persists the brief without starting generatio
   assert.match(workbench, /if \(!result\) return;/);
   assert.match(workbench, /工作说明仍可保存，不会扣 Credits/);
   assert.match(workbench, /工作说明已保存；当前没有可用线路，未启动生成/);
+  assert.match(workbench, /details: result\.next_action/);
+  assert.match(workbench, /deliverable-preflight/);
+});
+
+test('staged approvals describe the required follow-up instead of claiming production starts', () => {
+  assert.match(workbench, /批准分镜（下一步发送消息）/);
+  assert.match(workbench, /批准大纲（下一步发送消息）/);
+  assert.doesNotMatch(workbench, /批准分镜并开始制作/);
+  assert.doesNotMatch(workbench, /批准大纲并开始制作/);
+});
+
+test('planning revisions hide production targets and shot redo selects failed units only', () => {
+  assert.match(workbench, /storyboardReview \|\| outlineReview/);
+  assert.match(workbench, /unit\.status === 'failed'/);
+  assert.match(workbench, /stage_key === 'shot_generate' \|\| unit\.stage_key === 'shot_qa'/);
+  assert.match(workbench, /setSelectedRevisionUnits\(shotReview \? failedShotKeys : \[\]\)/);
+  assert.match(workbench, /请选择至少一个失败镜头/);
 });
 
 test('presentation preflight receives the same business goal used by the deliverable brief', () => {

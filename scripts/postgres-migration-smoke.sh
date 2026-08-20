@@ -8,7 +8,7 @@ partial_db_name="${db_name}_partial"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_orchestrator_settings}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_coordination_mode}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -2091,6 +2091,7 @@ PYTHONPATH=. .venv/bin/python ../scripts/mcp-import-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-remediation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/billing-reconciliation-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/wechat-payment-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/agentbay-identity-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/plaza-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \

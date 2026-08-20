@@ -18,8 +18,10 @@ from app.models.gateway_message import GatewayMessage
 from app.services.agent_runtime.a2a_runtime import (
     A2ARuntimeError,
     RuntimeA2AService,
+    _enforce_ceo_dispatch_authority,
     _request,
     _resolve_target,
+    _validate_ceo_target_capabilities,
     a2a_mode_from_correlation,
     a2a_waiting_request,
     complete_gateway_a2a_runtime,
@@ -35,6 +37,9 @@ class _ScalarResult:
         self.value = value
 
     def scalar_one_or_none(self):
+        return self.value
+
+    def scalar_one(self):
         return self.value
 
     def scalars(self):
@@ -203,6 +208,170 @@ def test_directory_target_id_is_the_primary_runtime_a2a_contract() -> None:
             }
         )
     assert raised.value.code == "a2a_target_id_invalid"
+
+
+def test_delegation_contract_is_bounded_and_task_only() -> None:
+    target_id = uuid.uuid4()
+    request = _request(
+        {
+            "target_agent_id": str(target_id),
+            "message": "Research the facts",
+            "msg_type": "task_delegate",
+            "delegation_contract": {
+                "version": 1,
+                "title": " Research ",
+                "objective": " Use a real search tool. ",
+                "required_capabilities": ["web_search", "web_search"],
+                "acceptance_criteria": ["Return cited facts."],
+                "expected_artifacts": [],
+                "requires_artifact_delivery": False,
+            },
+        }
+    )
+    assert request.delegation_contract is not None
+    assert request.delegation_contract["title"] == "Research"
+    assert request.delegation_contract["required_capabilities"] == ["web_search"]
+
+    with pytest.raises(A2ARuntimeError) as raised:
+        _request(
+            {
+                "target_agent_id": str(target_id),
+                "message": "FYI",
+                "msg_type": "notify",
+                "delegation_contract": _delegation_contract(),
+            }
+        )
+    assert raised.value.code == "a2a_delegation_contract_invalid"
+
+
+def _ceo_runtime_settings(tenant_id: uuid.UUID) -> Settings:
+    return Settings(
+        _env_file=None,
+        CEO_ORCHESTRATOR_ENABLED=True,
+        CEO_ORCHESTRATOR_TENANT_IDS=str(tenant_id),
+        CEO_COORDINATION_ENABLED=True,
+        CEO_COORDINATION_TENANT_IDS=str(tenant_id),
+    )
+
+
+def _delegation_contract() -> dict:
+    return {
+        "version": 1,
+        "title": "Research facts",
+        "objective": "Research the latest facts with a real tool.",
+        "required_capabilities": ["web_search"],
+        "acceptance_criteria": ["Cite the verified facts."],
+        "expected_artifacts": [],
+        "requires_artifact_delivery": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ceo_observer_may_consult_but_cannot_delegate() -> None:
+    tenant_id, source, _, source_run, _ = _records()
+    source.is_system = True
+    row = SimpleNamespace(
+        tenant_id=tenant_id,
+        ceo_agent_id=source.id,
+        enabled=True,
+        coordination_enabled=False,
+        auto_dispatch_enabled=False,
+        max_parallel_delegations=3,
+    )
+    settings = _ceo_runtime_settings(tenant_id)
+
+    await _enforce_ceo_dispatch_authority(
+        _Session(row),  # type: ignore[arg-type]
+        source_agent=source,
+        source_run=source_run,
+        mode="consult",
+        runtime_settings=settings,
+    )
+    with pytest.raises(A2ARuntimeError) as raised:
+        await _enforce_ceo_dispatch_authority(
+            _Session(row),  # type: ignore[arg-type]
+            source_agent=source,
+            source_run=source_run,
+            mode="task_delegate",
+            runtime_settings=settings,
+        )
+    assert raised.value.code == "ceo_coordination_required"
+
+
+@pytest.mark.asyncio
+async def test_ceo_coordinator_chat_respects_parallel_limit_and_auto_gate() -> None:
+    tenant_id, source, _, source_run, _ = _records()
+    source.is_system = True
+    row = SimpleNamespace(
+        tenant_id=tenant_id,
+        ceo_agent_id=source.id,
+        enabled=True,
+        coordination_enabled=True,
+        auto_dispatch_enabled=False,
+        max_parallel_delegations=2,
+    )
+    settings = _ceo_runtime_settings(tenant_id)
+
+    await _enforce_ceo_dispatch_authority(
+        _Session(row, 1),  # type: ignore[arg-type]
+        source_agent=source,
+        source_run=source_run,
+        mode="task_delegate",
+        runtime_settings=settings,
+        delegation_contract=_delegation_contract(),
+    )
+    with pytest.raises(A2ARuntimeError) as raised:
+        await _enforce_ceo_dispatch_authority(
+            _Session(row, 2),  # type: ignore[arg-type]
+            source_agent=source,
+            source_run=source_run,
+            mode="task_delegate",
+            runtime_settings=settings,
+            delegation_contract=_delegation_contract(),
+        )
+    assert raised.value.code == "ceo_parallel_delegation_limit"
+
+    source_run.source_type = "trigger"
+    with pytest.raises(A2ARuntimeError) as raised:
+        await _enforce_ceo_dispatch_authority(
+            _Session(row),  # type: ignore[arg-type]
+            source_agent=source,
+            source_run=source_run,
+            mode="notify",
+            runtime_settings=settings,
+        )
+    assert raised.value.code == "ceo_auto_dispatch_required"
+
+
+@pytest.mark.asyncio
+async def test_ceo_target_capability_preflight_uses_current_enabled_grants() -> None:
+    _, _, target, _, _ = _records()
+    ceo_row = SimpleNamespace(id=uuid.uuid4())
+
+    await _validate_ceo_target_capabilities(
+        _Session(["web_search", "send_file_to_agent"]),  # type: ignore[arg-type]
+        ceo_settings=ceo_row,  # type: ignore[arg-type]
+        target=target,
+        delegation_contract={
+            **_delegation_contract(),
+            "expected_artifacts": ["report.md"],
+            "requires_artifact_delivery": True,
+        },
+    )
+
+    with pytest.raises(A2ARuntimeError) as raised:
+        await _validate_ceo_target_capabilities(
+            _Session(["web_search"]),  # type: ignore[arg-type]
+            ceo_settings=ceo_row,  # type: ignore[arg-type]
+            target=target,
+            delegation_contract={
+                **_delegation_contract(),
+                "expected_artifacts": ["report.md"],
+                "requires_artifact_delivery": True,
+            },
+        )
+    assert raised.value.code == "ceo_target_capability_missing"
+    assert "send_file_to_agent" in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -404,6 +573,7 @@ async def test_delegate_creates_target_run_and_receipt_in_one_transaction() -> N
                 "target_agent_id": str(target.id),
                 "message": "Research the latest facts",
                 "msg_type": "task_delegate",
+                "delegation_contract": _delegation_contract(),
             },
             reservation=reservation,
             lease_owner="runtime:command:delegate-call",
@@ -436,6 +606,19 @@ async def test_delegate_creates_target_run_and_receipt_in_one_transaction() -> N
     assert "runtime_instruction" in command.payload
     assert "automatically" in command.payload["runtime_instruction"]
     assert "send_message_to_agent" in command.payload["runtime_instruction"]
+    assert "narrative claim is not a tool receipt" in command.payload["runtime_instruction"]
+    assert command.payload["delegation_contract"] == {
+        **_delegation_contract(),
+        "contract_id": str(
+            uuid.uuid5(
+                source_run.id,
+                "a2a-delegation-contract:delegate-call",
+            )
+        ),
+        "source_run_id": str(source_run.id),
+        "source_agent_id": str(source.id),
+        "target_agent_id": str(target.id),
+    }
     assert command.payload["message_id"] == str(
         uuid.uuid5(source_run.id, "a2a-input:delegate-call")
     )

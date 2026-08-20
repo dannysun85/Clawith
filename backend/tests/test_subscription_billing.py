@@ -28,6 +28,7 @@ from app.schemas.saas import AssignSubscriptionIn, BillingRuleCreateIn, GrantCre
 from app.schemas.schemas import AgentCreate
 from app.schemas.subscription import AssignPlanIn, CheckoutSubscribeIn, CheckoutTopupIn
 from app.services.entitlements import Entitlements
+from app.services.billing_provider import BillingProviderReadiness
 from app.services.token_tracker import TokenUsage
 
 
@@ -344,6 +345,50 @@ async def test_saas_mark_order_paid_grants_subscription_credits_in_same_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["wechat", "stripe"])
+async def test_saas_cannot_manually_finalize_provider_backed_order(provider):
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=1000,
+        amount_cents=100,
+        currency="CNY",
+        provider=provider,
+        status="pending",
+    )
+    db = MockDB(get_map={(PaymentOrder, order.id): order})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await saas_api.mark_order_paid(order.id, current_user=_admin_user(), db=db)
+
+    assert exc_info.value.status_code == 409
+    assert "verified provider event" in str(exc_info.value.detail)
+    assert order.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_saas_cannot_reopen_canceled_manual_order_as_paid():
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=1000,
+        amount_cents=100,
+        currency="CNY",
+        provider="manual",
+        status="canceled",
+    )
+    db = MockDB(get_map={(PaymentOrder, order.id): order})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await saas_api.mark_order_paid(order.id, current_user=_admin_user(), db=db)
+
+    assert exc_info.value.status_code == 409
+    assert "status canceled" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_credit_ledger_integrity_detects_balance_and_reserved_drift():
     from app.services.billing_reconciliation import check_credit_ledger_integrity
 
@@ -548,6 +593,57 @@ async def test_payment_reconciliation_applies_subscribe_effects_after_recovery()
     assert [issue.code for issue in report.issues] == ["recovered_via_provider_query"]
     effects.assert_awaited_once_with(order)
     assert effect_saw_commit["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_payment_reconciliation_closes_expired_wechat_order_without_paid_effects():
+    from app.services.billing_reconciliation import reconcile_pending_payment_orders
+
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=1000,
+        amount_cents=100,
+        currency="CNY",
+        provider="wechat",
+        provider_session_id="session",
+        status="pending",
+        created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+    )
+    db = MockDB(
+        execute_results=[DummyManyResult([order])],
+        get_map={(PaymentOrder, order.id): order},
+    )
+
+    async def _close(_db, expired_order):
+        expired_order.status = "canceled"
+        return True
+
+    with (
+        patch(
+            "app.services.billing_events.sync_pending_order_from_provider",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "app.services.billing_events.close_expired_pending_order",
+            new=AsyncMock(side_effect=_close),
+        ) as close_order,
+        patch(
+            "app.services.billing_reconciliation.get_settings",
+            return_value=SimpleNamespace(WECHAT_PAY_ORDER_EXPIRE_MINUTES=120),
+        ),
+        patch(
+            "app.services.subscription_lifecycle.apply_paid_subscribe_effects",
+            new=AsyncMock(),
+        ) as effects,
+    ):
+        report = await reconcile_pending_payment_orders(db)
+
+    assert order.status == "canceled"
+    assert [issue.code for issue in report.issues] == ["expired_order_closed"]
+    close_order.assert_awaited_once_with(db, order)
+    effects.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1251,6 +1347,54 @@ async def test_checkout_subscribe_returns_provider_session_url():
 
 
 @pytest.mark.asyncio
+async def test_checkout_fails_before_order_creation_when_provider_is_not_ready():
+    readiness = BillingProviderReadiness(
+        provider="wechat",
+        status="misconfigured",
+        checkout_enabled=False,
+        native_payment_enabled=False,
+        webhook_ready=False,
+        missing_config=("WECHAT_PAY_PLATFORM_SERIAL_NO",),
+        issues=("wechat_notify_url_must_be_public_https",),
+        next_action="configure provider",
+    )
+    db = MockDB()
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    with patch.object(subscription_api, "billing_provider_readiness", return_value=readiness):
+        with pytest.raises(HTTPException) as exc_info:
+            await subscription_api.checkout_subscribe(
+                CheckoutSubscribeIn(plan_id=uuid.uuid4()),
+                SimpleNamespace(headers={"host": "localhost"}),
+                current_user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["code"] == "BILLING_PROVIDER_NOT_READY"
+    assert exc_info.value.detail["provider"] == "wechat"
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_billing_config_exposes_manual_mode_without_claiming_native_payment():
+    settings = SimpleNamespace(
+        BILLING_PROVIDER="manual",
+        BILLING_USD_CNY_RATE=7.0,
+        PAYMENT_BASE_URL="",
+        PUBLIC_BASE_URL="",
+    )
+    with patch.object(subscription_api, "get_settings", return_value=settings):
+        result = await subscription_api.get_billing_config(current_user=SimpleNamespace())
+
+    assert result.provider == "manual"
+    assert result.status == "manual"
+    assert result.checkout_enabled is True
+    assert result.native_payment_enabled is False
+    assert result.webhook_ready is False
+    assert "不会生成微信支付二维码" in result.next_action
+
+
+@pytest.mark.asyncio
 async def test_checkout_topup_returns_provider_session_url():
     tenant_id = uuid.uuid4()
     pack = SimpleNamespace(
@@ -1338,6 +1482,221 @@ async def test_billing_webhook_duplicate_event_does_not_finalize_twice():
     assert first["status"] == "processed"
     assert second["status"] == "duplicate"
     finalize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_billing_webhook_preserves_remote_state_error_before_event_exists():
+    from app.services.billing_events import process_billing_webhook_event
+
+    provider = SimpleNamespace(
+        verify_webhook=AsyncMock(
+            return_value={"id": "evt_remote_failure", "type": "TRANSACTION.SUCCESS"}
+        ),
+        load_remote_event_state=AsyncMock(
+            side_effect=ValueError("remote state unavailable")
+        ),
+    )
+    db = MockDB()
+
+    with pytest.raises(ValueError, match="remote state unavailable"):
+        await process_billing_webhook_event(
+            db,
+            provider_name="wechat",
+            payload=b"{}",
+            signature=None,
+            provider=provider,
+        )
+
+    assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_wechat_webhook_api_forwards_all_signature_headers():
+    from app.services.billing_events import PaymentProviderEventState
+
+    provider = SimpleNamespace(
+        verify_webhook=AsyncMock(return_value={"id": "evt_headers", "type": "TRANSACTION.SUCCESS"}),
+        load_remote_event_state=AsyncMock(
+            return_value=PaymentProviderEventState(
+                provider="wechat",
+                event_id="evt_headers",
+                event_type="TRANSACTION.SUCCESS",
+                order_id=None,
+                status="ignored",
+            )
+        ),
+        validate_event_state=lambda _order, _state: None,
+    )
+
+    class RequestStub:
+        headers = {
+            "Wechatpay-Signature": "signature",
+            "Wechatpay-Timestamp": "1700000000",
+            "Wechatpay-Nonce": "nonce",
+            "Wechatpay-Serial": "serial",
+        }
+
+        async def body(self):
+            return b"{}"
+
+    db = MockDB()
+    with patch.object(subscription_api, "get_billing_provider", return_value=provider):
+        result = await subscription_api.billing_webhook(
+            "wechat",
+            RequestStub(),
+            stripe_signature=None,
+            db=db,
+        )
+
+    assert result == {"code": "SUCCESS", "message": "成功"}
+    assert provider.verify_webhook.await_args.kwargs["headers"] == RequestStub.headers
+
+
+@pytest.mark.asyncio
+async def test_refund_event_marks_paid_order_without_regranting_credits():
+    from app.services.billing_events import PaymentProviderEventState, process_billing_webhook_event
+
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=10_000,
+        amount_cents=1500,
+        currency="CNY",
+        provider="wechat",
+        provider_session_id="session",
+        status="paid",
+    )
+    state = PaymentProviderEventState(
+        provider="wechat",
+        event_id="evt_refund",
+        event_type="REFUND.SUCCESS",
+        order_id=order.id,
+        status="refunded",
+        provider_session_id="session",
+    )
+    provider = SimpleNamespace(
+        verify_webhook=AsyncMock(return_value={"id": "evt_refund", "type": "REFUND.SUCCESS"}),
+        load_remote_event_state=AsyncMock(return_value=state),
+        validate_event_state=lambda _order, _state: None,
+    )
+    db = MockDB(get_map={(PaymentOrder, order.id): order})
+
+    with patch("app.services.billing_events.finalize_order_in_session", AsyncMock()) as finalize:
+        result = await process_billing_webhook_event(
+            db,
+            provider_name="wechat",
+            payload=b"{}",
+            signature=None,
+            provider=provider,
+        )
+
+    assert result["status"] == "processed"
+    assert order.status == "refunded"
+    finalize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refund_claws_back_only_unreserved_available_credits_exactly_once():
+    from app.services.billing_events import refund_order_in_session
+
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=1000,
+        amount_cents=100,
+        currency="CNY",
+        provider="wechat",
+        status="paid",
+        paid_at=datetime.now(timezone.utc),
+    )
+    original = CreditTransaction(
+        tenant_id=order.tenant_id,
+        delta=1000,
+        balance_after=1000,
+        reason="topup",
+        ref_type="order",
+        ref_id=order.id,
+    )
+    balance = CreditBalance(tenant_id=order.tenant_id, balance=700, reserved=200)
+    db = MockDB(
+        execute_results=[
+            DummyResult(original),
+            DummyResult(None),
+            DummyResult(balance),
+        ]
+    )
+
+    await refund_order_in_session(db, order)
+    await refund_order_in_session(db, order)
+
+    clawbacks = [
+        item
+        for item in db.added
+        if isinstance(item, CreditTransaction) and item.reason == "refund_clawback"
+    ]
+    assert order.status == "refunded"
+    assert balance.balance == 200
+    assert balance.reserved == 200
+    assert len(clawbacks) == 1
+    assert clawbacks[0].delta == -500
+    assert clawbacks[0].balance_after == 200
+
+
+@pytest.mark.asyncio
+async def test_latest_refunded_subscription_is_canceled_after_credit_clawback():
+    from app.services.billing_events import refund_order_in_session
+
+    tenant_id = uuid.uuid4()
+    plan_id = uuid.uuid4()
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        type="subscribe",
+        plan_id=plan_id,
+        change_kind="new",
+        amount_cents=2000,
+        currency="CNY",
+        provider="wechat",
+        status="paid",
+        paid_at=datetime.now(timezone.utc),
+    )
+    original = CreditTransaction(
+        tenant_id=tenant_id,
+        delta=1000,
+        balance_after=1000,
+        reason="subscribe",
+        ref_type="order",
+        ref_id=order.id,
+    )
+    balance = CreditBalance(tenant_id=tenant_id, balance=1000, reserved=0)
+    subscription = Subscription(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        plan_id=plan_id,
+        status="active",
+        period_start=datetime.now(timezone.utc),
+        period_end=datetime.now(timezone.utc) + timedelta(days=30),
+        auto_renew=True,
+    )
+    db = MockDB(
+        execute_results=[
+            DummyResult(original),
+            DummyResult(None),
+            DummyResult(balance),
+            DummyResult(None),
+            DummyResult(subscription),
+        ]
+    )
+
+    await refund_order_in_session(db, order)
+
+    assert order.status == "refunded"
+    assert balance.balance == 0
+    assert subscription.status == "canceled"
+    assert subscription.auto_renew is False
+    assert subscription.period_end <= datetime.now(timezone.utc)
 
 
 @pytest.mark.asyncio

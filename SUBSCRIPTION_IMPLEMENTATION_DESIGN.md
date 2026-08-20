@@ -367,7 +367,7 @@ def today_in_tenant_tz(tenant) -> date:
 
 ### 4.3 国内支付方案(支付宝/微信)
 
-> **已实现(微信支付 Native)**: `services/billing_provider.py::WeChatBillingProvider`,`BILLING_PROVIDER=wechat` 启用;下单走 V3 Native 返回 `code_url`,前端扫码弹窗 + `/subscription/checkout/{order_id}/status` 轮询;回调 `/api/subscription/billing/webhook/wechat` 用 APIv3 密钥 AEAD 解密验真,并回查订单接口确认终态。微信仅支持 CNY,USD 定价按 `BILLING_USD_CNY_RATE`(默认 7)换算下单与展示。续费仍为"到期手动续"(无委托代扣)。
+> **已实现(微信支付 Native)**: `services/billing_provider.py::WeChatBillingProvider` 走 V3 Native 返回 `code_url`,前端扫码弹窗 + `/subscription/checkout/{order_id}/status` 轮询。`provider=wechat` 不等于已就绪：`/subscription/config` 独立返回 readiness，配置不完整时在写订单前 `503` 阻断。回调先用微信平台公钥验证 `Wechatpay-*` HTTP RSA 签名、serial 与 5 分钟时间窗，再用 APIv3 key AEAD 解密，并回查订单；成功入账前核对 order/session、MCHID、APPID、`NATIVE`、CNY 金额和 tenant attach。订单行锁、webhook event 唯一键和 Credits order reference 共同保证 exactly-once。过期 pending 订单先调用 Provider close 再本地取消；退款只回收尚未消费且未预留的 order grant。微信仅支持 CNY,USD 定价按 `BILLING_USD_CNY_RATE`(默认 7)换算下单与展示。续费仍为"到期手动续"(无委托代扣)。详细事实与外部门见 `.agents/reference/wechat-payment-readiness.md`。
 
 Stripe 无国内可用,国内需自建订阅原语:
 - **订阅 = 首次支付 + 记录 `period_end` + 定时任务(cron)到期前发起续费扣款**。

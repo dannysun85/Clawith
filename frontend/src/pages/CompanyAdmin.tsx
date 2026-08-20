@@ -643,6 +643,7 @@ export default function CompanyAdmin() {
     const isChinese = i18n.language.startsWith('zh');
     const tenantId = user?.tenant_id || '';
     const section = location.pathname.split('/')[2] || 'overview';
+    const settingsView = location.pathname.split('/')[3] || '';
     const tenantQuery = useQuery({ queryKey: ['company-console-tenant', tenantId], queryFn: () => tenantApi.me(), enabled: !!tenantId });
     const membersQuery = useQuery({ queryKey: ['company-governance-members', tenantId], queryFn: () => membershipApi.list() as Promise<CompanyMember[]>, enabled: !!tenantId && hasEffectiveCapability(user, 'company.members.view') });
     const companyName = tenantQuery.data?.name || (isChinese ? '当前公司' : 'Current company');
@@ -669,6 +670,17 @@ export default function CompanyAdmin() {
     const content = useMemo(() => {
         if (section === 'members') return <CompanyMembers tenantId={tenantId} />;
         if (section === 'agents') return <AgentGovernance />;
+        if (section === 'settings' && settingsView === 'okr') {
+            return <>
+                <PageHeader
+                    title={isChinese ? '目标、复盘与公司 CEO' : 'Objectives, reviews, and Company CEO'}
+                    description={isChinese
+                        ? '在公司治理边界内配置 OKR 节奏与唯一的公司 CEO；不会新增左侧主导航，也不会把 CEO 设置混入企业知识与集成。'
+                        : 'Configure OKR cadence and the single Company CEO inside company governance without adding a primary navigation item or mixing CEO settings into integrations.'}
+                />
+                <EnterpriseSettings initialTab="okr" embedded />
+            </>;
+        }
         if (section === 'settings') return <CompanyPolicySettings tenantId={tenantId} tenant={tenantQuery.data} />;
         if (section === 'billing') return <><PageHeader title={isChinese ? '套餐、账单与用量' : 'Plan, billing and usage'} description={isChinese ? '公司管理员查看聚合用量；支付主体、订单与续费仍按 company.billing.manage 单独守卫。' : 'Company admins see aggregate usage; payer, order, and renewal actions remain gated by company.billing.manage.'} /><SubscriptionDetail /></>;
         if (section === 'market') return <><PageHeader title={isChinese ? '购买套餐与额度' : 'Buy plans and credits'} description={isChinese ? '选择适合团队的套餐或补充额度包，支付仅允许在官方支付域名上发起。' : 'Pick a plan or top up credits; payment is only accepted on the official payment domain.'} /><SubscriptionTab /></>;
@@ -676,7 +688,7 @@ export default function CompanyAdmin() {
         const legacyTabs: Record<string, 'approvals' | 'tools' | 'audit'> = { approvals: 'approvals', integrations: 'tools', audit: 'audit' };
         if (legacyTabs[section]) return <><PageHeader title={items.find((item) => item.to.endsWith(section))?.label || section} description={isChinese ? '该能力继续复用已验证的企业设置数据源，并置于新的公司治理边界内。' : 'This capability reuses the existing enterprise data source inside the new company-governance boundary.'} /><EnterpriseSettings key={section} initialTab={legacyTabs[section]} embedded /></>;
         return <CompanyOverview companyName={companyName} />;
-    }, [companyName, isChinese, items, membersQuery.data, section, tenantId, tenantQuery.data]);
+    }, [companyName, isChinese, items, membersQuery.data, section, settingsView, tenantId, tenantQuery.data]);
 
     return (
         <ProductConsoleShell

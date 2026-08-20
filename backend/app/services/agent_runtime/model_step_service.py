@@ -612,6 +612,7 @@ def _runtime_sections(build: RuntimeContextBuild) -> JsonObject:
         "heartbeat_context",
         "background_mode",
         "a2a_mode",
+        "delegation_contract",
         "source_agent_id",
         "source_agent_name",
         "onboarding_target_phase",

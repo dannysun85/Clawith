@@ -77,6 +77,13 @@
     text-align: center;
 }
 
+.employees-page__scope-contract {
+    margin: -8px 0 0;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
 .employees-page__header .btn,
 .employees-page__empty .btn,
 .employees-page__success .btn,

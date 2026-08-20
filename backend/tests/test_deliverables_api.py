@@ -158,8 +158,8 @@ def _artifact(request: DeliverableRequest, artifact_type: str) -> DeliverableArt
 
 
 @pytest.mark.asyncio
-async def test_create_brief_does_not_require_a_provider_route(monkeypatch) -> None:
-    """Saving an unavailable media brief must not perform a paid preflight."""
+async def test_create_brief_persists_provider_free_preflight_without_launch(monkeypatch) -> None:
+    """Saving an unavailable brief records readiness but never launches work."""
 
     tenant_id = uuid.uuid4()
     user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
@@ -194,7 +194,18 @@ async def test_create_brief_does_not_require_a_provider_route(monkeypatch) -> No
     )
     shadow = SimpleNamespace(id=uuid.uuid4())
     monkeypatch.setattr(deliverables, "add_initial_execution_shadow", lambda *_args: shadow)
-    preflight = AsyncMock(side_effect=AssertionError("brief persistence must not call provider preflight"))
+    preflight_result = {
+        "available": False,
+        "launchable": False,
+        "reasons": ["pool_unavailable"],
+        "capability_status": "unavailable",
+        "next_action": "Configure a provider route and recheck.",
+        "tier": "lite",
+        "normalized_spec": dict(data.spec),
+        "credit_estimate": {"mode": "estimate"},
+        "creates_reservation": False,
+    }
+    preflight = AsyncMock(return_value=preflight_result)
     monkeypatch.setattr(deliverables, "preflight_workflow", preflight)
     monkeypatch.setattr(deliverables, "_request_out", AsyncMock(side_effect=lambda _db, request: request))
 
@@ -204,9 +215,13 @@ async def test_create_brief_does_not_require_a_provider_route(monkeypatch) -> No
     assert request.current_stage == "brief_confirmed"
     assert request.work_type == "video"
     assert request.current_execution_id == shadow.id
+    assert request.latest_preflight["launchable"] is False
+    assert request.latest_preflight["next_action"] == preflight_result["next_action"]
+    assert shadow.status == "blocked"
+    assert shadow.blocked_reason == "pool_unavailable"
     assert db.flush_count == 3
     assert db.added == [request]
-    preflight.assert_not_awaited()
+    preflight.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -351,6 +366,23 @@ async def test_linked_work_task_accepts_the_exact_formal_delivery_contract(monke
     monkeypatch.setattr(deliverables, "validate_workflow_spec", lambda _workflow, value: dict(value))
     shadow = SimpleNamespace(id=uuid.uuid4())
     monkeypatch.setattr(deliverables, "add_initial_execution_shadow", lambda *_args: shadow)
+    monkeypatch.setattr(
+        deliverables,
+        "preflight_workflow",
+        AsyncMock(
+            return_value={
+                "available": True,
+                "launchable": True,
+                "reasons": [],
+                "capability_status": "available",
+                "next_action": "Ready to launch.",
+                "tier": "ultra",
+                "normalized_spec": dict(data.spec),
+                "credit_estimate": {"mode": "estimate"},
+                "creates_reservation": False,
+            }
+        ),
+    )
     monkeypatch.setattr(deliverables, "_request_out", AsyncMock(side_effect=lambda _db, request: request))
 
     request = await deliverables.create_deliverable_request(
@@ -365,6 +397,7 @@ async def test_linked_work_task_accepts_the_exact_formal_delivery_contract(monke
     assert request.inputs == []
     assert request.spec == {"aspect_ratio": "9:16", "exact_copy": exact_copy}
     assert request.current_execution_id == shadow.id
+    assert request.latest_preflight["launchable"] is True
 
 
 @pytest.mark.asyncio

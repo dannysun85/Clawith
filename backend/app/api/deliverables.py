@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from urllib.parse import quote
 import uuid
 
@@ -89,6 +89,7 @@ from app.services.deliverable_executions import (
     ensure_execution_shadow,
     execution_units,
     project_execution_lifecycle,
+    record_execution_preflight,
 )
 from app.services.deliverable_quality_gate import (
     creative_quality_gate_required_for_request,
@@ -232,6 +233,35 @@ async def _apply_brief_projection(
             first_missing = next(iter(brief_row.missing_fields or []), "unknown")
             execution.blocked_reason = f"brief_missing:{first_missing}"[:200]
     return brief_row
+
+
+async def _record_provider_free_preflight(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    *,
+    execution: DeliverableExecution | None = None,
+) -> dict[str, Any]:
+    """Revalidate and persist launch readiness without reserving or submitting."""
+
+    workflow = require_workflow(
+        request.work_type,
+        request.workflow_id,
+        request.workflow_version,
+    )
+    preflight = await preflight_workflow(
+        db,
+        tenant_id=request.tenant_id,
+        agent_id=request.agent_id,
+        workflow=workflow,
+        tier=request.tier,
+        spec=request.spec,
+        goal=request.goal,
+        inputs=request.inputs,
+    )
+    if execution is None:
+        execution = await ensure_execution_shadow(db, request, lock=True)
+    record_execution_preflight(request, execution, preflight)
+    return preflight
 
 
 def _brief_out_from_row(brief_row) -> DeliverableBriefOut:
@@ -834,6 +864,11 @@ async def create_deliverable_request(
             # an incomplete brief parks the execution as blocked.
             if await _apply_brief_projection(db, request, execution=execution) is not None:
                 await db.flush()
+            # The client-side preview is advisory.  Re-run the same
+            # Provider-free check inside the write transaction and persist its
+            # next_action so refresh/reconnect cannot turn a blocked brief into
+            # an apparently launchable one.
+            await _record_provider_free_preflight(db, request, execution=execution)
     except IntegrityError:
         concurrent_result = await db.execute(
             select(DeliverableRequest).where(
@@ -1055,6 +1090,57 @@ async def record_deliverable_approval(
         )
 
     decision_execution = await ensure_execution_shadow(db, request, lock=True)
+    revision_stage = (
+        "storyboard"
+        if stage_flow and data.stage == "storyboard"
+        else "outline"
+        if outline_stage_flow and data.stage == "outline"
+        else "shot"
+        if stage_flow and request.current_stage == "shot_review"
+        else "final"
+    )
+    if (
+        data.action == "request_changes"
+        and revision_stage in {"storyboard", "outline"}
+        and data.target_units
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "deliverable_revision_target_not_allowed",
+                "message": "Storyboard and outline revisions must revise the planning stage before production targets exist",
+            },
+        )
+    if data.action == "request_changes" and revision_stage == "shot":
+        review_units = await execution_units(db, decision_execution.id, lock=True)
+        failed_shot_keys = {
+            unit.unit_key
+            for unit in review_units
+            if unit.stage_key in {"shot_generate", "shot_qa"}
+            and unit.status == "failed"
+        }
+        requested_shot_keys = {
+            unit_key.strip()
+            for unit_key in data.target_units
+            if unit_key.strip()
+        }
+        if not requested_shot_keys:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "deliverable_failed_shot_target_required",
+                    "message": "Select at least one failed shot to redo",
+                },
+            )
+        invalid_shot_keys = sorted(requested_shot_keys - failed_shot_keys)
+        if invalid_shot_keys:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "deliverable_failed_shot_target_invalid",
+                    "message": "Only failed shots can be redone: " + ", ".join(invalid_shot_keys),
+                },
+            )
     now = datetime.now(UTC)
     next_execution_id: uuid.UUID | None = None
     superseded_review_ids: tuple[uuid.UUID, ...] = ()
@@ -1148,6 +1234,7 @@ async def record_deliverable_approval(
                 client_revision_id=data.client_action_id,
                 instruction=normalized_instruction,
                 target_units=data.target_units,
+                revision_stage=revision_stage,
             )
         except DeliverableExecutionError as exc:
             raise _execution_error(exc) from exc
@@ -1918,7 +2005,9 @@ async def update_deliverable_request(
     request.spec = next_spec
     request.tier = data.tier or request.tier
     request.version += 1
-    await _apply_brief_projection(db, request)
+    execution = await ensure_execution_shadow(db, request, lock=True)
+    await _apply_brief_projection(db, request, execution=execution)
+    await _record_provider_free_preflight(db, request, execution=execution)
     await db.flush()
     return await _request_out(db, request)
 
@@ -2021,7 +2110,9 @@ async def submit_deliverable_clarifications(
         raise _workflow_error(exc) from exc
     request.spec = next_spec
     request.version += 1
-    brief_row = await _apply_brief_projection(db, request)
+    execution = await ensure_execution_shadow(db, request, lock=True)
+    brief_row = await _apply_brief_projection(db, request, execution=execution)
+    await _record_provider_free_preflight(db, request, execution=execution)
     await db.flush()
     return _brief_out_from_row(brief_row)
 

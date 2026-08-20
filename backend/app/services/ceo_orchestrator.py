@@ -33,7 +33,10 @@ from app.models.trigger_execution import TriggerExecution
 from app.models.user import User
 from app.services.agent_manager import _render_soul_template, agent_manager
 from app.services.agent_tool_assignments import upsert_agent_tool
-from app.services.ceo_briefing import ceo_orchestrator_allowed
+from app.services.ceo_briefing import (
+    ceo_coordination_rollout_allowed,
+    ceo_orchestrator_allowed,
+)
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.focus_service import ensure_focus_item
 from app.services import group_chat_service
@@ -117,7 +120,7 @@ _CEO_TRIGGER_SPECS = (
         "reason": (
             "系统触发器：主持晨会/周会（单轮定向询问 + 汇总）。执行要求："
             "1. 调用 company_brief_snapshot 获取全景；2. 对会议成员中的每位员工用 "
-            "send_message_to_agent 定向询问一次进展（等待回复，不重复发送）；"
+            "send_message_to_agent（msg_type=consult）定向询问一次进展（等待回复，不重复发送）；"
             "3. 汇总后用 write_file 把纪要写入 workspace 的 meeting-minutes/YYYY-MM-DD.md，"
             "纪要中的行动项仅以文本“建议行动项”呈现；4. 最终回复是会议汇总。"
             "禁止创建任务、禁止修改任何人的 Focus 或 OKR、禁止外发消息。"
@@ -313,7 +316,7 @@ async def _sync_ceo_relationships(
                     agent_id=pair[0],
                     target_agent_id=pair[1],
                     relation="collaborator",
-                    description="CEO orchestrator meeting member (P1 observer)",
+                    description="Company CEO collaboration member",
                     created_by_user_id=actor_id,
                 )
             )
@@ -349,7 +352,7 @@ async def _sync_ceo_triggers(db: AsyncSession, settings: CeoOrchestratorSettings
     system_focus_ref = await ensure_focus_item(
         settings.ceo_agent_id,
         focus_ref=CEO_SYSTEM_FOCUS_REF,
-        description="CEO 简报、晨会与业务全景节奏（P1 观察型）",
+        description="CEO 简报、晨会与业务全景节奏",
         system=True,
         db=db,
     )
@@ -501,6 +504,9 @@ async def disable_ceo_orchestrator(
 ) -> None:
     """Switch off cadence triggers and the master flag; never deletes history."""
     settings.enabled = False
+    # Re-enabling P1 must never silently restore P2 dispatch authority.
+    settings.coordination_enabled = False
+    settings.auto_dispatch_enabled = False
     result = await db.execute(
         select(AgentTrigger).where(
             AgentTrigger.agent_id == settings.ceo_agent_id,
@@ -522,8 +528,11 @@ async def update_ceo_settings(
     daily_credit_cap: int | None = None,
     monthly_credit_cap: int | None = None,
     member_agent_ids: list[uuid.UUID] | None = None,
+    coordination_enabled: bool | None = None,
+    auto_dispatch_enabled: bool | None = None,
+    max_parallel_delegations: int | None = None,
 ) -> CeoOrchestratorSettings:
-    """Patch cadence switches, budget caps, and meeting members; resync triggers."""
+    """Patch CEO settings while preserving the independent P2 authority gate."""
     if briefing_enabled is not None:
         settings.briefing_enabled = bool(briefing_enabled)
     if morning_meeting_enabled is not None:
@@ -532,6 +541,45 @@ async def update_ceo_settings(
         settings.daily_credit_cap = max(0, int(daily_credit_cap))
     if monthly_credit_cap is not None:
         settings.monthly_credit_cap = max(0, int(monthly_credit_cap))
+    if max_parallel_delegations is not None:
+        normalized_parallelism = int(max_parallel_delegations)
+        if not 1 <= normalized_parallelism <= 12:
+            raise CeoOrchestratorError(
+                "ceo_parallel_delegation_limit_invalid",
+                "CEO max_parallel_delegations must be between 1 and 12",
+            )
+        settings.max_parallel_delegations = normalized_parallelism
+    if coordination_enabled is not None:
+        if coordination_enabled and not ceo_coordination_rollout_allowed(
+            tenant_id=settings.tenant_id,
+            agent_id=settings.ceo_agent_id,
+        ):
+            raise CeoOrchestratorError(
+                "ceo_coordination_not_available",
+                "CEO coordination rollout gate is closed for this company",
+            )
+        settings.coordination_enabled = bool(coordination_enabled)
+        if coordination_enabled:
+            settings.coordination_enabled_by_user_id = actor.id
+            if settings.coordination_enabled_at is None:
+                settings.coordination_enabled_at = datetime.now(timezone.utc)
+        else:
+            settings.auto_dispatch_enabled = False
+    if auto_dispatch_enabled is not None:
+        if auto_dispatch_enabled and not bool(settings.coordination_enabled):
+            raise CeoOrchestratorError(
+                "ceo_coordination_required",
+                "Enable CEO coordination before autonomous dispatch",
+            )
+        if auto_dispatch_enabled and not ceo_coordination_rollout_allowed(
+            tenant_id=settings.tenant_id,
+            agent_id=settings.ceo_agent_id,
+        ):
+            raise CeoOrchestratorError(
+                "ceo_coordination_not_available",
+                "CEO coordination rollout gate is closed for this company",
+            )
+        settings.auto_dispatch_enabled = bool(auto_dispatch_enabled)
     if member_agent_ids is not None:
         members = await _validate_member_agents(
             db,
