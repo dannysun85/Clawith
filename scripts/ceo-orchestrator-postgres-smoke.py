@@ -257,11 +257,12 @@ async def main() -> None:
             )
             await db.commit()
             assert again.ceo_agent_id == ceo_agent_id, "re-enable must reuse the same CEO Agent"
-            rows = (
+            count = (
                 await db.execute(
                     select(func.count()).select_from(CeoOrchestratorSettings)
                 )
             ).scalar_one()
+            assert count == 1, "re-enable must not insert a second settings row"
         async with async_session() as db:
             tenant_rows = (
                 await db.execute(
