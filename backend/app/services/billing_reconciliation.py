@@ -324,6 +324,12 @@ async def reconcile_pending_payment_orders(
             )
             continue
         if changed:
+            await db.commit()
+            from app.services.subscription_lifecycle import apply_paid_subscribe_effects
+
+            recovered = await db.get(PaymentOrder, order.id)
+            if recovered is not None:
+                await apply_paid_subscribe_effects(recovered)
             logger.info(
                 "[billing] pending order recovered via provider query order_id={} provider={}",
                 order.id,

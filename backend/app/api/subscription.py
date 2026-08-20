@@ -621,12 +621,9 @@ def _yearly_price_cents(plan: Plan) -> int:
 
 async def _apply_paid_subscribe_effects(order: PaymentOrder) -> None:
     """Post-payment side effects shared by the webhook and poll-sync paths."""
-    if order.type == "subscribe" and order.status == "paid":
-        from app.services.subscription_lifecycle import enforce_agent_limit, restore_stopped_agents
+    from app.services.subscription_lifecycle import apply_paid_subscribe_effects
 
-        await reconcile_tenant_agent_plan_selections(order.tenant_id)
-        await restore_stopped_agents(order.tenant_id)
-        await enforce_agent_limit(order.tenant_id)
+    await apply_paid_subscribe_effects(order)
 
 
 async def _classify_plan_change(

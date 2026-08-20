@@ -5,9 +5,11 @@
 - Plan purchases are classified at checkout (new / renew / period switch /
   upgrade / downgrade) and stored on the order; yearly pricing honors the
   plan's configured yearly price and discount instead of a flat 10x estimate.
-- Upgrades and renewals apply immediately and stack on unexpired time;
-  downgrades are scheduled and applied at period end by the lifecycle daemon,
-  so paid higher-tier time is never discarded.
+- Downgrades are scheduled and applied at period end by the lifecycle daemon,
+  so paid higher-tier time is never discarded. Period-end credit grants use a
+  unique plan-change idempotency key, so a later paid return to the same plan
+  is not silently skipped. Missed-webhook recovery applies the same
+  post-payment agent restore/limit effects as the QR poll.
 - The market page offers explicit 续费 / 转年付 / 升级 / 降级（下个周期生效）
   actions, and the SaaS admin plan form edits yearly pricing directly.
 - WeChat Pay uses the 32-char hex out_trade_no, syncs pending orders from the

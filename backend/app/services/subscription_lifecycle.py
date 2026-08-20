@@ -21,9 +21,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
-from app.models.subscription import CreditBalance, Plan, Subscription
+from app.models.subscription import CreditBalance, PaymentOrder, Plan, Subscription
 from app.services.entitlements import STRIPE_RETRY_WINDOW, get_tenant_entitlements
-from app.services.credit_service import grant_credits_in_session
+from app.services.credit_service import (
+    SUBSCRIPTION_PLAN_CHANGE_REF_TYPE,
+    grant_credits_in_session,
+    subscription_plan_change_grant_ref_id,
+)
 from app.services.llm.load_balancer import reset_daily_usage
 
 # Hourly — cheap query, catches expiries within the hour. Webhooks handle the
@@ -140,6 +144,8 @@ async def expire_subscriptions() -> int:
                 scheduled_plan = await db.get(Plan, s.scheduled_plan_id)
                 if scheduled_plan and scheduled_plan.is_active:
                     period_days = 365 if (s.scheduled_period or "monthly") == "yearly" else 30
+                    previous_plan_id = s.plan_id
+                    activation_at = s.period_end or now
                     base = s.period_end if s.period_end and s.period_end > now else now
                     s.plan_id = scheduled_plan.id
                     s.status = "active"
@@ -153,8 +159,13 @@ async def expire_subscriptions() -> int:
                             amount=scheduled_plan.credits_per_period,
                             reason="subscribe",
                             granted_by=None,
-                            ref_type="plan",
-                            ref_id=scheduled_plan.id,
+                            ref_type=SUBSCRIPTION_PLAN_CHANGE_REF_TYPE,
+                            ref_id=subscription_plan_change_grant_ref_id(
+                                s.id,
+                                previous_plan_id,
+                                scheduled_plan.id,
+                                activation_at,
+                            ),
                         )
                     applied += 1
                     continue
@@ -270,6 +281,21 @@ async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
             await db.commit()
             logger.info(f"[subscription_lifecycle] restored {len(to_restore)} agent(s) in tenant {tenant_id}")
         return len(to_restore)
+
+
+async def apply_paid_subscribe_effects(order: PaymentOrder) -> None:
+    """Restore routing and agent slots after a subscribe order is marked paid.
+
+    Shared by the webhook, QR poll, and missed-webhook reconciler. Safe to
+    call more than once for the same paid order.
+    """
+    if order.type != "subscribe" or order.status != "paid":
+        return
+    from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
+
+    await reconcile_tenant_agent_plan_selections(order.tenant_id)
+    await restore_stopped_agents(order.tenant_id)
+    await enforce_agent_limit(order.tenant_id)
 
 
 async def start_subscription_lifecycle_daemon() -> None:

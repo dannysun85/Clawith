@@ -692,7 +692,11 @@ async def gate_ceo_trigger_automation(trigger: AgentTrigger, now: datetime) -> b
             )
         )
         settings = settings_result.scalar_one_or_none()
-        if settings is None or not settings.enabled:
+        rollout_open = settings is not None and ceo_orchestrator_allowed(
+            tenant_id=settings.tenant_id,
+            agent_id=settings.ceo_agent_id,
+        )
+        if settings is None or not settings.enabled or not rollout_open:
             trigger_result = await db.execute(
                 select(AgentTrigger).where(AgentTrigger.id == trigger.id)
             )

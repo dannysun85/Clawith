@@ -505,6 +505,52 @@ async def test_payment_reconciliation_log_excludes_order_and_tenant_details():
 
 
 @pytest.mark.asyncio
+async def test_payment_reconciliation_applies_subscribe_effects_after_recovery():
+    from app.services.billing_reconciliation import reconcile_pending_payment_orders
+
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="subscribe",
+        amount_cents=16000,
+        currency="CNY",
+        provider="wechat",
+        provider_session_id="session",
+        status="paid",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=15),
+    )
+    db = MockDB(
+        execute_results=[DummyManyResult([order])],
+        get_map={(PaymentOrder, order.id): order},
+    )
+
+    async def _mark_paid(_db, synced):
+        synced.status = "paid"
+        return True
+
+    effect_saw_commit = {"value": False}
+
+    async def _effects(_order):
+        effect_saw_commit["value"] = db.committed
+
+    with (
+        patch(
+            "app.services.billing_events.sync_pending_order_from_provider",
+            new=AsyncMock(side_effect=_mark_paid),
+        ),
+        patch(
+            "app.services.subscription_lifecycle.apply_paid_subscribe_effects",
+            new=AsyncMock(side_effect=_effects),
+        ) as effects,
+    ):
+        report = await reconcile_pending_payment_orders(db)
+
+    assert [issue.code for issue in report.issues] == ["recovered_via_provider_query"]
+    effects.assert_awaited_once_with(order)
+    assert effect_saw_commit["value"] is True
+
+
+@pytest.mark.asyncio
 async def test_saas_reconciliation_endpoint_returns_jsonable_report():
     tenant_id = uuid.uuid4()
     balance = CreditBalance(tenant_id=tenant_id, balance=900, reserved=0)

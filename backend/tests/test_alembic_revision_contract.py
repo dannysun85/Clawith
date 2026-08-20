@@ -150,8 +150,8 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         BACKEND_ROOT.parent / "scripts/tenant-purge-postgres-smoke.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-subscription_change_kind' in smoke
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-subscription_change_kind' in purge_smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_orchestrator_settings' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-ceo_orchestrator_settings' in purge_smoke
     assert 'grep -F "${release_head} (head)"' in purge_smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke

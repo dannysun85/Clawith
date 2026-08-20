@@ -11,6 +11,18 @@ import pytest
 from app.api import subscription as subscription_api
 from app.models.subscription import PaymentOrder, Plan, Subscription
 from app.services import subscription_lifecycle
+from app.services.credit_service import subscription_plan_change_grant_ref_id
+
+
+def test_plan_change_grant_refs_differ_across_activations():
+    subscription_id = uuid.uuid4()
+    previous = uuid.uuid4()
+    nxt = uuid.uuid4()
+    first = datetime(2026, 1, 31, tzinfo=timezone.utc)
+    second = datetime(2026, 3, 2, tzinfo=timezone.utc)
+    assert subscription_plan_change_grant_ref_id(
+        subscription_id, previous, nxt, first
+    ) != subscription_plan_change_grant_ref_id(subscription_id, previous, nxt, second)
 
 
 class DummyResult:
@@ -225,6 +237,7 @@ async def test_expire_subscriptions_applies_scheduled_downgrade():
         scheduled_plan_id=target.id,
         scheduled_period="yearly",
     )
+    original_end = sub.period_end
     fake_db = MagicMock()
     fake_db.execute = AsyncMock(
         side_effect=[
@@ -250,6 +263,15 @@ async def test_expire_subscriptions_applies_scheduled_downgrade():
     assert sub.scheduled_plan_id is None
     assert sub.period_end > now + timedelta(days=360)  # yearly from old period_end
     grant.assert_awaited_once()
+    assert grant.await_args.kwargs["reason"] == "subscribe"
+    assert grant.await_args.kwargs["ref_type"] == "subscription_plan_change"
+    assert grant.await_args.kwargs["ref_id"] == subscription_plan_change_grant_ref_id(
+        sub.id,
+        current.id,
+        target.id,
+        original_end,
+    )
+    assert grant.await_args.kwargs["ref_id"] != target.id
 
 
 @pytest.mark.asyncio

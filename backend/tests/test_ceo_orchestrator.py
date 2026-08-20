@@ -157,6 +157,64 @@ def test_ceo_trigger_names_never_collide_with_okr_names() -> None:
     assert "ceo_morning_meeting" in ceo_orchestrator.CEO_SYSTEM_TRIGGER_NAMES
 
 
+@pytest.mark.asyncio
+async def test_gate_ceo_trigger_disables_fire_when_rollout_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        is_system=True,
+        name="ceo_daily_brief",
+        is_enabled=True,
+    )
+    settings = SimpleNamespace(
+        tenant_id=uuid.uuid4(),
+        ceo_agent_id=trigger.agent_id,
+        enabled=True,
+    )
+    stored = SimpleNamespace(id=trigger.id, is_enabled=True)
+
+    class _Result:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar_one_or_none(self):
+            return self._value
+
+    class _DB:
+        def __init__(self):
+            self.calls = 0
+            self.committed = False
+
+        async def execute(self, _stmt):
+            self.calls += 1
+            if self.calls == 1:
+                return _Result(settings)
+            return _Result(stored)
+
+        async def commit(self):
+            self.committed = True
+
+    db = _DB()
+
+    class _CM:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(ceo_orchestrator, "async_session", lambda: _CM())
+    monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: False)
+
+    skipped = await ceo_orchestrator.gate_ceo_trigger_automation(trigger, now)
+    assert skipped is True
+    assert stored.is_enabled is False
+    assert db.committed is True
+
+
 # ─── Snapshot truncation (FR-CEO-2) ──────────────────────────────────
 
 
