@@ -143,6 +143,7 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
     slide_area = width * height
     text_chars_by_slide: list[int] = []
     shape_count_by_slide: list[int] = []
+    editable_shape_count_by_slide: list[int] = []
     for slide_root, slide_text_entry in zip(slide_roots, slide_texts, strict=False):
         picture_count = 0
         picture_area = 0
@@ -184,6 +185,15 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
         )
         text_chars_by_slide.append(len("".join(slide_text_entry.split())))
         shape_count_by_slide.append(shape_count)
+        # ``picture_count`` only includes visible pictures with a valid
+        # transform.  Use every declared picture shape here so malformed or
+        # off-canvas raster nodes can never be misclassified as editable.
+        declared_picture_count = len(
+            slide_root.findall(".//p:pic", picture_namespace)
+        )
+        editable_shape_count_by_slide.append(
+            max(0, shape_count - declared_picture_count)
+        )
     while len(picture_count_by_slide) < len(slide_ids):
         # A structurally minimal fixture may declare slide ids without
         # shipping slide XML.  Preserve the existing page-count facts while
@@ -192,6 +202,7 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
         picture_coverage_ratio_by_slide.append(0.0)
         text_chars_by_slide.append(0)
         shape_count_by_slide.append(0)
+        editable_shape_count_by_slide.append(0)
     slide_count = len(slide_ids)
     # FR-P7: make viewer-side font substitution explicit and auditable.
     requested_families = requested_font_families_from_pptx(data)
@@ -218,6 +229,7 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
         # FR-P4 density facts: per-slide editable text volume and shape count.
         "text_chars_by_slide": text_chars_by_slide,
         "shape_count_by_slide": shape_count_by_slide,
+        "editable_shape_count_by_slide": editable_shape_count_by_slide,
         "mean_text_chars_per_slide": round(
             sum(text_chars_by_slide) / slide_count,
             6,
@@ -339,9 +351,20 @@ def _apply_presentation_v2_deck_gates(
     if not density_ok:
         invalid_types.add("pptx")
 
-    # FR-P5 data pages must stay editable: a data slide may not be a full-page
-    # rasterized picture in the final PPTX.
+    # FR-P5 data pages must stay editable.  A full-bleed background is legal
+    # when the slide also contains a material native/editable composition; a
+    # single screenshot plus a token overlay is still rejected.
     coverage = [float(value) for value in pptx_facts.get("picture_coverage_ratio_by_slide") or ()]
+    editable_shapes = [
+        int(value)
+        for value in pptx_facts.get("editable_shape_count_by_slide") or ()
+    ]
+    raster_only_coverage = float(
+        policy["maximum_raster_only_picture_coverage_ratio"]
+    )
+    minimum_editable_shapes = int(
+        policy["minimum_editable_shapes_on_picture_covered_data_slide"]
+    )
     spec_slides = deck_slide_spec.get("slides")
     data_slide_editability_ok = True
     if isinstance(spec_slides, list):
@@ -349,10 +372,22 @@ def _apply_presentation_v2_deck_gates(
             if not isinstance(spec_slide, Mapping) or spec_slide.get("data_slide") is not True:
                 continue
             observed = coverage[index] if index < len(coverage) else 0.0
-            if observed >= 0.9:
+            observed_editable_shapes = (
+                editable_shapes[index] if index < len(editable_shapes) else 0
+            )
+            if (
+                observed >= raster_only_coverage
+                and observed_editable_shapes < minimum_editable_shapes
+            ):
                 data_slide_editability_ok = False
                 break
     pptx_facts["data_slide_editability_gate"] = int(data_slide_editability_ok)
+    pptx_facts["maximum_raster_only_picture_coverage_ratio"] = (
+        raster_only_coverage
+    )
+    pptx_facts["minimum_editable_shapes_on_picture_covered_data_slide"] = (
+        minimum_editable_shapes
+    )
     if not data_slide_editability_ok:
         invalid_types.add("pptx")
 

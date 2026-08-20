@@ -47,7 +47,9 @@
 
 ## Operations
 
-- Includes Alembic migrations up to `ceo_coordination_mode`.
+- Includes Alembic migrations up to `backfill_deliv_audit_tenant`, which
+  expands persisted creative-brief version identifiers for presentation v2
+  and restores tenant scope on historical Deliverable audit events.
 - Registration-code business-flow smoke now follows the governed platform
   registration-credential contract and its structured error responses.
 - The production release must use an immutable reviewed commit and separately

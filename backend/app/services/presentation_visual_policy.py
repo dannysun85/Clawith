@@ -142,6 +142,12 @@ def deck_quality_policy() -> dict[str, float | int | str]:
         "maximum_text_chars_per_slide": 900,
         "maximum_shapes_per_slide": 40,
         "minimum_contrast_ratio": 4.5,
+        # A full-bleed visual may be used as a background on a data slide, but
+        # it must be accompanied by a material native/editable composition.
+        # This distinguishes a hybrid slide from a single raster screenshot
+        # with a token text label placed on top.
+        "maximum_raster_only_picture_coverage_ratio": 0.9,
+        "minimum_editable_shapes_on_picture_covered_data_slide": 4,
         "data_slide_editability": "editable_required",
         "image_slide_fact_policy": "no_fact_assertions",
     }

@@ -473,4 +473,22 @@ describe('deliverable composer selection', () => {
         expect(deliverableApprovalStatusMessage(blocked, true)).toContain('明确问题');
         expect(deliverableApprovalStatusMessage(blocked, false)).toContain('cannot be approved');
     });
+
+    it('explains incomplete execution truth without claiming a quality-review requirement', () => {
+        const blocked = request({
+            status: 'waiting_approval',
+            current_stage: 'output_review',
+            approval_readiness: {
+                approvable: false,
+                quality_gate_required: false,
+                quality_status: 'not_required',
+                blockers: ['deliverable_execution_incomplete'],
+                receipt_ref: null,
+            },
+        });
+
+        expect(deliverableApprovalBlocked(blocked)).toBe(true);
+        expect(deliverableApprovalStatusMessage(blocked, true)).toContain('执行记录');
+        expect(deliverableApprovalStatusMessage(blocked, false)).toContain('Execution steps');
+    });
 });

@@ -18,6 +18,9 @@ from app.models.deliverable import (
 )
 from app.services import deliverable_workflows
 from app.services.creative_briefs import (
+    CREATIVE_BRIEF_SCHEMA_VERSION,
+    PRESENTATION_BRIEF_SCHEMA_VERSION,
+    VIDEO_BRIEF_SCHEMA_VERSION,
     CreativeBrief,
     brief_sha256,
     candidate_count_for_policy,
@@ -32,6 +35,18 @@ from app.services.deliverable_workflows import (
     require_workflow,
     validate_workflow_spec,
 )
+
+
+def test_registered_brief_schema_versions_fit_persisted_column() -> None:
+    column = DeliverableCreativeBrief.__table__.c.schema_version
+    max_length = column.type.length
+
+    assert max_length is not None
+    assert max(
+        len(CREATIVE_BRIEF_SCHEMA_VERSION),
+        len(VIDEO_BRIEF_SCHEMA_VERSION),
+        len(PRESENTATION_BRIEF_SCHEMA_VERSION),
+    ) <= max_length
 
 
 class _Result:

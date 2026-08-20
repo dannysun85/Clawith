@@ -277,6 +277,11 @@ async def test_review_creation_rejects_two_memberships_for_one_physical_identity
     )
     monkeypatch.setattr(
         deliverables,
+        "_synchronize_and_require_output_execution",
+        AsyncMock(return_value=artifacts),
+    )
+    monkeypatch.setattr(
+        deliverables,
         "_ensure_quality_review_allowlisted",
         lambda _request: None,
     )

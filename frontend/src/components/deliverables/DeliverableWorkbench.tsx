@@ -30,6 +30,7 @@ import {
 } from '../../services/api';
 import {
     deliverableApprovalBlocked,
+    deliverableApprovalStatusMessage,
     deliverableNextAction,
 } from '../../utils/deliverables';
 import type { SaasTier } from '../TierSelector';
@@ -930,6 +931,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         setVideoPreviewError(false);
     }, [previewArtifactUrl]);
     const awaitingReview = request.status === 'waiting_approval' && request.current_stage === 'output_review';
+    const failedRequest = request.status === 'failed';
     const storyboardReview = request.workflow_id === 'builtin.video.v2'
         && request.status === 'waiting_approval'
         && request.current_stage === 'storyboard_review';
@@ -1152,6 +1154,15 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     ? `已完成 ${qualityReview.submitted_reviewer_count}/${qualityReview.assigned_reviewer_count} 份独立检查`
                     : `${qualityReview.submitted_reviewer_count}/${qualityReview.assigned_reviewer_count} independent checks completed`,
                 step: 1,
+            };
+        }
+        if (awaitingReview && !managedReviewRequired) {
+            return {
+                title: approvalBlocked
+                    ? (isZh ? '交付检查尚未完成' : 'Delivery checks are incomplete')
+                    : (isZh ? '文件已生成，等待确认' : 'Files are ready for confirmation'),
+                description: deliverableApprovalStatusMessage(request, isZh),
+                step: approvalBlocked ? 1 : 2,
             };
         }
         if (awaitingReview) {
@@ -1869,7 +1880,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     {isZh ? '暂时无法读取质量检查，请稍后重试。' : 'Quality review is temporarily unavailable. Please try again.'}
                 </div>
             )}
-            {(awaitingReview || storyboardReview || shotReview || outlineReview) && revisionOpen && (
+            {(awaitingReview || storyboardReview || shotReview || outlineReview || failedRequest) && revisionOpen && (
                 <section className="deliverable-revision-form" aria-label={isZh ? '创建修订版本' : 'Create revision'}>
                     <div>
                         <strong>{isZh ? '说明需要修改的内容' : 'Describe the requested changes'}</strong>
@@ -1940,7 +1951,9 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         >
                             {acting === 'request_changes'
                                 ? (isZh ? '正在创建新版本…' : 'Creating revision…')
-                                : (isZh ? '创建修订版本' : 'Create revision')}
+                                : failedRequest
+                                    ? (isZh ? '创建重试版本' : 'Create retry revision')
+                                    : (isZh ? '创建修订版本' : 'Create revision')}
                         </button>
                     </div>
                 </section>
@@ -2028,6 +2041,20 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                         {revisionOpen
                             ? (isZh ? '收起修改说明' : 'Hide revision form')
                             : (isZh ? '重做失败镜头' : 'Redo failed shots')}
+                    </button>
+                </div>
+            )}
+            {failedRequest && (
+                <div className="deliverable-review-card__actions">
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={acting !== null}
+                        onClick={toggleRevisionForm}
+                    >
+                        {revisionOpen
+                            ? (isZh ? '收起重试说明' : 'Hide retry form')
+                            : (isZh ? '重新生成' : 'Regenerate')}
                     </button>
                 </div>
             )}

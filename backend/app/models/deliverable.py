@@ -636,7 +636,10 @@ class DeliverableCreativeBrief(Base):
         nullable=True,
     )
     modality: Mapped[str] = mapped_column(String(24), nullable=False)
-    schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Version identifiers are part of the persisted contract.  Presentation
+    # v2 uses ``presentation-brief-v1`` (21 chars), so this column must not be
+    # narrower than the identifiers accepted by the compiler.
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="draft", server_default=text("'draft'")
     )

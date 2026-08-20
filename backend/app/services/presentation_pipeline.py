@@ -707,6 +707,20 @@ async def advance_presentation_v2_after_run(
     stage = str(request.current_stage or "")
     cancelled = str(lifecycle_status or "").strip().lower() == "cancelled"
 
+    # Runtime terminal notifications are at-least-once.  Once the outline run
+    # has already been projected, a replay must remain owned by this stage
+    # machine; otherwise the generic artifact reconciler interprets the
+    # intentionally artifact-free planning run as a missing final PPTX and
+    # regresses ``outline_review`` to ``artifact_verification_failed``.
+    if (
+        stage == "outline_review"
+        and request.status == "waiting_approval"
+    ) or (
+        stage == "outline_invalid"
+        and request.status == "failed"
+    ):
+        return True
+
     if stage in {"slide_render", "slide_revision"}:
         if cancelled:
             return False

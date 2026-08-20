@@ -4,15 +4,26 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+from pathlib import Path
+import sys
 
-from app.services.agent_template_contract import load_agent_template_manifest
-from app.services.agent_tools import RUNTIME_TYPED_APPLICATION_TOOL_NAMES
-from app.services.builtin_tool_definitions import BUILTIN_TOOL_DEFINITIONS
-from app.services.multimodal_capability_matrix import validate_capability_matrix
-from app.services.media_provider_routing import validate_media_route_policy
-from app.services.skill_seeder import BUILTIN_SKILLS
-from app.services.template_seeder import _TEMPLATE_ROOT
+_BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(_BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_ROOT))
+
+# Importing the service registries initializes the application logger.  Keep
+# import-time diagnostics on stderr so ``--json`` always reserves stdout for a
+# single machine-readable document, including on hosts without Docker.
+with contextlib.redirect_stdout(sys.stderr):
+    from app.services.agent_template_contract import load_agent_template_manifest
+    from app.services.agent_tools import RUNTIME_TYPED_APPLICATION_TOOL_NAMES
+    from app.services.builtin_tool_definitions import BUILTIN_TOOL_DEFINITIONS
+    from app.services.media_provider_routing import validate_media_route_policy
+    from app.services.multimodal_capability_matrix import validate_capability_matrix
+    from app.services.skill_seeder import BUILTIN_SKILLS
+    from app.services.template_seeder import _TEMPLATE_ROOT
 
 
 def _load_templates() -> dict[str, dict[str, object]]:

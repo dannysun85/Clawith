@@ -1230,7 +1230,15 @@ if (typeof document !== 'undefined' && !document.getElementById(_PULSE_STYLE_ID)
 type AnalysisItem =
     | { type: 'thinking'; content: string }
     | { type: 'assistant_progress'; content: string }
-    | { type: 'tool'; name: string; args: any; status: 'running' | 'done'; result?: string };
+    | {
+        type: 'tool';
+        name: string;
+        args: any;
+        status: 'running' | 'done';
+        result?: string;
+        executionStatus?: 'pending' | 'succeeded' | 'failed' | 'unknown';
+        errorCode?: string;
+    };
 
 type AnalysisToolMeta = {
     title: string;
@@ -1308,6 +1316,12 @@ function getToolMeta(item: Extract<AnalysisItem, { type: 'tool' }>): AnalysisToo
         return { title: query ? `Searched ${query}` : titleCaseToolName(name), label: 'Search', target: query, kind: 'search' };
     }
     if (lower.includes('send_') || lower.includes('message')) {
+        if (item.executionStatus === 'failed') {
+            return { title: recipient ? `Message not sent to ${recipient}` : 'Message not sent', label: 'Message blocked', target: recipient, kind: 'message' };
+        }
+        if (item.executionStatus === 'pending' || item.executionStatus === 'unknown') {
+            return { title: recipient ? `Message delivery unconfirmed for ${recipient}` : 'Message delivery unconfirmed', label: 'Message unconfirmed', target: recipient, kind: 'message' };
+        }
         return { title: recipient ? `Sent message to ${recipient}` : titleCaseToolName(name), label: 'Message', target: recipient, kind: 'message' };
     }
     if (lower.includes('agent')) {
@@ -1346,6 +1360,8 @@ function describeAnalysis(items: AnalysisItem[], t: (k: string, opts?: any) => s
     let deleted = 0;
     let commands = 0;
     let agents = 0;
+    let blockedAgents = 0;
+    let unconfirmedAgents = 0;
     const agentMessageTools = new Set([
         'send_message_to_agent',
         'send_file_to_agent',
@@ -1355,7 +1371,11 @@ function describeAnalysis(items: AnalysisItem[], t: (k: string, opts?: any) => s
         if (name.includes('write_file') || name.includes('create_file')) created += 1;
         else if (name.includes('edit_file') || name.includes('update_file') || name.includes('move_file') || name.startsWith('convert_')) updated += 1;
         else if (name.includes('delete_file')) deleted += 1;
-        else if (agentMessageTools.has(name)) agents += 1;
+        else if (agentMessageTools.has(name)) {
+            if (item.executionStatus === 'failed') blockedAgents += 1;
+            else if (item.executionStatus === 'pending' || item.executionStatus === 'unknown') unconfirmedAgents += 1;
+            else agents += 1;
+        }
         else commands += 1;
     }
 
@@ -1365,6 +1385,8 @@ function describeAnalysis(items: AnalysisItem[], t: (k: string, opts?: any) => s
     if (deleted) parts.push(t('agent.chat.deletedFiles', { count: deleted }));
     if (commands) parts.push(t('agent.chat.ranCommands', { count: commands }));
     if (agents) parts.push(t('agent.chat.ranAgents', { count: agents }));
+    if (blockedAgents) parts.push(t('agent.chat.blockedAgents', { count: blockedAgents }));
+    if (unconfirmedAgents) parts.push(t('agent.chat.unconfirmedAgents', { count: unconfirmedAgents }));
     if (!parts.length) parts.push(t('agent.chat.ranCommands', { count: toolItems.length }));
     return parts.join(', ');
 }
@@ -1463,6 +1485,8 @@ function AnalysisCard({
 
                             const tc = item;
                             const running = tc.status === 'running';
+                            const executionFailed = tc.executionStatus === 'failed';
+                            const executionUnconfirmed = tc.executionStatus === 'pending' || tc.executionStatus === 'unknown';
                             const meta = getToolMeta(tc);
                             const ToolIcon = getToolIcon(meta.kind);
                             const provider = getToolProvider(tc.name);
@@ -1489,7 +1513,7 @@ function AnalysisCard({
                                                 overflow: 'hidden',
                                                 textOverflow: 'ellipsis',
                                                 whiteSpace: 'nowrap',
-                                                color: running ? 'var(--text-secondary)' : 'var(--text-tertiary)',
+                                                color: executionFailed ? 'var(--error)' : (running ? 'var(--text-secondary)' : 'var(--text-tertiary)'),
                                                 fontSize: '13px',
                                                 lineHeight: 1.5,
                                             }}>
@@ -1498,6 +1522,16 @@ function AnalysisCard({
                                             {running && (
                                                 <span style={{ color: 'var(--text-tertiary)', fontSize: '12px', flexShrink: 0 }}>
                                                     {t('common.loading')}
+                                                </span>
+                                            )}
+                                            {!running && executionFailed && (
+                                                <span style={{ color: 'var(--error)', fontSize: '12px', flexShrink: 0 }}>
+                                                    {t('agent.chat.toolFailed')}
+                                                </span>
+                                            )}
+                                            {!running && executionUnconfirmed && (
+                                                <span style={{ color: 'var(--text-tertiary)', fontSize: '12px', flexShrink: 0 }}>
+                                                    {t('agent.chat.toolUnconfirmed')}
                                                 </span>
                                             )}
                                         </div>
@@ -2674,6 +2708,8 @@ export default function AgentDetailPage() {
                     toolStatus: message.toolStatus,
                     toolResult: message.toolResult,
                     toolThinking: message.toolThinking,
+                    toolExecutionStatus: message.toolExecutionStatus,
+                    toolErrorCode: message.toolErrorCode,
                 }),
                 ...(message.thinking && { thinking: message.thinking }),
                 ...(message.created_at && { timestamp: message.created_at }),
@@ -3256,7 +3292,7 @@ export default function AgentDetailPage() {
             if (activeSessionIdRef.current !== sess.id) return;
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
-                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking, toolExecutionStatus: m.toolExecutionStatus, toolErrorCode: m.toolErrorCode }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -3387,7 +3423,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error(t('common.error.saveFailed', '保存失败'), { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; storageFilePath?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; runtimeError?: RuntimeErrorContext; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
+    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; storageFilePath?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; toolExecutionStatus?: 'pending' | 'succeeded' | 'failed' | 'unknown'; toolErrorCode?: string; thinking?: string; imageUrl?: string; timestamp?: string; runtimeError?: RuntimeErrorContext; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -4320,6 +4356,8 @@ export default function AgentDetailPage() {
                     toolStatus: d.status,
                     toolResult: d.result,
                     toolThinking: d.reasoning_content,
+                    toolExecutionStatus: d.execution_status,
+                    toolErrorCode: d.error_code,
                 });
                 if (d.status === 'done') {
                     const mediaPath = safeWorkspaceMediaPath(d.workspace_path)
@@ -4854,7 +4892,7 @@ export default function AgentDetailPage() {
             );
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
-                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking, toolExecutionStatus: m.toolExecutionStatus, toolErrorCode: m.toolErrorCode }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -4944,7 +4982,7 @@ export default function AgentDetailPage() {
             );
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
-                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking, toolExecutionStatus: m.toolExecutionStatus, toolErrorCode: m.toolErrorCode }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -8276,6 +8314,8 @@ export default function AgentDetailPage() {
                                                                     args: msg.toolArgs || {},
                                                                     status: msg.toolStatus === 'running' ? 'running' : 'done',
                                                                     result: msg.toolResult || undefined,
+                                                                    executionStatus: msg.toolExecutionStatus,
+                                                                    errorCode: msg.toolErrorCode,
                                                                 });
                                                             } else if (msg.role === 'assistant') {
                                                                 // Could be thinking-only OR has content (mid-flow text)

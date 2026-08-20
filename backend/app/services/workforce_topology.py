@@ -606,6 +606,19 @@ def _project_topology_execution_summaries(
     return projected
 
 
+def _project_topology_agent_status(
+    agent_status: str,
+    execution: WorkforceTopologyExecutionOut | None,
+) -> str:
+    """Overlay live Run activity without hiding lifecycle/health failures."""
+
+    if agent_status in {"creating", "stopped", "error"}:
+        return agent_status
+    if execution is not None and execution.status in ACTIVE_EXECUTION_STATUSES:
+        return "running"
+    return agent_status
+
+
 async def _load_topology_execution_summaries(
     db: AsyncSession,
     *,
@@ -1123,7 +1136,10 @@ async def build_workforce_topology(
                 name=agent.name,
                 avatar_url=agent.avatar_url,
                 role_description=agent.role_description or "",
-                status=agent.status,
+                status=_project_topology_agent_status(
+                    agent.status,
+                    execution_by_agent.get(agent.id),
+                ),
                 last_active_at=agent.last_active_at,
                 tokens_used_today=(agent.tokens_used_today or 0) if can_view_company_analytics else None,
                 cache_read_tokens_today=(agent.cache_read_tokens_today or 0) if can_view_company_analytics else None,

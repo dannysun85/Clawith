@@ -13,6 +13,10 @@ type SeatUsage = {
     pending_invites: number;
 };
 
+type AgentCreationLimitOptions = {
+    enabled?: boolean;
+};
+
 export function countActiveAgents(agents: AgentWithExpiry[]): number {
     return agents.filter((agent) => (
         agent.status !== 'stopped'
@@ -28,16 +32,22 @@ export function agentLimitMessage(isChinese: boolean, used: number, limit: numbe
         : `Your current plan allows ${limit} agents and has used ${used}/${limit}. Upgrade your plan to continue.`;
 }
 
-export function useAgentCreationLimit(providedAgents?: AgentWithExpiry[] | null) {
+export function useAgentCreationLimit(
+    providedAgents?: AgentWithExpiry[] | null,
+    options: AgentCreationLimitOptions = {},
+) {
+    const enabled = options.enabled ?? true;
     const { data: entitlements, isLoading: loadingEntitlements } = useQuery({
         queryKey: ['subscription-entitlements'],
         queryFn: () => fetchJson<Entitlements | null>('/subscription/my-entitlements'),
+        enabled,
     });
 
     const { data: seats, isLoading: loadingSeats } = useQuery({
         queryKey: ['subscription-seats'],
         queryFn: () => fetchJson<SeatUsage>('/subscription/seats'),
         refetchInterval: 30000,
+        enabled,
     });
 
     const agents = (providedAgents ?? []) as AgentWithExpiry[];

@@ -213,6 +213,17 @@ def test_execution_summary_prioritizes_active_waiting_over_recent_terminal():
     assert summary.recently_finished_count == 1
 
 
+def test_topology_agent_status_projects_live_execution_without_hiding_health_failures():
+    active_execution = SimpleNamespace(status="running")
+    completed_execution = SimpleNamespace(status="completed")
+
+    assert workforce_topology._project_topology_agent_status("idle", active_execution) == "running"
+    assert workforce_topology._project_topology_agent_status("running", active_execution) == "running"
+    assert workforce_topology._project_topology_agent_status("idle", completed_execution) == "idle"
+    assert workforce_topology._project_topology_agent_status("error", active_execution) == "error"
+    assert workforce_topology._project_topology_agent_status("stopped", active_execution) == "stopped"
+
+
 @pytest.mark.asyncio
 async def test_work_summary_queries_are_viewer_scoped_and_not_globally_capped():
     tenant_id = uuid.uuid4()

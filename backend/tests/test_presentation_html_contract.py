@@ -160,6 +160,81 @@ def test_browser_visual_quality_accepts_measured_non_overlapping_layout():
     assert receipt["slide_count"] == 1
 
 
+def test_browser_visual_quality_rejects_line_start_punctuation():
+    layout = {
+        "slides": [
+            {
+                "width": 1280,
+                "height": 720,
+                "items": [
+                    {
+                        "kind": "text",
+                        "tag": "p",
+                        "text": "每一步都定义负责人，验收与回滚条件。",
+                        "x": 80,
+                        "y": 120,
+                        "w": 360,
+                        "h": 80,
+                        "clientWidth": 360,
+                        "clientHeight": 80,
+                        "scrollWidth": 360,
+                        "scrollHeight": 80,
+                        "style": {"fontSize": "18px", "overflow": "visible"},
+                        "lines": [
+                            {"text": "每一步都定义负责人"},
+                            {"text": "，验收与回滚条件。"},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(PresentationVisualQualityError) as error:
+        validate_browser_slide_visual_quality(layout)
+
+    assert error.value.receipt["failures"][0]["code"] == "line_start_punctuation"
+
+
+def test_editable_pptx_text_preserves_measured_browser_lines():
+    item = {
+        "text": "每一步都定义负责人，验收与回滚条件。",
+        "lines": [
+            {"text": "每一步都定义负责人，"},
+            {"text": "验收与回滚条件。"},
+        ],
+    }
+
+    assert pptx_renderer._browser_text_with_preserved_line_breaks(item) == (
+        "每一步都定义负责人，\n验收与回滚条件。"
+    )
+
+    mismatched = {**item, "lines": [{"text": "不匹配"}, {"text": "内容"}]}
+    assert pptx_renderer._browser_text_with_preserved_line_breaks(mismatched) == item["text"]
+
+
+def test_editable_pptx_multiline_body_copy_keeps_office_width_slack():
+    nearly_full = {
+        "w": 320,
+        "lines": [
+            {"text": "第一行", "w": 312},
+            {"text": "第二行", "w": 180},
+        ],
+    }
+    roomy = {
+        "w": 320,
+        "lines": [
+            {"text": "第一行", "w": 250},
+            {"text": "第二行", "w": 180},
+        ],
+    }
+
+    assert pptx_renderer._browser_text_font_scale(nearly_full, "p") == 0.8821
+    assert pptx_renderer._browser_text_font_scale(roomy, "p") == 0.94
+    assert pptx_renderer._browser_text_font_scale(nearly_full, "h1") == 1.0
+    assert pptx_renderer._browser_text_font_scale({"lines": []}, "p") == 0.94
+
+
 def test_browser_visual_quality_rejects_unreadably_small_body_copy():
     layout = {
         "slides": [
@@ -452,6 +527,7 @@ def test_presentation_html_contract_rejects_missing_image_without_page_count(
         ("[Your Brand Logo]", "unresolved visible placeholder"),
         ("品牌名称：待补充", "unresolved visible placeholder"),
         ("茶饮爱好者 ★", "unsupported visible rating glyphs"),
+        (r"第一条证据\n第二条证据", "visible serialization escape sequence"),
     ],
 )
 def test_presentation_html_contract_rejects_release_blocking_visible_copy(
@@ -473,7 +549,10 @@ def test_presentation_html_contract_rejects_release_blocking_visible_copy(
         validate_presentation_html_contract(source, expected_page_count=1)
 
 
-@pytest.mark.parametrize("visible_copy", ["[Your Brand Logo]", "办公白领 ★"])
+@pytest.mark.parametrize(
+    "visible_copy",
+    ["[Your Brand Logo]", "办公白领 ★", r"第一条证据\n第二条证据"],
+)
 def test_presentation_visible_text_policy_rejects_release_blockers(
     visible_copy: str,
 ) -> None:

@@ -483,6 +483,8 @@ export default function Layout() {
     const activeAgentId = activeAgentNestedMatch?.params.id || activeAgentRootMatch?.params.id;
     const canAccessPlatformSettings = hasProductSurface(user, 'platform_admin');
     const canAccessCompanySettings = hasProductSurface(user, 'company_admin');
+    const canCreateAgent = hasEffectiveCapability(user, 'agent.create.company')
+        || hasEffectiveCapability(user, 'agent.create.private');
     const pendingInvitationCount = user?.pending_invitation_count || 0;
     const routeParams = new URLSearchParams(location.search);
     const showCompanyTour = routeParams.get('tour') === 'company';
@@ -730,7 +732,9 @@ export default function Layout() {
         ),
         [agents, onboardingStatus?.personal_assistant_agent_id],
     );
-    const agentCreationLimit = useAgentCreationLimit(employeeAgents as any[]);
+    const agentCreationLimit = useAgentCreationLimit(employeeAgents as any[], {
+        enabled: canCreateAgent,
+    });
 
     const handleAgentLimitReached = useCallback(() => {
         toast.warning(

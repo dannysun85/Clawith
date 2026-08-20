@@ -320,6 +320,22 @@ export function deliverableApprovalStatusMessage(
             ? '文件已通过结构校验，请确认交付'
             : 'Files passed structural validation and await approval';
     }
+    const blockers = request.approval_readiness?.blockers || [];
+    if (blockers.includes('deliverable_execution_missing')) {
+        return isChinese
+            ? '执行记录尚未建立，当前不能确认交付'
+            : 'The execution record is missing; delivery cannot be confirmed';
+    }
+    if (blockers.includes('deliverable_execution_incomplete')) {
+        return isChinese
+            ? '执行记录尚未完整收敛，当前不能确认交付'
+            : 'Execution steps are incomplete; delivery cannot be confirmed';
+    }
+    if (blockers.includes('deliverable_artifact_missing')) {
+        return isChinese
+            ? '交付文件不完整，当前不能确认交付'
+            : 'Required deliverable files are missing; delivery cannot be confirmed';
+    }
     const status = request.approval_readiness?.quality_status;
     if (status === 'blocked') {
         return isChinese

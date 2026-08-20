@@ -1355,6 +1355,7 @@ async def test_followup_run_recovers_failed_deliverable_from_same_session(
     assert request.current_stage == "output_review"
     assert request.last_error_code is None
     assert request.completed_at is None
+    assert request.agent_run_id == followup_run_id
     reconcile.assert_awaited_once_with(
         ANY,
         request=request,
@@ -1421,6 +1422,7 @@ async def test_followup_run_registers_new_revision_for_waiting_approval_request(
     assert request.status == "waiting_approval"
     assert request.current_stage == "output_review"
     assert request.version == 5
+    assert request.agent_run_id == followup_run_id
 
 
 @pytest.mark.asyncio

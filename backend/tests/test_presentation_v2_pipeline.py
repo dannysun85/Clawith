@@ -733,6 +733,35 @@ async def test_outline_draft_terminal_projection_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "stage"),
+    [
+        ("waiting_approval", "outline_review"),
+        ("failed", "outline_invalid"),
+    ],
+)
+async def test_outline_terminal_projection_replay_is_idempotent(
+    status: str,
+    stage: str,
+) -> None:
+    request = _request(status=status, current_stage=stage)
+    original_version = request.version
+
+    handled = await advance_presentation_v2_after_run(
+        _Session([]),  # type: ignore[arg-type]
+        request=request,
+        run_id=uuid.uuid4(),
+        lifecycle_status="completed",
+        storage=_FakeStorage(),
+    )
+
+    assert handled is True
+    assert request.status == status
+    assert request.current_stage == stage
+    assert request.version == original_version
+
+
+@pytest.mark.asyncio
 async def test_slide_render_stage_records_semantic_qa_and_defers() -> None:
     request = _request(status="running", current_stage="slide_render")
     execution = _execution(request)

@@ -355,6 +355,17 @@ async def _request_out(db: AsyncSession, request: DeliverableRequest) -> Deliver
         artifact_models,
         require_creative_quality_gate=quality_gate_required,
     )
+    if readiness.approvable:
+        execution_blockers = await _output_execution_blockers(db, request)
+        if execution_blockers:
+            readiness = readiness.model_copy(
+                update={
+                    "approvable": False,
+                    "blockers": tuple(
+                        dict.fromkeys((*readiness.blockers, *execution_blockers))
+                    ),
+                }
+            )
     fields = {
         field: getattr(request, field)
         for field in DeliverableRequestOut.model_fields
@@ -481,6 +492,57 @@ async def _request_artifacts(
         query = query.with_for_update()
     result = await db.execute(query)
     return selected_deliverable_artifacts(request, tuple(result.scalars().all()))
+
+
+async def _output_execution_blockers(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    *,
+    execution: DeliverableExecution | None = None,
+    lock: bool = False,
+) -> tuple[str, ...]:
+    """Require durable execution truth before final output approval."""
+
+    if request.current_stage != "output_review":
+        return ()
+    current = execution or await current_execution(db, request, lock=lock)
+    if not isinstance(current, DeliverableExecution):
+        return ("deliverable_execution_missing",)
+    units = await execution_units(db, current.id, lock=lock)
+    if not units or any(unit.status != "succeeded" for unit in units):
+        return ("deliverable_execution_incomplete",)
+    return ()
+
+
+async def _synchronize_and_require_output_execution(
+    db: AsyncSession,
+    request: DeliverableRequest,
+) -> tuple[DeliverableArtifactRevision, ...]:
+    """Bind verified artifacts, project recovery, then enforce unit closure."""
+
+    execution = await ensure_execution_shadow(db, request, lock=True)
+    artifacts = await _request_artifacts(db, request, lock=True)
+    if artifacts:
+        await bind_artifacts_to_current_execution(db, request, artifacts)
+    await project_execution_lifecycle(db, request)
+    blockers = await _output_execution_blockers(
+        db,
+        request,
+        execution=execution,
+        lock=True,
+    )
+    if blockers:
+        code = blockers[0]
+        message = (
+            "The deliverable execution record is missing"
+            if code == "deliverable_execution_missing"
+            else "Every deliverable execution unit must succeed before final approval"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": code, "message": message},
+        )
+    return artifacts
 
 
 async def _review_rows(
@@ -1041,6 +1103,11 @@ async def record_deliverable_approval(
         settings.DELIVERABLE_STAGE_APPROVALS_ENABLED
         and request.workflow_id == PRESENTATION_V2_WORKFLOW_ID
     )
+    failed_retry = bool(
+        data.action == "request_changes"
+        and data.stage == "final"
+        and request.status == "failed"
+    )
     if (
         data.stage != "final"
         and not (stage_flow and data.stage == "storyboard")
@@ -1080,7 +1147,10 @@ async def record_deliverable_approval(
         # FR-V4: a failed shot is redone through a targeted revision without
         # dragging the whole request back through the storyboard.
         pass
-    elif request.status != "waiting_approval" or request.current_stage != "output_review":
+    elif (
+        not failed_retry
+        and (request.status != "waiting_approval" or request.current_stage != "output_review")
+    ):
         raise HTTPException(
             status_code=409,
             detail={
@@ -1090,6 +1160,8 @@ async def record_deliverable_approval(
         )
 
     decision_execution = await ensure_execution_shadow(db, request, lock=True)
+    if data.action == "approve" and data.stage == "final":
+        await _synchronize_and_require_output_execution(db, request)
     revision_stage = (
         "storyboard"
         if stage_flow and data.stage == "storyboard"
@@ -1278,6 +1350,7 @@ async def record_deliverable_approval(
     db.add(receipt)
     db.add(
         AuditLog(
+            tenant_id=request.tenant_id,
             user_id=current_user.id,
             agent_id=request.agent_id,
             action=f"deliverable.approval.{data.action}",
@@ -1379,7 +1452,7 @@ async def create_deliverable_quality_review(
                 "message": "Deliverable must be in final output review",
             },
         )
-    artifacts = await _request_artifacts(db, request, lock=True)
+    artifacts = await _synchronize_and_require_output_execution(db, request)
     if len(artifacts) != len(set(request.output_contract)):
         raise HTTPException(
             status_code=409,
@@ -1534,6 +1607,7 @@ async def create_deliverable_quality_review(
     db.add_all(assignments)
     db.add(
         AuditLog(
+            tenant_id=request.tenant_id,
             user_id=current_user.id,
             agent_id=request.agent_id,
             action="deliverable.quality_review.created",
@@ -1694,6 +1768,7 @@ async def submit_deliverable_quality_review(
         review.version += 1
         db.add(
             AuditLog(
+                tenant_id=request.tenant_id,
                 user_id=current_user.id,
                 agent_id=request.agent_id,
                 action="deliverable.quality_review.superseded",
@@ -1736,6 +1811,7 @@ async def submit_deliverable_quality_review(
         raise _quality_review_error(exc) from exc
     db.add(
         AuditLog(
+            tenant_id=request.tenant_id,
             user_id=current_user.id,
             agent_id=request.agent_id,
             action="deliverable.quality_review.submitted",
@@ -1817,6 +1893,7 @@ async def add_deliverable_quality_review_evidence(
         review.version += 1
         db.add(
             AuditLog(
+                tenant_id=request.tenant_id,
                 user_id=current_user.id,
                 agent_id=request.agent_id,
                 action="deliverable.quality_review.superseded",
@@ -1875,6 +1952,7 @@ async def add_deliverable_quality_review_evidence(
         raise _quality_review_error(exc) from exc
     db.add(
         AuditLog(
+            tenant_id=request.tenant_id,
             user_id=current_user.id,
             agent_id=request.agent_id,
             action="deliverable.quality_review.evidence_added",
@@ -2130,6 +2208,7 @@ async def apply_deliverable_action(
     if request.current_stage == "output_review":
         now = datetime.now(UTC)
         if data.action == "approve":
+            await _synchronize_and_require_output_execution(db, request)
             try:
                 artifacts = await approve_deliverable_artifacts(db, request=request)
             except DeliverableArtifactError as exc:

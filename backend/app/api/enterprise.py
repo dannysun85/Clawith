@@ -1231,8 +1231,14 @@ def _runtime_settings_tenant_id(current_user: User, requested_tenant_id: str | N
         tenant_id = uuid.UUID(str(raw_tenant_id))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid tenant ID") from exc
-    from app.services.access_control import is_company_governor
+    from app.services.access_control import is_company_governor, is_platform_operator
 
+    # Runtime models are platform-operated assets. A platform operator may
+    # configure them for a selected tenant without inheriting any company
+    # membership or access to that tenant's business data. Company governors
+    # remain limited to their active company.
+    if is_platform_operator(current_user):
+        return tenant_id
     if not is_company_governor(current_user) or current_user.tenant_id != tenant_id:
         raise HTTPException(status_code=403, detail="Cannot manage another tenant's Runtime models")
     return tenant_id

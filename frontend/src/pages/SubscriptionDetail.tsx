@@ -118,7 +118,8 @@ const orderDescription = (order: PaymentOrder) => {
     return order.type || '-';
 };
 
-const orderStatusLabel = (status: string) => {
+const orderStatusLabel = (order: PaymentOrder) => {
+    if (order.status === 'pending' && order.provider === 'manual') return '待人工处理';
     const labels: Record<string, string> = {
         pending: '待支付',
         paid: '已支付',
@@ -126,7 +127,7 @@ const orderStatusLabel = (status: string) => {
         canceled: '已取消',
         refunded: '已退款',
     };
-    return labels[status] || status || '-';
+    return labels[order.status] || order.status || '-';
 };
 
 export const transactionActionLabel = (tx: CreditTransaction) => {
@@ -380,7 +381,7 @@ export default function SubscriptionDetail() {
                                                 <TableCell align="right">{formatMoneyCny(order.currency, order.amount_cents, cnyRate)}</TableCell>
                                                 <TableCell>
                                                     <span style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '4px 10px', background: 'var(--bg-secondary)', color: 'var(--text-secondary)', fontWeight: 650, fontSize: 12 }}>
-                                                        {orderStatusLabel(order.status)}
+                                                        {orderStatusLabel(order)}
                                                     </span>
                                                 </TableCell>
                                             </tr>

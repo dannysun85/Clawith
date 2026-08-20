@@ -1141,6 +1141,8 @@ async def get_session_messages(
                 entry["toolArgs"] = data.get("args") or data.get("arguments")
                 entry["toolStatus"] = data.get("status", "done")
                 entry["toolResult"] = data.get("result", "")
+                entry["toolExecutionStatus"] = data.get("execution_status")
+                entry["toolErrorCode"] = data.get("error_code")
                 entry["toolThinking"] = project_private_reasoning(
                     data.get("reasoning_content")
                 )

@@ -11,7 +11,7 @@ import AccountManagement from './AccountManagement';
 const SAAS_TIERS = ['lite', 'pro', 'ultra'];
 const LLM_ROUTE_MODALITIES = ['text', 'image', 'video'];
 
-type SaasTab = 'plans' | 'packs' | 'rules' | 'model-routes' | 'media-routes' | 'tenants' | 'accounts' | 'production-issues';
+type SaasTab = 'plans' | 'packs' | 'rules' | 'model-routes' | 'media-routes' | 'tenants' | 'orders' | 'accounts' | 'production-issues';
 
 type ModelRoute = {
     id: string;
@@ -21,6 +21,33 @@ type ModelRoute = {
     priority: number;
     fallback_route_id?: string | null;
     enabled: boolean;
+};
+
+type PlatformLlmModel = {
+    id: string;
+    provider: string;
+    model: string;
+    label: string;
+    base_url?: string | null;
+    max_output_tokens?: number | null;
+    modality: string;
+    tier: string;
+    enabled: boolean;
+    verification_status?: string | null;
+    last_verified_at?: string | null;
+    supports_tool_calling?: boolean | null;
+    tool_calling_error?: string | null;
+};
+
+type LlmModelTestResult = {
+    success: boolean;
+    connection_success: boolean;
+    reply?: string;
+    connection_latency_ms: number;
+    tool_calling_supported: boolean | null;
+    tool_calling_latency_ms: number;
+    capability_recorded: boolean;
+    error?: string | null;
 };
 
 type MediaRoute = {
@@ -151,6 +178,20 @@ type Plan = {
     name: string;
 };
 
+type PaymentOrder = {
+    id: string;
+    tenant_id: string;
+    type: string;
+    plan_id?: string | null;
+    credits?: number | null;
+    amount_cents: number;
+    currency: string;
+    provider: string;
+    status: string;
+    created_at: string;
+    paid_at?: string | null;
+};
+
 type InitializeFreeResult = {
     total_candidates: number;
     created: number;
@@ -195,6 +236,7 @@ const tabMeta: { key: SaasTab; label: string; icon: ReactNode }[] = [
     { key: 'model-routes', label: '输入理解路由', icon: <IconRoute size={15} stroke={1.7} /> },
     { key: 'media-routes', label: '媒体生成策略', icon: <IconPhotoVideo size={15} stroke={1.7} /> },
     { key: 'tenants', label: '租户订阅', icon: <IconUsers size={15} stroke={1.7} /> },
+    { key: 'orders', label: '人工订单', icon: <IconReceipt size={15} stroke={1.7} /> },
     { key: 'accounts', label: '账号池', icon: <IconDatabase size={15} stroke={1.7} /> },
     { key: 'production-issues', label: '生产问题', icon: <IconAlertTriangle size={15} stroke={1.7} /> },
 ];
@@ -236,6 +278,7 @@ export default function SaasAdmin() {
             {tab === 'model-routes' && <ModelRoutesTab />}
             {tab === 'media-routes' && <MediaRoutesTab />}
             {tab === 'tenants' && <TenantsTab />}
+            {tab === 'orders' && <ManualOrdersTab />}
             {tab === 'accounts' && <AccountManagement />}
             {tab === 'production-issues' && <ProductionIssuesTab />}
         </div>
@@ -248,7 +291,7 @@ function ModelRoutesTab() {
         queryKey: ['saas-model-routes'],
         queryFn: () => fetchJson<ModelRoute[]>('/saas/model-routes'),
     });
-    const { data: models = [] } = useQuery({
+    const { data: models = [] } = useQuery<PlatformLlmModel[]>({
         queryKey: ['llm-models-platform-routes'],
         queryFn: () => enterpriseApi.platformLlmModels(),
     });
@@ -273,6 +316,7 @@ function ModelRoutesTab() {
             <div className="card" style={{ marginBottom: 16, padding: 14, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
                 这里配置对话输入理解路由：text、image、video。语音、音乐以及图片/视频“生成模型”请到“媒体路由”配置；系统会拒绝把不支持该输入类型的模型绑定到对应路由。
             </div>
+            <PlatformModelPoolCard models={models} />
             <RuntimeModelSettingsCard />
             <div className="card" style={{ marginBottom: 16, display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10, alignItems: 'end' }}>
                 <Field label="Tier">
@@ -323,6 +367,138 @@ function ModelRoutesTab() {
                     );
                 }}
             />
+        </div>
+    );
+}
+
+function PlatformModelPoolCard({ models }: { models: PlatformLlmModel[] }) {
+    const qc = useQueryClient();
+    const [showForm, setShowForm] = useState(false);
+    const [form, setForm] = useState({
+        provider: 'custom',
+        model: '',
+        label: '',
+        base_url: '',
+        max_output_tokens: '4096',
+        modality: 'text',
+        tier: 'standard',
+    });
+    const [testResult, setTestResult] = useState<{ modelId: string; result: LlmModelTestResult } | null>(null);
+
+    const create = useMutation({
+        mutationFn: () => fetchJson<PlatformLlmModel>('/enterprise/llm-models?platform=true', {
+            method: 'POST',
+            body: JSON.stringify({
+                provider: form.provider.trim(),
+                model: form.model.trim(),
+                api_key: '',
+                base_url: form.base_url.trim() || null,
+                label: form.label.trim(),
+                enabled: true,
+                supports_vision: false,
+                max_output_tokens: Number(form.max_output_tokens),
+                modality: form.modality,
+                tier: form.tier,
+            }),
+        }),
+        onSuccess: () => {
+            qc.invalidateQueries({ queryKey: ['llm-models-platform-routes'] });
+            setShowForm(false);
+            setForm({
+                provider: 'custom',
+                model: '',
+                label: '',
+                base_url: '',
+                max_output_tokens: '4096',
+                modality: 'text',
+                tier: 'standard',
+            });
+        },
+    });
+    const test = useMutation({
+        mutationFn: (model: PlatformLlmModel) => fetchJson<LlmModelTestResult>('/enterprise/llm-test', {
+            method: 'POST',
+            body: JSON.stringify({
+                provider: model.provider,
+                model: model.model,
+                base_url: model.base_url || null,
+                model_id: model.id,
+            }),
+        }),
+        onSuccess: (result, model) => {
+            setTestResult({ modelId: model.id, result });
+            qc.invalidateQueries({ queryKey: ['llm-models-platform-routes'] });
+            qc.invalidateQueries({ queryKey: ['runtime-model-settings'] });
+        },
+    });
+    const error = create.error || test.error;
+
+    return (
+        <div className="card" style={{ marginBottom: 16, padding: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'start' }}>
+                <div>
+                    <div style={{ fontSize: 14, fontWeight: 650 }}>平台模型池</div>
+                    <div style={{ marginTop: 6, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
+                        先在“Provider 账号池”保存并验证 provider 账号，再创建模型并执行连接与原生工具调用测试；只有保留当前配置验证 evidence 的模型才能进入租户运行时候选。
+                    </div>
+                </div>
+                <button className="btn btn-ghost" onClick={() => setShowForm((value) => !value)}>
+                    {showForm ? '取消' : '新增平台模型'}
+                </button>
+            </div>
+            {showForm && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(180px, 1fr))', gap: 10, alignItems: 'end', marginTop: 14 }}>
+                    <Field label="Provider">
+                        <input className="form-input" value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })} placeholder="custom" />
+                    </Field>
+                    <Field label="Model ID">
+                        <input className="form-input" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="provider model id" />
+                    </Field>
+                    <Field label="显示名称">
+                        <input className="form-input" value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} placeholder="平台模型名称" />
+                    </Field>
+                    <Field label="Base URL（可选）">
+                        <input className="form-input" value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder="https://.../v1" />
+                    </Field>
+                    <Field label="最大输出 tokens">
+                        <input className="form-input" type="number" min="1" value={form.max_output_tokens} onChange={(event) => setForm({ ...form, max_output_tokens: event.target.value })} />
+                    </Field>
+                    <button
+                        className="btn btn-primary"
+                        disabled={create.isPending || !form.provider.trim() || !form.model.trim() || !form.label.trim() || Number(form.max_output_tokens) < 1}
+                        onClick={() => create.mutate()}
+                    >
+                        {create.isPending ? '保存中...' : '保存模型'}
+                    </button>
+                </div>
+            )}
+            {create.isSuccess && <div style={{ marginTop: 10, color: 'var(--success)', fontSize: 12 }}>平台模型已保存；请执行验证后再绑定路由。</div>}
+            {error && <div style={{ marginTop: 10, color: 'var(--error)', fontSize: 12 }}>模型操作失败：{error instanceof Error ? error.message : String(error)}</div>}
+            <div style={{ marginTop: 14, display: 'grid', gap: 8 }}>
+                {models.length === 0 && <div style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>暂无平台模型</div>}
+                {models.map((model) => {
+                    const result = testResult?.modelId === model.id ? testResult.result : null;
+                    return (
+                        <div key={model.id} style={{ borderTop: '1px solid var(--border)', paddingTop: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+                            <div style={{ minWidth: 0 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600 }}>{model.label}</div>
+                                <div style={{ marginTop: 3, color: 'var(--text-tertiary)', fontSize: 11 }}>
+                                    {model.provider}/{model.model} · {model.modality} · {model.verification_status || 'unverified'} · 工具调用 {model.supports_tool_calling == null ? '未验证' : model.supports_tool_calling ? '支持' : '不支持'}
+                                </div>
+                                {result && (
+                                    <div style={{ marginTop: 4, color: result.connection_success && result.tool_calling_supported ? 'var(--success)' : 'var(--warning)', fontSize: 11 }}>
+                                        连接 {result.connection_success ? `通过 ${result.connection_latency_ms}ms` : '失败'} · 原生工具调用 {result.tool_calling_supported === true ? `通过 ${result.tool_calling_latency_ms}ms` : result.tool_calling_supported === false ? '不支持' : '未确认'}
+                                        {result.error ? ` · ${result.error}` : ''}
+                                    </div>
+                                )}
+                            </div>
+                            <button className="btn btn-ghost" disabled={test.isPending} onClick={() => test.mutate(model)}>
+                                {test.isPending && test.variables?.id === model.id ? '验证中...' : '连接与工具验证'}
+                            </button>
+                        </div>
+                    );
+                })}
+            </div>
         </div>
     );
 }
@@ -907,6 +1083,82 @@ function TenantsTab() {
                         <td>{tenant.subscription_status || '-'}</td>
                         <td>{tenant.seats_used}/{tenant.seats_total}</td>
                         <td>{tenant.credits_balance.toLocaleString()}</td>
+                    </>
+                )}
+            />
+        </div>
+    );
+}
+
+function ManualOrdersTab() {
+    const qc = useQueryClient();
+    const [statusFilter, setStatusFilter] = useState<'pending' | 'all'>('pending');
+    const orders = useQuery({
+        queryKey: ['saas-orders', statusFilter],
+        queryFn: () => fetchJson<PaymentOrder[]>(
+            `/saas/orders?limit=100${statusFilter === 'pending' ? '&status=pending' : ''}`,
+        ),
+        refetchInterval: 30_000,
+    });
+    const markPaid = useMutation({
+        mutationFn: (orderId: string) => fetchJson<PaymentOrder>(`/saas/orders/${orderId}/mark-paid`, { method: 'POST' }),
+        onSuccess: () => {
+            qc.invalidateQueries({ queryKey: ['saas-orders'] });
+            qc.invalidateQueries({ queryKey: ['saas-tenants'] });
+        },
+    });
+
+    const confirmManualPayment = (order: PaymentOrder) => {
+        const amount = `${order.currency} ${(order.amount_cents / 100).toFixed(2)}`;
+        if (window.confirm(`确认已核对订单 ${order.id} 的线下收款 ${amount}？确认后将立即发放套餐或 Credits；仅可用于已到账款项或明确标记的本地测试数据。`)) {
+            markPaid.mutate(order.id);
+        }
+    };
+
+    return (
+        <div>
+            <div className="card" style={{ marginBottom: 16, padding: 14, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
+                这里只处理 provider=manual 的人工订单。平台运营人员必须先在线下核对收款，再确认发放；微信等供应商订单只能由已验证的支付回调或主动查单完成，不能在此人工置为已支付。
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 10, marginBottom: 12 }}>
+                <Field label="状态">
+                    <select className="form-input" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as 'pending' | 'all')}>
+                        <option value="pending">待处理</option>
+                        <option value="all">全部</option>
+                    </select>
+                </Field>
+                <button className="btn btn-secondary" disabled={orders.isFetching} onClick={() => void orders.refetch()}>立即刷新</button>
+            </div>
+            {(orders.error || markPaid.error) && (
+                <div className="card" style={{ marginBottom: 12, padding: 14, color: 'var(--error)' }}>
+                    订单操作失败：{String(orders.error || markPaid.error)}
+                </div>
+            )}
+            <DataTable
+                rows={orders.data ?? []}
+                empty={orders.isLoading ? '正在读取订单…' : '当前没有订单'}
+                renderHeader={() => <><th>订单 / 企业</th><th>内容</th><th>金额</th><th>通道</th><th>状态</th><th>创建时间</th><th /></>}
+                renderRow={(order) => (
+                    <>
+                        <td style={{ minWidth: 230 }}>
+                            <strong title={order.id}>{order.id}</strong>
+                            <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 4 }} title={order.tenant_id}>企业 {order.tenant_id}</div>
+                        </td>
+                        <td>{order.type === 'topup' ? `${(order.credits ?? 0).toLocaleString()} Credits` : order.type}</td>
+                        <td>{order.currency} {(order.amount_cents / 100).toFixed(2)}</td>
+                        <td>{order.provider}</td>
+                        <td>{order.status === 'pending' && order.provider === 'manual' ? '待人工处理' : order.status}</td>
+                        <td style={{ whiteSpace: 'nowrap' }}>{new Date(order.created_at).toLocaleString()}</td>
+                        <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                            {order.provider === 'manual' && order.status === 'pending' && (
+                                <button className="btn btn-primary" disabled={markPaid.isPending} onClick={() => confirmManualPayment(order)}>
+                                    {markPaid.isPending && markPaid.variables === order.id ? '处理中…' : '确认人工收款'}
+                                </button>
+                            )}
+                            {order.provider !== 'manual' && order.status === 'pending' && (
+                                <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>等待供应商凭证</span>
+                            )}
+                        </td>
                     </>
                 )}
             />

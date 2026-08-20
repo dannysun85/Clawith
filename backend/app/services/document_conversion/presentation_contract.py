@@ -28,6 +28,9 @@ _UNRESOLVED_PLACEHOLDER_PATTERNS = (
     re.compile(r"(?:待替换|待补充|请填写|占位符)\s*(?:品牌|公司|客户|名称|标题|Logo)?"),
 )
 _RATING_GLYPHS = frozenset({"★", "☆", "⭐"})
+_VISIBLE_SERIALIZATION_ESCAPE_PATTERN = re.compile(
+    r"(?<!\\)\\(?:r\\n|[nr])"
+)
 _MINIMUM_BODY_FONT_SIZE_PX = 16.0
 _MINIMUM_METADATA_FONT_SIZE_PX = 10.0
 _METADATA_TEXT_ROLE = "metadata"
@@ -227,6 +230,13 @@ def _validate_visible_text_policy(
             "unsupported visible rating glyphs: " + " ".join(rating_glyphs)
         )
 
+    serialization_escape = _VISIBLE_SERIALIZATION_ESCAPE_PATTERN.search(visible_text)
+    if serialization_escape:
+        failures.append(
+            "visible serialization escape sequence: "
+            + serialization_escape.group(0)
+        )
+
 
 def validate_presentation_visible_text(visible_text: str) -> None:
     """Validate copy extracted from a rendered presentation artifact."""
@@ -239,8 +249,8 @@ def validate_presentation_visible_text(visible_text: str) -> None:
         )
 
 
-def _css_color_rgb(value: Any) -> tuple[int, int, int] | None:
-    """Parse a computed CSS color; unparseable values carry no evidence."""
+def _css_color_rgba(value: Any) -> tuple[int, int, int, float] | None:
+    """Parse a computed CSS color without discarding its alpha channel."""
 
     normalized = str(value or "").strip().lower()
     if not normalized:
@@ -250,16 +260,46 @@ def _css_color_rgb(value: Any) -> tuple[int, int, int] | None:
         raw = match.group(1)
         if len(raw) == 3:
             raw = "".join(character * 2 for character in raw)
-        return tuple(int(raw[index : index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+        red, green, blue = (int(raw[index : index + 2], 16) for index in (0, 2, 4))
+        return red, green, blue, 1.0
     match = re.fullmatch(
-        r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*[\d.]+\s*)?\)",
+        r"(rgb|rgba)\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})"
+        r"\s*(?:,\s*([\d.]+)\s*)?\)",
         normalized,
     )
     if match:
-        channels = tuple(int(match.group(index)) for index in (1, 2, 3))
-        if all(channel <= 255 for channel in channels):
-            return channels  # type: ignore[return-value]
+        channels = tuple(int(match.group(index)) for index in (2, 3, 4))
+        alpha = float(match.group(5)) if match.group(5) is not None else 1.0
+        if all(channel <= 255 for channel in channels) and 0 <= alpha <= 1:
+            return channels[0], channels[1], channels[2], alpha
     return None
+
+
+def _css_color_rgb(
+    value: Any,
+    *,
+    backdrop: tuple[int, int, int] | None = None,
+) -> tuple[int, int, int] | None:
+    """Resolve a computed CSS color against a known solid backdrop.
+
+    Chromium reports an element without its own background as
+    ``rgba(0, 0, 0, 0)``. Treating those RGB channels as opaque black creates
+    false contrast failures. Preserving alpha also prevents transparent text
+    from bypassing the quality gate.
+    """
+
+    parsed = _css_color_rgba(value)
+    if parsed is None:
+        return None
+    red, green, blue, alpha = parsed
+    if alpha >= 0.999:
+        return red, green, blue
+    if backdrop is None:
+        return None
+    return tuple(
+        round(channel * alpha + backdrop_channel * (1 - alpha))
+        for channel, backdrop_channel in zip((red, green, blue), backdrop)
+    )  # type: ignore[return-value]
 
 
 def _relative_luminance(rgb: tuple[int, int, int]) -> float:
@@ -290,14 +330,21 @@ def _text_contrast_failure(
     """
 
     style = item.get("style") or {}
-    foreground = _css_color_rgb(style.get("color"))
+    slide_background = _css_color_rgb(slide.get("backgroundColor")) or (
+        255,
+        255,
+        255,
+    )
+    background = (
+        _css_color_rgb(
+            style.get("backgroundColor"),
+            backdrop=slide_background,
+        )
+        or slide_background
+    )
+    foreground = _css_color_rgb(style.get("color"), backdrop=background)
     if foreground is None:
         return None
-    background = (
-        _css_color_rgb(style.get("backgroundColor"))
-        or _css_color_rgb(slide.get("backgroundColor"))
-        or (255, 255, 255)
-    )
     ratio = contrast_ratio(foreground, background)
     if ratio + 1e-9 < minimum_contrast_ratio:
         return ratio
@@ -574,6 +621,23 @@ def validate_browser_slide_visual_quality(
                 for line in (item.get("lines") or [])
                 if str(line.get("text") or "").strip()
             ]
+            closing_punctuation = "，。；：！？、）】》」』,.!?;:)\u201d\u2019"
+            for line_number, line in enumerate(lines, start=1):
+                line_text = str(line.get("text") or "").strip()
+                if line_text and line_text[0] in closing_punctuation:
+                    failures.append(
+                        {
+                            "code": "line_start_punctuation",
+                            "slide": slide_index,
+                            "item": item_index,
+                            "line": line_number,
+                            "excerpt": text[:80],
+                            "message": (
+                                f"slide {slide_index} line {line_number} starts with "
+                                f"closing punctuation: {line_text[:60]}"
+                            ),
+                        }
+                    )
             if tag in {"h1", "h2", "h3"} and len(lines) >= 2:
                 compact_text = _compact_visible_title(text)
                 final_line = _compact_visible_title(str(lines[-1].get("text") or ""))
@@ -652,6 +716,7 @@ def validate_browser_slide_visual_quality(
         "canvas_bounds",
         "minimum_readable_font_size",
         "text_container_overflow",
+        "line_start_punctuation",
         "title_orphan_line",
         "text_overlap",
     )

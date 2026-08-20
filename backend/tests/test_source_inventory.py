@@ -477,6 +477,55 @@ def test_text_bounds_parameterized_contrast_floor() -> None:
     validate_browser_slide_text_bounds(high_contrast, minimum_contrast_ratio=4.5)
 
 
+def test_text_contrast_composites_css_alpha_against_slide_background() -> None:
+    transparent_item_background = {
+        "slides": [
+            {
+                "width": 1280,
+                "height": 720,
+                "backgroundColor": "rgb(255, 255, 255)",
+                "items": [
+                    _layout_item(
+                        "透明元素背景不应被误判为黑色",
+                        style={
+                            "color": "rgb(19, 33, 58)",
+                            "backgroundColor": "rgba(0, 0, 0, 0)",
+                        },
+                    )
+                ],
+            }
+        ]
+    }
+    validate_browser_slide_text_bounds(
+        transparent_item_background,
+        minimum_contrast_ratio=4.5,
+    )
+
+    transparent_foreground = {
+        "slides": [
+            {
+                "width": 1280,
+                "height": 720,
+                "backgroundColor": "rgb(255, 255, 255)",
+                "items": [
+                    _layout_item(
+                        "透明文字仍必须被质量门禁拒绝",
+                        style={
+                            "color": "rgba(0, 0, 0, 0)",
+                            "backgroundColor": "rgba(0, 0, 0, 0)",
+                        },
+                    )
+                ],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="contrast"):
+        validate_browser_slide_text_bounds(
+            transparent_foreground,
+            minimum_contrast_ratio=4.5,
+        )
+
+
 def test_visual_quality_accepts_parameterized_floors() -> None:
     layout = {
         "slides": [
@@ -526,7 +575,11 @@ def _deck_pptx_bytes(*, text_per_slide: int = 200, shapes_per_slide: int = 6) ->
     return output.getvalue()
 
 
-def _deck_pptx_with_full_page_image(*, data_slide_index: int = 2) -> bytes:
+def _deck_pptx_with_full_page_image(
+    *,
+    data_slide_index: int = 2,
+    editable_shapes_on_data_slide: int = 1,
+) -> bytes:
     from io import BytesIO
 
     from PIL import Image
@@ -547,6 +600,15 @@ def _deck_pptx_with_full_page_image(*, data_slide_index: int = 2) -> bytes:
             )
         box = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(8), Inches(5))
         box.text = f"第 {index + 1} 页 " + "内容" * 120
+        if index == data_slide_index:
+            for extra in range(1, editable_shapes_on_data_slide):
+                extra_box = slide.shapes.add_textbox(
+                    Inches(0.5 + extra * 1.25),
+                    Inches(6),
+                    Inches(1),
+                    Inches(0.5),
+                )
+                extra_box.text = f"指标 {extra}"
     output = BytesIO()
     presentation.save(output)
     return output.getvalue()
@@ -629,6 +691,24 @@ def test_data_slide_full_page_raster_is_rejected_for_v2() -> None:
         deck_slide_spec=_slide_spec(),
     )
     assert not invalid
+    assert facts["pptx"]["data_slide_editability_gate"] == 1
+
+
+def test_data_slide_allows_full_bleed_background_with_editable_composition() -> None:
+    request = _request()
+    hybrid = _deck_pptx_with_full_page_image(
+        data_slide_index=2,
+        editable_shapes_on_data_slide=4,
+    )
+    facts, invalid = _presentation_contract_facts(
+        request,
+        {"pptx": _verified("pptx", hybrid)},
+        deck_slide_spec=_slide_spec(data_slides=(3,)),
+    )
+
+    assert not invalid
+    assert facts["pptx"]["picture_coverage_ratio_by_slide"][2] == 1
+    assert facts["pptx"]["editable_shape_count_by_slide"][2] == 4
     assert facts["pptx"]["data_slide_editability_gate"] == 1
 
 

@@ -445,6 +445,11 @@ def _mock_final_approval_api(monkeypatch, request, execution):
         "ensure_execution_shadow",
         AsyncMock(return_value=execution),
     )
+    monkeypatch.setattr(
+        deliverables,
+        "_synchronize_and_require_output_execution",
+        AsyncMock(return_value=()),
+    )
     monkeypatch.setattr(deliverables, "project_execution_lifecycle", AsyncMock())
     monkeypatch.setattr(deliverables, "_request_out", AsyncMock(side_effect=lambda _db, req: req))
     calls: dict[str, list[str]] = {"select": [], "rebind": [], "approve": []}

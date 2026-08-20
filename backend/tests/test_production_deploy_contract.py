@@ -1085,9 +1085,21 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
             f"{os.pathsep}{os.environ.get('PATH', '')}"
         )
     }
+    docker_fixture = (
+        f"docker() {{ {shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(docker_stub))} \"$@\"; }}"
+    )
 
     traced = subprocess.run(
-        ["bash", "-x", "-c", f"set -euo pipefail\n{helper}\ninspect_worker_runtime_identity worker-id"],
+        [
+            "bash",
+            "-x",
+            "-c",
+            (
+                f"set -euo pipefail\n{docker_fixture}\n{helper}\n"
+                "inspect_worker_runtime_identity worker-id"
+            ),
+        ],
         env=env,
         capture_output=True,
         check=False,
@@ -1125,8 +1137,19 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
             f"{os.pathsep}{os.environ.get('PATH', '')}"
         ),
     }
+    duplicate_docker_fixture = (
+        f"docker() {{ {shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(duplicate_stub))} \"$@\"; }}"
+    )
     duplicated = subprocess.run(
-        ["bash", "-c", f"set -euo pipefail\n{helper}\ninspect_worker_runtime_identity worker-id"],
+        [
+            "bash",
+            "-c",
+            (
+                f"set -euo pipefail\n{duplicate_docker_fixture}\n{helper}\n"
+                "inspect_worker_runtime_identity worker-id"
+            ),
+        ],
         env=duplicate_env,
         capture_output=True,
         check=False,
@@ -1159,6 +1182,10 @@ def test_rollback_worker_identity_accepts_the_legacy_release_contract(tmp_path):
             f"{os.pathsep}{os.environ.get('PATH', '')}"
         )
     }
+    docker_fixture = (
+        f"docker() {{ {shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(docker_stub))} \"$@\"; }}"
+    )
 
     traced = subprocess.run(
         [
@@ -1166,7 +1193,7 @@ def test_rollback_worker_identity_accepts_the_legacy_release_contract(tmp_path):
             "-x",
             "-c",
             (
-                f"set -euo pipefail\n{helper}\n"
+                f"set -euo pipefail\n{docker_fixture}\n{helper}\n"
                 "inspect_rollback_worker_runtime_identity worker-id"
             ),
         ],
@@ -4970,6 +4997,19 @@ def _write_fake_docker(tmp_path: Path, spec: dict) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     docker_path = tmp_path / "docker"
     (tmp_path / "docker-spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    if sys.platform == "darwin":
+        # macOS 26 can indefinitely quarantine freshly-created executable
+        # scripts before their shebang interpreter starts.  Keep the fixture
+        # semantically identical while executing each Docker subcommand as an
+        # ordinary Python input through the already-trusted test interpreter.
+        docker_path.symlink_to(sys.executable)
+        command_source = FAKE_DOCKER.strip().replace(
+            "args = sys.argv[1:]",
+            "args = [Path(__file__).name, *sys.argv[1:]]",
+        )
+        for command in ("network", "ps", "inspect", "exec"):
+            (tmp_path / command).write_text(command_source + "\n", encoding="utf-8")
+        return docker_path
     docker_path.write_text(FAKE_DOCKER.strip() + "\n", encoding="utf-8")
     docker_path.chmod(docker_path.stat().st_mode | stat.S_IXUSR)
     return docker_path
@@ -5048,7 +5088,7 @@ def _run_data_plane_checker(
         capture_output=True,
         text=True,
         check=False,
-        cwd=ROOT,
+        cwd=tmp_path if sys.platform == "darwin" else ROOT,
     )
 
 

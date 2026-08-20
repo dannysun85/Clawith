@@ -412,6 +412,11 @@ async def test_output_review_approval_marks_verified_artifacts_and_request_deliv
         "approve_deliverable_artifacts",
         AsyncMock(return_value=tuple(artifacts)),
     )
+    monkeypatch.setattr(
+        deliverables,
+        "_synchronize_and_require_output_execution",
+        AsyncMock(return_value=tuple(artifacts)),
+    )
     monkeypatch.setattr(deliverables, "_request_out", AsyncMock(return_value=request))
 
     result = await deliverables.apply_deliverable_action(
@@ -465,6 +470,11 @@ async def test_output_review_approval_fails_closed_when_artifact_changed(monkeyp
             )
         ),
     )
+    monkeypatch.setattr(
+        deliverables,
+        "_synchronize_and_require_output_execution",
+        AsyncMock(return_value=()),
+    )
 
     with pytest.raises(HTTPException) as error:
         await deliverables.apply_deliverable_action(
@@ -476,6 +486,44 @@ async def test_output_review_approval_fails_closed_when_artifact_changed(monkeyp
 
     assert error.value.status_code == 409
     assert error.value.detail["code"] == "deliverable_artifact_changed"
+    assert request.status == "waiting_approval"
+    assert request.version == 3
+
+
+@pytest.mark.asyncio
+async def test_output_review_approval_fails_before_artifact_approval_when_execution_incomplete(
+    monkeypatch,
+) -> None:
+    request = _request()
+    user = SimpleNamespace(id=request.created_by_user_id)
+    artifact_approval = AsyncMock()
+    monkeypatch.setattr(deliverables, "_owned_request", AsyncMock(return_value=request))
+    monkeypatch.setattr(deliverables, "approve_deliverable_artifacts", artifact_approval)
+    monkeypatch.setattr(
+        deliverables,
+        "_synchronize_and_require_output_execution",
+        AsyncMock(
+            side_effect=HTTPException(
+                status_code=409,
+                detail={
+                    "code": "deliverable_execution_incomplete",
+                    "message": "Every execution unit must succeed",
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await deliverables.apply_deliverable_action(
+            request.id,
+            DeliverableActionIn(action="approve", expected_version=3),
+            user,  # type: ignore[arg-type]
+            _Session(),  # type: ignore[arg-type]
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "deliverable_execution_incomplete"
+    artifact_approval.assert_not_awaited()
     assert request.status == "waiting_approval"
     assert request.version == 3
 

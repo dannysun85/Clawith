@@ -812,6 +812,8 @@ async def test_runtime_tool_history_returns_stable_call_identity(monkeypatch):
                 "args": {"path": "README.md"},
                 "status": "done",
                 "result": "contents",
+                "execution_status": "failed",
+                "error_code": "ceo_coordination_required",
                 "tool_call_id": "call-1",
                 "reasoning_content": "Inspect the file",
             }
@@ -838,6 +840,8 @@ async def test_runtime_tool_history_returns_stable_call_identity(monkeypatch):
     assert messages[0]["toolCallId"] == "call-1"
     assert messages[0]["toolStatus"] == "done"
     assert messages[0]["toolResult"] == "contents"
+    assert messages[0]["toolExecutionStatus"] == "failed"
+    assert messages[0]["toolErrorCode"] == "ceo_coordination_required"
     assert messages[0]["toolThinking"] == (
         "Internal reasoning is private. Tool execution records remain available."
     )

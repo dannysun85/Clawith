@@ -11,6 +11,7 @@ import uuid
 import pytest
 
 from app.api import deliverables
+from app.models.audit import AuditLog
 from app.models.deliverable import (
     DeliverableApprovalReceipt,
     DeliverableArtifactRevision,
@@ -20,6 +21,7 @@ from app.models.deliverable import (
 )
 from app.schemas.deliverable import DeliverableApprovalIn
 from app.services.deliverable_executions import (
+    bind_artifacts_to_current_execution,
     build_execution_shadow,
     create_revision_execution,
     execution_unit_blueprints,
@@ -101,7 +103,7 @@ def _request(*, work_type: str = "presentation", spec: dict | None = None) -> De
 def test_unit_blueprints_model_pages_candidates_and_shots_without_provider_calls() -> None:
     presentation = _request(spec={"page_count": 6})
     presentation_units = execution_unit_blueprints(presentation)
-    assert len(presentation_units) == 16
+    assert len(presentation_units) == 14
     assert [unit.unit_key for unit in presentation_units if unit.stage_key == "slide_render"] == [
         "slide-01",
         "slide-02",
@@ -114,6 +116,13 @@ def test_unit_blueprints_model_pages_candidates_and_shots_without_provider_calls
     assert [unit.unit_key for unit in targeted if unit.stage_key == "slide_render"] == [
         "slide-03"
     ]
+    assert not any(unit.stage_key == "pdf_render" for unit in presentation_units)
+    assert not any(unit.stage_key == "pptx_pdf_parity" for unit in presentation_units)
+
+    presentation.output_contract = ["pptx", "pdf"]
+    dual_output_units = execution_unit_blueprints(presentation)
+    assert any(unit.stage_key == "pdf_render" for unit in dual_output_units)
+    assert any(unit.stage_key == "pptx_pdf_parity" for unit in dual_output_units)
 
     poster = _request(work_type="poster")
     poster_units = execution_unit_blueprints(poster)
@@ -232,6 +241,45 @@ async def test_revision_preserves_prior_execution_and_artifacts_as_history() -> 
 
 
 @pytest.mark.asyncio
+async def test_retry_preserves_failed_execution_truth_and_creates_new_revision() -> None:
+    request = _request(spec={"page_count": 4})
+    request.status = "failed"
+    request.current_stage = "artifact_verification_failed"
+    request.last_error_code = "deliverable_artifact_missing"
+    current, current_units = build_execution_shadow(
+        request,
+        execution_number=2,
+        kind="revision",
+        idempotency_key=uuid.uuid4(),
+        current_stage="artifact_verification_failed",
+    )
+    current.status = "failed"
+    current.current_stage = "artifact_verification_failed"
+    current_units[-1].status = "failed"
+    current_units[-1].last_error_code = "deliverable_artifact_missing"
+    request.current_execution_id = current.id
+    db = _Session(current, None, list(current_units), [])
+
+    retry, created = await create_revision_execution(
+        db,  # type: ignore[arg-type]
+        request,
+        client_revision_id=uuid.uuid4(),
+        instruction="Retry the preserved brief after fixing the local render fixture",
+    )
+
+    assert created is True
+    assert current.status == "failed"
+    assert current.current_stage == "artifact_verification_failed"
+    assert current_units[-1].status == "failed"
+    assert current_units[-1].last_error_code == "deliverable_artifact_missing"
+    assert retry.execution_number == 3
+    assert request.current_execution_id == retry.id
+    assert request.status == "ready"
+    assert request.current_stage == "revision_ready"
+    assert request.last_error_code is None
+
+
+@pytest.mark.asyncio
 async def test_verified_output_projects_remaining_v1_units_to_complete() -> None:
     request = _request(work_type="presentation", spec={"page_count": 3})
     execution, units = build_execution_shadow(
@@ -245,6 +293,10 @@ async def test_verified_output_projects_remaining_v1_units_to_complete() -> None
     output_unit = next(unit for unit in units if unit.stage_key == "pptx_render")
     output_unit.status = "succeeded"
     output_unit.result_snapshot = {"artifact_revision_id": str(uuid.uuid4())}
+    recovered_unit = next(unit for unit in units if unit.stage_key == "visual_qa")
+    recovered_unit.status = "failed"
+    recovered_unit.last_error_code = "deliverable_artifact_missing"
+    execution.completed_at = datetime.now(UTC)
     db = _Session(execution, list(units))
 
     projected = await project_execution_lifecycle(
@@ -254,6 +306,7 @@ async def test_verified_output_projects_remaining_v1_units_to_complete() -> None
 
     assert projected is execution
     assert execution.status == "waiting_approval"
+    assert execution.completed_at is None
     assert all(unit.status == "succeeded" for unit in units)
     assert "lifecycle_projection" not in output_unit.result_snapshot
     projected_units = [unit for unit in units if unit is not output_unit]
@@ -261,6 +314,180 @@ async def test_verified_output_projects_remaining_v1_units_to_complete() -> None
         unit.result_snapshot["lifecycle_projection"]["evidence_level"]
         for unit in projected_units
     } == {"projected_v1_runtime_completion"}
+    assert recovered_unit.last_error_code is None
+    assert recovered_unit.result_snapshot["lifecycle_projection"] == {
+        "version": 1,
+        "evidence_level": "projected_v1_runtime_completion",
+        "request_status": "waiting_approval",
+        "request_stage": "output_review",
+        "verified_output_gate": True,
+        "recovered_from_failure": True,
+        "previous_error_code": "deliverable_artifact_missing",
+    }
+
+
+@pytest.mark.asyncio
+async def test_v1_projection_requires_every_output_contract_artifact_unit() -> None:
+    request = _request(work_type="presentation", spec={"page_count": 2})
+    request.output_contract = ["pptx", "pdf"]
+    execution, units = build_execution_shadow(
+        request,
+        execution_number=1,
+        kind="initial",
+        idempotency_key=request.client_request_id,
+        current_stage="output_review",
+    )
+    request.current_execution_id = execution.id
+    next(unit for unit in units if unit.stage_key == "pptx_render").status = "succeeded"
+    db = _Session(execution, list(units))
+
+    await project_execution_lifecycle(db, request)  # type: ignore[arg-type]
+
+    assert next(unit for unit in units if unit.stage_key == "pdf_render").status == "pending"
+    assert any(unit.status == "pending" for unit in units)
+
+
+@pytest.mark.asyncio
+async def test_v2_output_review_does_not_fabricate_per_unit_completion() -> None:
+    request = _request(work_type="presentation", spec={"page_count": 2})
+    request.workflow_id = "builtin.presentation.v2"
+    request.workflow_version = "2.0.0"
+    execution, units = build_execution_shadow(
+        request,
+        execution_number=1,
+        kind="initial",
+        idempotency_key=request.client_request_id,
+        current_stage="output_review",
+    )
+    request.current_execution_id = execution.id
+    next(unit for unit in units if unit.stage_key == "pptx_render").status = "succeeded"
+    db = _Session(execution, list(units))
+
+    await project_execution_lifecycle(db, request)  # type: ignore[arg-type]
+
+    assert any(unit.status == "pending" for unit in units)
+    assert all(
+        "lifecycle_projection" not in unit.result_snapshot
+        for unit in units
+        if unit.status == "pending"
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_verified_artifact_closes_units_from_specific_evidence() -> None:
+    request = _request(work_type="presentation", spec={"page_count": 2})
+    request.workflow_id = "builtin.presentation.v2"
+    request.workflow_version = "2.0.0"
+    # Materialize the legacy graph that contained PDF/parity rows even though
+    # the persisted customer contract was PPTX-only.
+    request.output_contract = ["pptx", "pdf"]
+    execution, units = build_execution_shadow(
+        request,
+        execution_number=1,
+        kind="initial",
+        idempotency_key=request.client_request_id,
+        current_stage="output_review",
+    )
+    request.output_contract = ["pptx"]
+    request.current_execution_id = execution.id
+    semantic = next(unit for unit in units if unit.stage_key == "semantic_qa")
+    semantic.quality_evaluation = {
+        "enforcement": "shadow",
+        "semantic_qa": {
+            "schema_version": "semantic-qa-v1",
+            "status": "passed",
+            "score": 100,
+            "artifact_sha256": "c" * 64,
+            "subject_similarity": {
+                "inventory_sha256": "e" * 64,
+                "assertion_count": 4,
+                "assumption_count": 0,
+            },
+        },
+    }
+    artifact = DeliverableArtifactRevision(
+        id=uuid.uuid4(),
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        artifact_key="pptx",
+        artifact_type="pptx",
+        workspace_path=f"workspace/deliverables/{request.id}/result.pptx",
+        content_hash="d" * 64,
+        size_bytes=4096,
+        revision_number=1,
+        status="candidate",
+        evaluation={
+            "verified": True,
+            "facts": {
+                "page_count": 2,
+                "width": 12192000,
+                "height": 6858000,
+                "aspect_ratio": 16 / 9,
+                "slide_spec_gate": 1,
+                "density_gate": 1,
+                "data_slide_editability_gate": 1,
+                "picture_coverage_gate": 1,
+            },
+        },
+    )
+    db = _Session(execution, list(units))
+
+    await bind_artifacts_to_current_execution(
+        db,  # type: ignore[arg-type]
+        request,
+        (artifact,),
+    )
+
+    assert all(unit.status == "succeeded" for unit in units)
+    assert next(unit for unit in units if unit.stage_key == "slide_render").result_snapshot[
+        "presentation_v2_evidence"
+    ]["evidence_level"] == "verified_artifact_page"
+    assert semantic.result_snapshot["presentation_v2_evidence"]["evidence_level"] == (
+        "semantic_qa_receipt"
+    )
+    assert next(unit for unit in units if unit.stage_key == "outline").result_snapshot[
+        "presentation_v2_evidence"
+    ]["evidence_level"] == "verified_planning_contract"
+    assert next(
+        unit for unit in units if unit.stage_key == "source_inventory"
+    ).result_snapshot["presentation_v2_evidence"] == {
+        "version": 1,
+        "evidence_level": "semantic_inventory_receipt",
+        "inventory_sha256": "e" * 64,
+        "slide_spec_sha256": "c" * 64,
+        "assertion_count": 4,
+        "assumption_count": 0,
+    }
+    assert next(unit for unit in units if unit.stage_key == "pdf_render").result_snapshot[
+        "presentation_v2_evidence"
+    ]["evidence_level"] == "not_applicable_output_contract"
+
+
+@pytest.mark.asyncio
+async def test_approval_readiness_requires_every_execution_unit_to_succeed() -> None:
+    request = _request(work_type="presentation", spec={"page_count": 2})
+    execution, units = build_execution_shadow(
+        request,
+        execution_number=1,
+        kind="initial",
+        idempotency_key=request.client_request_id,
+        current_stage="output_review",
+    )
+    request.current_execution_id = execution.id
+
+    blocked = await deliverables._output_execution_blockers(
+        _Session(execution, list(units)),  # type: ignore[arg-type]
+        request,
+    )
+    assert blocked == ("deliverable_execution_incomplete",)
+
+    for unit in units:
+        unit.status = "succeeded"
+    ready = await deliverables._output_execution_blockers(
+        _Session(execution, list(units)),  # type: ignore[arg-type]
+        request,
+    )
+    assert ready == ()
 
 
 @pytest.mark.asyncio
@@ -399,6 +626,12 @@ async def test_final_approval_writes_idempotent_receipt(monkeypatch) -> None:
     )
     project = AsyncMock(return_value=current)
     monkeypatch.setattr(deliverables, "project_execution_lifecycle", project)
+    synchronize = AsyncMock(return_value=tuple(artifacts))
+    monkeypatch.setattr(
+        deliverables,
+        "_synchronize_and_require_output_execution",
+        synchronize,
+    )
     monkeypatch.setattr(deliverables, "_request_out", AsyncMock(return_value=request))
     action_id = uuid.uuid4()
 
@@ -419,11 +652,16 @@ async def test_final_approval_writes_idempotent_receipt(monkeypatch) -> None:
     assert request.current_stage == "delivered"
     assert request.version == 4
     receipts = [item for item in db.added if isinstance(item, DeliverableApprovalReceipt)]
+    audit_rows = [item for item in db.added if isinstance(item, AuditLog)]
     assert len(receipts) == 1
+    assert len(audit_rows) == 1
+    assert audit_rows[0].tenant_id == request.tenant_id
+    assert audit_rows[0].details["tenant_id"] == str(request.tenant_id)
     assert receipts[0].client_action_id == action_id
     assert receipts[0].execution_id == current.id
     assert receipts[0].receipt["result_request_version"] == 4
     assert all(artifact.status == "approved" for artifact in artifacts)
+    synchronize.assert_awaited_once_with(db, request)
     project.assert_awaited_once()
     assert db.flush_count == 1
 
@@ -506,6 +744,90 @@ async def test_revision_approval_records_old_and_new_execution_lineage(monkeypat
     assert receipts[0].target_units == ["shot-02"]
     assert request.status == "ready"
     assert request.version == 4
+
+
+@pytest.mark.asyncio
+async def test_failed_deliverable_can_regenerate_through_revision_approval(monkeypatch) -> None:
+    request = _request(spec={"page_count": 8})
+    request.status = "failed"
+    request.current_stage = "artifact_verification_failed"
+    request.last_error_code = "deliverable_artifact_missing"
+    current, _units = build_execution_shadow(
+        request,
+        execution_number=2,
+        kind="revision",
+        idempotency_key=uuid.uuid4(),
+        current_stage="artifact_verification_failed",
+    )
+    current.status = "failed"
+    request.current_execution_id = current.id
+    next_execution = DeliverableExecution(
+        id=uuid.uuid4(),
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        execution_number=3,
+        kind="revision",
+        status="ready",
+        current_stage="revision_ready",
+        workflow_id=request.workflow_id,
+        workflow_version=request.workflow_version,
+        contract_snapshot={},
+        preflight_snapshot={},
+        idempotency_key=uuid.uuid4(),
+        request_fingerprint="f" * 64,
+    )
+    user = SimpleNamespace(id=request.created_by_user_id)
+    db = _Session(None)
+    monkeypatch.setattr(deliverables, "_owned_request", AsyncMock(return_value=request))
+    monkeypatch.setattr(deliverables, "ensure_execution_shadow", AsyncMock(return_value=current))
+
+    async def create_retry(*_args, **_kwargs):
+        request.current_execution_id = next_execution.id
+        request.contract_revision = 3
+        request.status = "ready"
+        request.current_stage = "revision_ready"
+        request.completed_at = None
+        request.last_error_code = None
+        request.version += 1
+        return next_execution, True
+
+    create_retry_mock = AsyncMock(side_effect=create_retry)
+    monkeypatch.setattr(deliverables, "create_revision_execution", create_retry_mock)
+    monkeypatch.setattr(
+        deliverables,
+        "_supersede_quality_reviews_for_revision",
+        AsyncMock(return_value=()),
+    )
+    monkeypatch.setattr(
+        deliverables,
+        "project_execution_lifecycle",
+        AsyncMock(return_value=next_execution),
+    )
+    monkeypatch.setattr(deliverables, "_request_out", AsyncMock(return_value=request))
+
+    result = await deliverables.record_deliverable_approval(
+        request.id,
+        DeliverableApprovalIn(
+            expected_version=3,
+            client_action_id=uuid.uuid4(),
+            stage="final",
+            action="request_changes",
+            instruction="Regenerate from the preserved brief after fixing the renderer",
+        ),
+        user,  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+    )
+
+    assert result is request
+    assert request.status == "ready"
+    assert request.current_stage == "revision_ready"
+    assert request.current_execution_id == next_execution.id
+    assert request.version == 4
+    create_retry_mock.assert_awaited_once()
+    receipts = [item for item in db.added if isinstance(item, DeliverableApprovalReceipt)]
+    assert len(receipts) == 1
+    assert receipts[0].execution_id == current.id
+    assert receipts[0].receipt["next_execution_id"] == str(next_execution.id)
 
 
 @pytest.mark.asyncio

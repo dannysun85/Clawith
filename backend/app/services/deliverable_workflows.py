@@ -2861,7 +2861,16 @@ async def sync_deliverable_lifecycle(
                 artifacts,
                 now=now,
             )
-        await project_execution_lifecycle(db, target, now=now)
+        execution = await project_execution_lifecycle(db, target, now=now)
+        if (
+            execution is not None
+            and target.agent_run_id == run_id
+            and execution.intake_run_id != run_id
+        ):
+            # A same-session recovery run is the coordinator for the recovered
+            # artifact set.  Preserve the original intake run while pointing
+            # current lineage at the run that actually supplied the evidence.
+            execution.coordinator_run_id = run_id
         return target
 
     if not isinstance(request, DeliverableRequest):
@@ -2936,11 +2945,13 @@ async def sync_deliverable_lifecycle(
             )
             if not attempted_types:
                 continue
+            run_link_changed = candidate.agent_run_id != run_id
+            candidate.agent_run_id = run_id
             if reconciliation.complete:
                 created_types = tuple(
                     getattr(reconciliation, "created_types", ()) or (),
                 )
-                changed = bool(created_types) or (
+                changed = run_link_changed or bool(created_types) or (
                     candidate.status != "waiting_approval"
                     or candidate.current_stage != "output_review"
                     or candidate.last_error_code is not None
@@ -2968,7 +2979,8 @@ async def sync_deliverable_lifecycle(
             else:
                 next_error_code = "deliverable_artifact_missing"
             changed = (
-                candidate.status != "failed"
+                run_link_changed
+                or candidate.status != "failed"
                 or candidate.current_stage != "artifact_verification_failed"
                 or candidate.last_error_code != next_error_code
             )

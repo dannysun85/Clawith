@@ -791,8 +791,8 @@ export default function EnterpriseSettings({ initialTab, embedded = false }: Ent
                 {activeTab === 'info' && (
                     <div>
                         <CompanyLogoEditor key={`logo-${selectedTenantId}`} />
-                        <CompanyNameEditor key={`name-${selectedTenantId}`} />
-                        <CompanyTimezoneEditor key={`tz-${selectedTenantId}`} />
+                        {!embedded && <CompanyNameEditor key={`name-${selectedTenantId}`} />}
+                        {!embedded && <CompanyTimezoneEditor key={`tz-${selectedTenantId}`} />}
                         <div className="card" style={{ padding: '16px', marginBottom: '24px' }}>
                             <div style={{ fontSize: '13px', fontWeight: 500, marginBottom: '4px' }}>
                                 {t('enterprise.companyIntro.title', 'Company Intro')}
@@ -833,8 +833,11 @@ export default function EnterpriseSettings({ initialTab, embedded = false }: Ent
                         <ThemeColorPicker />
                         <A2AAsyncToggle key={`a2a-${selectedTenantId}`} />
 
-                        {/* ── Danger Zone: Delete Company ── */}
-                        <div style={{ marginTop: '32px', padding: '16px', border: '1px solid var(--status-error, #e53e3e)', borderRadius: '8px' }}>
+                        {/* The company console owns the recoverable, re-authenticated
+                            lifecycle flow. Legacy standalone settings retain this
+                            compatibility action, but embedded settings must never
+                            reintroduce a second deletion path. */}
+                        {!embedded && <div style={{ marginTop: '32px', padding: '16px', border: '1px solid var(--status-error, #e53e3e)', borderRadius: '8px' }}>
                             <h3 style={{ marginBottom: '4px', color: 'var(--status-error, #e53e3e)' }}>{t('enterprise.dangerZone', 'Danger Zone')}</h3>
                             <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
                                 {t('enterprise.deleteCompanyDesc', 'Permanently delete this company and all its data including agents, models, tools, and skills. This action cannot be undone.')}
@@ -871,7 +874,7 @@ export default function EnterpriseSettings({ initialTab, embedded = false }: Ent
                             >
                                 {t('enterprise.deleteCompany', 'Delete This Company')}
                             </button>
-                        </div>
+                        </div>}
                     </div>
                 )}
 

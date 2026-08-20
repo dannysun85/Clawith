@@ -82,6 +82,30 @@ async def test_runtime_model_settings_are_company_admin_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_platform_operator_can_select_tenant_runtime_models() -> None:
+    session = _ModelSession([])
+    tenant_id = uuid.uuid4()
+    expected = {"tenant_id": str(tenant_id), "candidates": []}
+
+    with patch(
+        "app.api.enterprise._runtime_model_settings_payload",
+        new=AsyncMock(return_value=expected),
+    ):
+        result = await get_runtime_model_settings(
+            tenant_id=str(tenant_id),
+            current_user=SimpleNamespace(
+                role="platform_admin",
+                identity=SimpleNamespace(is_platform_admin=True),
+                tenant_id=None,
+            ),  # type: ignore[arg-type]
+            db=session,  # type: ignore[arg-type]
+        )
+
+    assert result == expected
+    assert session.execute_count == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "overrides",
     [

@@ -17,6 +17,70 @@ from app.services.document_conversion.presentation_contract import (
 _PRESENTATION_LONG_EDGE_INCHES = 13.333333
 
 
+def _browser_text_with_preserved_line_breaks(item: dict[str, Any]) -> str:
+    """Preserve Chromium's measured wrapping in editable PowerPoint text.
+
+    Browser layout collection records the exact visible line boxes for every
+    text element. Rejoining those lines before writing the PPTX asks Office to
+    wrap the copy a second time with different CJK punctuation rules, which can
+    strand commas or full stops at the start of a line. Use hard line breaks
+    when the measured lines faithfully contain the same visible text.
+    """
+
+    text = str(item.get("text") or "").strip()
+    lines = [
+        str(line.get("text") or "").strip()
+        for line in (item.get("lines") or [])
+        if isinstance(line, dict) and str(line.get("text") or "").strip()
+    ]
+    if len(lines) <= 1:
+        return text
+
+    def compact(value: str) -> str:
+        return re.sub(r"\s+", "", value)
+
+    if compact("".join(lines)) != compact(text):
+        return text
+    return "\n".join(lines)
+
+
+def _browser_text_font_scale(item: dict[str, Any], tag: str) -> float:
+    """Leave enough width slack for Office's CJK font metrics.
+
+    Chromium and PowerPoint do not use identical glyph metrics even when the
+    requested font family is the same.  A measured browser line that nearly
+    fills its element can therefore wrap again after conversion, leaving CJK
+    closing punctuation at the start of a new line.  Scale only multi-line
+    body copy, targeting at most 86% of the measured text-box width while
+    keeping single-line copy and headings unchanged from the established
+    renderer policy.
+    """
+
+    if tag in ("h1", "h2", "h3"):
+        return 1.0
+
+    lines = [
+        line
+        for line in (item.get("lines") or [])
+        if isinstance(line, dict) and str(line.get("text") or "").strip()
+    ]
+    if len(lines) <= 1:
+        return 0.94
+
+    try:
+        item_width = float(item.get("w") or 0)
+        maximum_line_width = max(float(line.get("w") or 0) for line in lines)
+    except (TypeError, ValueError):
+        return 0.90
+    if item_width <= 0 or maximum_line_width <= 0:
+        return 0.90
+
+    maximum_fill_ratio = maximum_line_width / item_width
+    if maximum_fill_ratio <= 0:
+        return 0.90
+    return round(max(0.86, min(0.94, 0.86 / maximum_fill_ratio)), 4)
+
+
 def _slide_size_inches(design_w_px: int, design_h_px: int) -> tuple[float, float]:
     """Map the source aspect ratio onto a bounded PowerPoint canvas."""
 
@@ -595,7 +659,7 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                         if p:
                             slide.shapes.add_picture(str(p), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
                     elif kind == "text":
-                        text = str(item.get("text") or "").strip()
+                        text = _browser_text_with_preserved_line_breaks(item)
                         if not text:
                             continue
                         tag = item.get("tag") or ""
@@ -608,10 +672,8 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                                 available_width,
                                 w + max(0.12, w * 0.12),
                             )
-                        ppt_style["_font-scale"] = (
-                            "1.0"
-                            if tag in ("h1", "h2", "h3")
-                            else "0.94"
+                        ppt_style["_font-scale"] = str(
+                            _browser_text_font_scale(item, tag)
                         )
                         default = 38 if tag == "h1" else 28 if tag == "h2" else 22 if tag == "h3" else 18
                         add_textbox(slide, text, x, y, w, h, ppt_style, default, tag in ("h1", "h2", "h3", "strong"))
