@@ -583,8 +583,14 @@ def _project_topology_execution_summaries(
     for agent_id, items in grouped.items():
         items.sort(
             key=lambda item: (
-                EXECUTION_STATUS_PRIORITY.get(item.status, 99),
+                0 if item.status in ACTIVE_EXECUTION_STATUSES else 1,
+                (
+                    EXECUTION_STATUS_PRIORITY.get(item.status, 99)
+                    if item.status in ACTIVE_EXECUTION_STATUSES
+                    else 0
+                ),
                 -item.updated_at.timestamp(),
+                EXECUTION_STATUS_PRIORITY.get(item.status, 99),
                 item.id.int,
             )
         )

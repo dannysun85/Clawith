@@ -213,6 +213,47 @@ def test_execution_summary_prioritizes_active_waiting_over_recent_terminal():
     assert summary.recently_finished_count == 1
 
 
+def test_execution_summary_uses_latest_terminal_outcome_after_activity_finishes():
+    agent_id = uuid.uuid4()
+    failed = workforce_topology._ExecutionCandidate(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        run_id=uuid.uuid4(),
+        source_type="direct_chat",
+        status="failed",
+        phase="run_failed",
+        title="Earlier failed revision",
+        summary="Earlier failed revision",
+        details_visible=True,
+        deep_link="/agents/example/chat",
+        updated_at=datetime(2026, 8, 20, 21, 9, tzinfo=UTC),
+    )
+    completed = workforce_topology._ExecutionCandidate(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        run_id=uuid.uuid4(),
+        source_type="deliverable",
+        status="completed",
+        phase="delivered",
+        title="Later approved delivery",
+        summary="Later approved delivery",
+        details_visible=True,
+        deep_link="/agents/example/chat",
+        updated_at=datetime(2026, 8, 20, 21, 21, tzinfo=UTC),
+    )
+
+    projected = workforce_topology._project_topology_execution_summaries(
+        [failed, completed],
+        since=datetime(2026, 8, 20, tzinfo=UTC),
+    )
+
+    summary = projected[agent_id]
+    assert summary.id == completed.id
+    assert summary.status == "completed"
+    assert summary.active_count == 0
+    assert summary.recently_finished_count == 2
+
+
 def test_topology_agent_status_projects_live_execution_without_hiding_health_failures():
     active_execution = SimpleNamespace(status="running")
     completed_execution = SimpleNamespace(status="completed")
