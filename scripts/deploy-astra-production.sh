@@ -85,6 +85,10 @@ COMPOSE_PROFILES_ARG="${COMPOSE_PROFILES:-__none__}"
 PUBLIC_URL="${PUBLIC_URL:-https://opc.reeftotem.ai}"
 RUN_LOCAL_CHECKS="${RUN_LOCAL_CHECKS:-1}"
 RUN_REMOTE_SMOKE="${RUN_REMOTE_SMOKE:-1}"
+PREPARE_REMOTE_SMOKE_PRINCIPALS="${PREPARE_REMOTE_SMOKE_PRINCIPALS:-0}"
+SMOKE_PRINCIPAL_CONFIRM_TENANT_ID="${SMOKE_PRINCIPAL_CONFIRM_TENANT_ID:-}"
+SMOKE_PRINCIPAL_PROVISION_OPERATION_ID="${SMOKE_PRINCIPAL_PROVISION_OPERATION_ID:-}"
+SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID="${SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID:-}"
 REMOTE_SMOKE_BREAK_GLASS_ARTIFACT="${REMOTE_SMOKE_BREAK_GLASS_ARTIFACT:-}"
 DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-900}"
 
@@ -126,6 +130,51 @@ case "$RUN_REMOTE_SMOKE" in
         exit 1
         ;;
 esac
+case "$PREPARE_REMOTE_SMOKE_PRINCIPALS" in
+    0|1) ;;
+    *)
+        echo "PREPARE_REMOTE_SMOKE_PRINCIPALS must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+if [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ]; then
+    if [ "$RUN_REMOTE_SMOKE" != "1" ]; then
+        echo "production smoke principals can only be prepared when RUN_REMOTE_SMOKE=1" >&2
+        exit 1
+    fi
+    python3 - \
+        "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" \
+        "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" \
+        "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" <<'PY_SMOKE_PRINCIPAL_IDS'
+import sys
+import uuid
+
+labels = ("confirmed tenant", "provision operation", "deactivate operation")
+values = sys.argv[1:]
+if len(values) != len(labels):
+    raise SystemExit("production smoke principal identifiers are incomplete")
+parsed = []
+for label, value in zip(labels, values):
+    try:
+        parsed_value = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SystemExit(f"{label} id must be a UUID") from exc
+    if parsed_value.int == 0 or str(parsed_value) != value.lower():
+        raise SystemExit(f"{label} id must be a canonical non-zero UUID")
+    parsed.append(parsed_value)
+if parsed[1] == parsed[2]:
+    raise SystemExit("provision and deactivate operation ids must be distinct")
+PY_SMOKE_PRINCIPAL_IDS
+    if [ "${SMOKE_ENV_VALUES[2]}" != "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" ]; then
+        echo "SMOKE_PRINCIPAL_CONFIRM_TENANT_ID must match SMOKE_TENANT_ID" >&2
+        exit 1
+    fi
+elif [ -n "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" ] || \
+     [ -n "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" ] || \
+     [ -n "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" ]; then
+    echo "smoke principal confirmation values require PREPARE_REMOTE_SMOKE_PRINCIPALS=1" >&2
+    exit 1
+fi
 
 if [ -n "$(git status --short)" ]; then
     echo "working tree is dirty; production releases require a reviewed commit" >&2
@@ -453,7 +502,11 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     "$SMOKE_ENV_REMOTE" "$DRAIN_TIMEOUT_SECONDS" \
     "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" "$BREAK_GLASS_FILE_REMOTE" \
     "$RELEASE_BASE_COMMIT" "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" \
-    "$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<'REMOTE_LOADER'
+    "$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" \
+    "$PREPARE_REMOTE_SMOKE_PRINCIPALS" \
+    "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" \
+    "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" \
+    "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" <<'REMOTE_LOADER'
 { set +x; } 2>/dev/null
 set -euo pipefail
 ORIGINAL_UMASK="$(umask)"
@@ -484,6 +537,10 @@ RELEASE_BASE_COMMIT="${13}"
 REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH="${14}"
 PACKAGE_SHA256="${15}"
 REMOTE_SMOKE_CREDENTIAL_DIGEST="${16}"
+PREPARE_REMOTE_SMOKE_PRINCIPALS="${17}"
+SMOKE_PRINCIPAL_CONFIRM_TENANT_ID="${18}"
+SMOKE_PRINCIPAL_PROVISION_OPERATION_ID="${19}"
+SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID="${20}"
 
 CURRENT="$APP_ROOT/current"
 CURRENT_TARGET=""
@@ -509,6 +566,8 @@ BROWSER_SMOKE_NETWORK=""
 BROWSER_SMOKE_FRONTEND_ID=""
 BROWSER_SMOKE_TEMP_DIR=""
 BROWSER_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"
+SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
+SMOKE_PRINCIPAL_CONTAINER_FILE="/tmp/astra-smoke-principals-${RELEASE_ID}.json"
 
 mkdir -p "$APP_ROOT"
 if ! command -v flock >/dev/null 2>&1; then
@@ -1377,6 +1436,244 @@ for sink, delivery in deliveries.items():
     ):
         raise SystemExit(1)
 PY_ALERT_CANARY_VALIDATE
+}
+
+validate_smoke_principal_inventory() {
+    local evidence="$1"
+    local expected_platform_ready="$2"
+
+    python3 - "$evidence" "$expected_platform_ready" <<'PY_SMOKE_PRINCIPAL_INVENTORY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+expected_platform_ready = sys.argv[2] == "1"
+if (
+    not path.is_file()
+    or path.is_symlink()
+    or not 0 < path.stat().st_size <= 16_384
+):
+    raise SystemExit(1)
+payload = json.loads(path.read_text(encoding="utf-8"))
+principals = payload.get("principals")
+tenant = payload.get("tenant")
+if (
+    payload.get("ok") is not True
+    or payload.get("action") != "inventory"
+    or not isinstance(tenant, dict)
+    or tenant.get("release_qa_boundary") is not True
+    or tenant.get("owner_pointer_valid") is not True
+    or not isinstance(principals, dict)
+):
+    raise SystemExit(1)
+owner = principals.get("owner")
+member = principals.get("member")
+platform = principals.get("platform")
+if (
+    not isinstance(owner, dict)
+    or owner.get("present") is not True
+    or owner.get("login_ready") is not True
+    or not isinstance(member, dict)
+    or member.get("present") is not True
+    or member.get("login_ready") is not True
+    or member.get("ordinary_member") is not True
+    or not isinstance(platform, dict)
+    or platform.get("present") is not True
+    or platform.get("tenantless") is not True
+    or platform.get("login_ready") is not expected_platform_ready
+    or platform.get("authority_active") is not expected_platform_ready
+):
+    raise SystemExit(1)
+PY_SMOKE_PRINCIPAL_INVENTORY
+}
+
+smoke_platform_principal_state() {
+    local evidence="$1"
+
+    python3 - "$evidence" <<'PY_SMOKE_PLATFORM_STATE'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if (
+    not path.is_file()
+    or path.is_symlink()
+    or not 0 < path.stat().st_size <= 16_384
+):
+    raise SystemExit(1)
+payload = json.loads(path.read_text(encoding="utf-8"))
+tenant = payload.get("tenant")
+principals = payload.get("principals")
+platform = principals.get("platform") if isinstance(principals, dict) else None
+if (
+    payload.get("ok") is not True
+    or payload.get("action") != "inventory"
+    or not isinstance(tenant, dict)
+    or tenant.get("release_qa_boundary") is not True
+    or tenant.get("owner_pointer_valid") is not True
+    or not isinstance(platform, dict)
+):
+    raise SystemExit(1)
+if platform.get("login_ready") is True or platform.get("authority_active") is True:
+    if (
+        platform.get("present") is not True
+        or platform.get("tenantless") is not True
+        or platform.get("login_ready") is not True
+        or platform.get("authority_active") is not True
+    ):
+        raise SystemExit(1)
+    print("active")
+else:
+    print("inactive")
+PY_SMOKE_PLATFORM_STATE
+}
+
+run_smoke_principal_manager() {
+    local action="$1"
+    local operation_id="$2"
+    local output="$3"
+    local manager_path="/app/scripts/manage_production_smoke_principals.py"
+    local status=0
+    local -a manager_args
+
+    [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] || return 1
+    [ "$RUN_REMOTE_SMOKE" = "1" ] || return 1
+    [ -n "${CANDIDATE_BACKEND_ID:-}" ] || return 1
+    [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || return 1
+    case "$output" in
+        "$BACKUP"/*.json) ;;
+        *) return 1 ;;
+    esac
+    case "$action" in
+        inventory)
+            [ -z "$operation_id" ] || return 1
+            ;;
+        provision|deactivate-platform)
+            [ -n "$operation_id" ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    rm -f "$output"
+    docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
+        rm -f "$SMOKE_PRINCIPAL_CONTAINER_FILE" >/dev/null 2>&1 || return 1
+    docker cp \
+        "$SMOKE_ENV_FILE" \
+        "${CANDIDATE_BACKEND_ID}:${SMOKE_PRINCIPAL_CONTAINER_FILE}" || return 1
+    if ! docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
+        sh -c 'test -f "$1" && test ! -L "$1" && chmod 0600 "$1" && chown 0:0 "$1" && test -f "$2" && test ! -L "$2"' \
+        sh "$SMOKE_PRINCIPAL_CONTAINER_FILE" "$manager_path"; then
+        docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
+            rm -f "$SMOKE_PRINCIPAL_CONTAINER_FILE" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    manager_args=(
+        python "$manager_path"
+        --action "$action"
+        --credentials-file "$SMOKE_PRINCIPAL_CONTAINER_FILE"
+        --confirm-environment production
+        --confirm-tenant-id "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID"
+        --release-version "$VERSION"
+    )
+    if [ "$action" != "inventory" ]; then
+        manager_args+=(--operation-id "$operation_id" --apply)
+    fi
+    if ! timeout --signal=TERM --kill-after=10s 180s \
+        docker exec --user 0:0 -i "$CANDIDATE_BACKEND_ID" \
+        "${manager_args[@]}" > "$output" < /dev/null; then
+        status=1
+    fi
+    docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
+        rm -f "$SMOKE_PRINCIPAL_CONTAINER_FILE" >/dev/null 2>&1 || status=1
+    chmod 0600 "$output" 2>/dev/null || status=1
+    [ "$status" = "0" ] || return 1
+
+    python3 - "$output" "$action" "$operation_id" <<'PY_SMOKE_PRINCIPAL_RESULT'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+action = sys.argv[2]
+operation_id = sys.argv[3]
+if (
+    not path.is_file()
+    or path.is_symlink()
+    or not 0 < path.stat().st_size <= 16_384
+):
+    raise SystemExit(1)
+payload = json.loads(path.read_text(encoding="utf-8"))
+if payload.get("ok") is not True or payload.get("action") != action:
+    raise SystemExit(1)
+if action == "inventory":
+    if operation_id or "status" in payload or "operation_id" in payload:
+        raise SystemExit(1)
+elif (
+    payload.get("status") not in {"applied", "already_applied"}
+    or payload.get("operation_id") != operation_id
+):
+    raise SystemExit(1)
+PY_SMOKE_PRINCIPAL_RESULT
+}
+
+prepare_smoke_principals() {
+    local before="$BACKUP/smoke-principals.inventory-before.json"
+    local provisioned="$BACKUP/smoke-principals.provision.json"
+    local after="$BACKUP/smoke-principals.inventory-ready.json"
+
+    [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] || return 0
+    echo "[remote] inventorying the approved Release QA smoke boundary"
+    run_smoke_principal_manager inventory "" "$before" || return 1
+    echo "[remote] preparing dedicated release-smoke principals"
+    # Arm cleanup before the transaction. A committed DB mutation followed by
+    # lost/corrupt command output must still force rollback-time revocation.
+    SMOKE_PLATFORM_PRINCIPAL_ACTIVE=1
+    run_smoke_principal_manager \
+        provision "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" "$provisioned" || return 1
+    run_smoke_principal_manager inventory "" "$after" || return 1
+    validate_smoke_principal_inventory "$after" 1 || return 1
+    write_atomic_line "$BACKUP/smoke-principals-state" \
+        "prepared:${SMOKE_PRINCIPAL_PROVISION_OPERATION_ID}"
+}
+
+deactivate_smoke_platform_principal() {
+    local reason="$1"
+    local deactivated
+    local after
+    local before
+    local platform_state
+
+    [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] || return 0
+    [ "$SMOKE_PLATFORM_PRINCIPAL_ACTIVE" = "1" ] || return 0
+    case "$reason" in
+        after-smoke|rollback) ;;
+        *) return 1 ;;
+    esac
+    before="$BACKUP/smoke-principals.inventory-cleanup-before-${reason}.json"
+    deactivated="$BACKUP/smoke-principals.deactivate-${reason}.json"
+    after="$BACKUP/smoke-principals.inventory-deactivated-${reason}.json"
+    run_smoke_principal_manager inventory "" "$before" || return 1
+    platform_state="$(smoke_platform_principal_state "$before")" || return 1
+    if [ "$platform_state" = "inactive" ]; then
+        SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
+        write_atomic_line "$BACKUP/smoke-principals-state" \
+            "platform-already-inactive:${reason}"
+        return 0
+    fi
+    [ "$platform_state" = "active" ] || return 1
+    echo "[remote] removing temporary release-smoke platform authority ($reason)"
+    run_smoke_principal_manager \
+        deactivate-platform \
+        "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" \
+        "$deactivated" || return 1
+    run_smoke_principal_manager inventory "" "$after" || return 1
+    validate_smoke_principal_inventory "$after" 0 || return 1
+    SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
+    write_atomic_line "$BACKUP/smoke-principals-state" \
+        "platform-deactivated:${SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID}:${reason}"
 }
 
 run_candidate_business_smoke() {
@@ -4961,6 +5258,20 @@ rollback() {
     trap - ERR HUP INT TERM
     set +e
     cleanup_browser_smoke_runtime
+    if [ "${PREPARE_REMOTE_SMOKE_PRINCIPALS:-0}" = "1" ] && \
+       ! deactivate_smoke_platform_principal rollback; then
+        echo "[remote] temporary release-smoke platform authority requires operator attention" >&2
+        write_cutover_state \
+            smoke_principal_cleanup_incomplete "$CANDIDATE_SLOT" "$RELEASE_ID" || true
+        if [ "${MAINTENANCE_ENABLED:-0}" != "1" ] || \
+           ! verify_public_maintenance; then
+            echo "[remote] reasserting maintenance after smoke-principal cleanup failure" >&2
+            enable_web_maintenance || \
+                echo "[remote] maintenance could not be re-verified; immediate operator action is required" >&2
+        fi
+        echo "[remote] refusing to restore public traffic until temporary platform authority is removed" >&2
+        return 1
+    fi
     rm -f "$SMOKE_ENV_FILE"
     # Once the durable approval consistency constraint exists, the old API and
     # worker are no longer schema-compatible. A failed/unknown probe is also
@@ -5304,6 +5615,9 @@ write_cutover_state candidate_alert_canary_verified \
 # before changing the public upstream. A failure here keeps the maintenance
 # fence in place and never exposes an unverified API/worker pair to customers.
 if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
+    if ! prepare_smoke_principals; then
+        abort_release "dedicated Release QA smoke principals could not be prepared safely"
+    fi
     if [ "$BROWSER_SMOKE_READY" != "1" ]; then
         abort_release "browser smoke image did not pass its pre-mutation launch self-test"
     fi
@@ -5319,6 +5633,9 @@ if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
     if ! install_durable_file \
         "$CANDIDATE_SMOKE_TEMP" "$BACKUP/subscription-smoke.candidate.json"; then
         abort_release "candidate smoke evidence could not be durably published"
+    fi
+    if ! deactivate_smoke_platform_principal after-smoke; then
+        abort_release "temporary release-smoke platform authority could not be removed"
     fi
     rm -f "$SMOKE_ENV_FILE"
     CANDIDATE_SMOKE_SHA256="$(

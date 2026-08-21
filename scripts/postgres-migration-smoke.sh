@@ -2591,6 +2591,7 @@ PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/approval-execution-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/chat-tier-preference-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/manual-order-governance-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/production-smoke-principals-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO users (

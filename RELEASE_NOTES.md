@@ -85,6 +85,9 @@
 
 ## Operations
 
+- Refreshes the frontend lockfile from `nanoid` 3.3.16 to 3.3.18, removing
+  the transitive high-severity development dependency advisory without adding
+  a new runtime dependency.
 - Includes one linear Alembic head, `manual_order_decisions`. The final two
   revisions add durable paid-effect receipts/provider-close state and
   evidence-backed manual-order operator decisions after
@@ -92,6 +95,13 @@
   fresh/history/downgrade/re-upgrade release gate.
 - Registration-code business-flow smoke now follows the governed platform
   registration-credential contract and its structured error responses.
+- Production releases can explicitly prepare dedicated Release QA principals
+  only after separate authorization: the owner/member boundary is tenant-fenced,
+  the temporary tenantless platform operator is enabled only for isolated
+  candidate smoke, and its password, authority, and tokens are revoked before
+  public cutover. If revocation cannot be proved, rollback remains behind the
+  maintenance fence and refuses to restore public traffic. Normal releases keep
+  this lifecycle disabled.
 - The production release must use an immutable reviewed commit and separately
   prove active-container configuration, migration head, provider readiness, and
   browser business flows. Rollback is the normal immutable-release rollback to

@@ -76,6 +76,9 @@ bash scripts/deploy-astra-production.sh
 `SMOKE_TENANT_ID` 必须指向明确批准的内部验证租户；API 与浏览器证据都必须证明
 最终 token 仍属于该租户，禁止依赖多租户账号的默认选择，也禁止误用客户租户；
 临时凭据文件必须由脚本清理，报告只记录通过/失败和 trace ID，不记录凭据。只有
+验收身份需要创建或轮换时，必须另外取得生产安全授权，并严格遵守
+`.agents/workflows/manage-production-smoke-principals.md`；普通发布默认不会修改身份。
+只有
 紧急恢复才允许 `RUN_REMOTE_SMOKE=0`，且必须同时提供带审批号、一次性随机
 `approval_nonce`、审批人、原因、目标版本、完整 commit、签发时间和未过期 UTC 时间的
 `REMOTE_SMOKE_BREAK_GLASS_ARTIFACT`。字段不得为空或重复，审批有效期最长 4 小时；

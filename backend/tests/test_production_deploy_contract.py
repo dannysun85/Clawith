@@ -641,7 +641,8 @@ def test_production_identity_preflight_runs_before_maintenance_and_redacts_value
     assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in script
     assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in script
     assert 'gzip -n -c "$PACKAGE_TAR" > "$PACKAGE"' in script
-    assert ('"$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<\'REMOTE_LOADER\'') in script
+    assert '"$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" \\' in script
+    assert '"$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" <<\'REMOTE_LOADER\'' in script
     assert 'cat > "$REMOTE_SCRIPT_FILE" <<\'REMOTE_SCRIPT\'' in script
     assert 'bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null' in script
     assert '" > "$raw_path" < /dev/null; then' in function
@@ -781,6 +782,57 @@ def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
     consume = script.index("consume_break_glass_approval.py")
     recovery_call = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', consume)
     assert consume < recovery_call
+
+
+def test_dedicated_smoke_principal_lifecycle_is_explicit_bounded_and_pre_cutover():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    assert 'PREPARE_REMOTE_SMOKE_PRINCIPALS="${PREPARE_REMOTE_SMOKE_PRINCIPALS:-0}"' in script
+    assert 'SMOKE_PRINCIPAL_CONFIRM_TENANT_ID="${SMOKE_PRINCIPAL_CONFIRM_TENANT_ID:-}"' in script
+    assert "production smoke principals can only be prepared when RUN_REMOTE_SMOKE=1" in script
+    assert "SMOKE_PRINCIPAL_CONFIRM_TENANT_ID must match SMOKE_TENANT_ID" in script
+    assert "provision and deactivate operation ids must be distinct" in script
+    assert "manage_production_smoke_principals.py" in script
+    assert '--confirm-environment production' in script
+    assert '--confirm-tenant-id "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID"' in script
+    assert 'manager_args+=(--operation-id "$operation_id" --apply)' in script
+    assert 'source "$SMOKE_ENV_FILE"' not in script
+
+    candidate_ready = script.index(
+        'write_cutover_state candidate_alert_canary_verified \\\n'
+        '    "$CANDIDATE_SLOT" "$RELEASE_ID"'
+    )
+    prepare = script.index("if ! prepare_smoke_principals; then", candidate_ready)
+    smoke = script.index("if ! run_candidate_business_smoke \\\n", prepare)
+    deactivate = script.index(
+        "if ! deactivate_smoke_platform_principal after-smoke; then",
+        smoke,
+    )
+    remove_credentials = script.index('rm -f "$SMOKE_ENV_FILE"', deactivate)
+    cutover = script.index(
+        'echo "[remote] switching the verified maintenance fence to candidate traffic"',
+        remove_credentials,
+    )
+    assert candidate_ready < prepare < smoke < deactivate < remove_credentials < cutover
+
+    rollback = _shell_function_source(script, "rollback", "abort_release")
+    rollback_deactivate = rollback.index("deactivate_smoke_platform_principal rollback")
+    rollback_fail_closed = rollback.index(
+        "refusing to restore public traffic until temporary platform authority is removed"
+    )
+    rollback_return = rollback.index("return 1", rollback_fail_closed)
+    rollback_remove_credentials = rollback.index('rm -f "$SMOKE_ENV_FILE"')
+    rollback_restore = rollback.index("schema_state=", rollback_remove_credentials)
+    assert (
+        rollback_deactivate
+        < rollback_fail_closed
+        < rollback_return
+        < rollback_remove_credentials
+        < rollback_restore
+    )
+    assert "smoke_principal_cleanup_incomplete" in rollback
+    assert "verify_public_maintenance" in rollback
+    assert "temporary release-smoke platform authority requires operator attention" in rollback
 
 
 def test_candidate_business_evidence_rejects_tampering_and_wrong_slot(tmp_path):
