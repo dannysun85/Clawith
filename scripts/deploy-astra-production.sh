@@ -92,6 +92,20 @@ SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID="${SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_
 REMOTE_SMOKE_BREAK_GLASS_ARTIFACT="${REMOTE_SMOKE_BREAK_GLASS_ARTIFACT:-}"
 DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-900}"
 
+isolate_smoke_principal_controls() {
+    # These release controls are consumed only by this orchestrator and are
+    # passed to the remote state machine explicitly.  Do not leak them into
+    # local test or build subprocesses: an exported prepare flag would make
+    # rollback contract harnesses behave as if they were inside the live
+    # identity lifecycle even though those isolated harnesses omit it.
+    export -n PREPARE_REMOTE_SMOKE_PRINCIPALS 2>/dev/null || true
+    export -n SMOKE_PRINCIPAL_CONFIRM_TENANT_ID 2>/dev/null || true
+    export -n SMOKE_PRINCIPAL_PROVISION_OPERATION_ID 2>/dev/null || true
+    export -n SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID 2>/dev/null || true
+}
+
+isolate_smoke_principal_controls
+
 SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
 SSH_OPTS=(
     -i "$SSH_KEY"

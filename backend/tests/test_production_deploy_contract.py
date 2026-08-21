@@ -792,6 +792,10 @@ def test_dedicated_smoke_principal_lifecycle_is_explicit_bounded_and_pre_cutover
     assert "production smoke principals can only be prepared when RUN_REMOTE_SMOKE=1" in script
     assert "SMOKE_PRINCIPAL_CONFIRM_TENANT_ID must match SMOKE_TENANT_ID" in script
     assert "provision and deactivate operation ids must be distinct" in script
+    assert "export -n PREPARE_REMOTE_SMOKE_PRINCIPALS" in script
+    assert "export -n SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" in script
+    assert "export -n SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" in script
+    assert "export -n SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" in script
     assert "manage_production_smoke_principals.py" in script
     assert '--confirm-environment production' in script
     assert '--confirm-tenant-id "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID"' in script
@@ -833,6 +837,43 @@ def test_dedicated_smoke_principal_lifecycle_is_explicit_bounded_and_pre_cutover
     assert "smoke_principal_cleanup_incomplete" in rollback
     assert "verify_public_maintenance" in rollback
     assert "temporary release-smoke platform authority requires operator attention" in rollback
+
+
+def test_smoke_principal_controls_stay_local_to_the_release_orchestrator():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    start = script.index("isolate_smoke_principal_controls() {")
+    end = script.index("\nisolate_smoke_principal_controls\n", start)
+    isolate = script[start:end]
+    harness = f"""set -eu
+export PREPARE_REMOTE_SMOKE_PRINCIPALS=1
+export SMOKE_PRINCIPAL_CONFIRM_TENANT_ID=11111111-1111-4111-8111-111111111111
+export SMOKE_PRINCIPAL_PROVISION_OPERATION_ID=22222222-2222-4222-8222-222222222222
+export SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID=33333333-3333-4333-8333-333333333333
+{isolate}
+isolate_smoke_principal_controls
+[ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = 1 ]
+[ "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" = 11111111-1111-4111-8111-111111111111 ]
+[ "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" = 22222222-2222-4222-8222-222222222222 ]
+[ "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" = 33333333-3333-4333-8333-333333333333 ]
+bash -c '
+    test -z "${{PREPARE_REMOTE_SMOKE_PRINCIPALS-}}" &&
+    test -z "${{SMOKE_PRINCIPAL_CONFIRM_TENANT_ID-}}" &&
+    test -z "${{SMOKE_PRINCIPAL_PROVISION_OPERATION_ID-}}" &&
+    test -z "${{SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID-}}"
+'
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    isolate_call = script.index("\nisolate_smoke_principal_controls\n", start)
+    local_gates = script.index('echo "[local] verifying unique production data-plane DNS"')
+    assert isolate_call < local_gates
 
 
 def test_candidate_business_evidence_rejects_tampering_and_wrong_slot(tmp_path):
