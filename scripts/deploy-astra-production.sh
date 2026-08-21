@@ -581,6 +581,7 @@ BROWSER_SMOKE_FRONTEND_ID=""
 BROWSER_SMOKE_TEMP_DIR=""
 BROWSER_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"
 SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
+RECOVERY_SMOKE_LIFECYCLE_CONSUMED=0
 SMOKE_PRINCIPAL_CONTAINER_FILE="/tmp/astra-smoke-principals-${RELEASE_ID}.json"
 
 mkdir -p "$APP_ROOT"
@@ -1548,16 +1549,20 @@ run_smoke_principal_manager() {
     local action="$1"
     local operation_id="$2"
     local output="$3"
+    local backend_id="${4:-${CANDIDATE_BACKEND_ID:-}}"
+    local output_root="${5:-$BACKUP}"
+    local release_version="${6:-$VERSION}"
+    local container_file="${7:-$SMOKE_PRINCIPAL_CONTAINER_FILE}"
     local manager_path="/app/scripts/manage_production_smoke_principals.py"
     local status=0
     local -a manager_args
 
     [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] || return 1
     [ "$RUN_REMOTE_SMOKE" = "1" ] || return 1
-    [ -n "${CANDIDATE_BACKEND_ID:-}" ] || return 1
+    [ -n "$backend_id" ] || return 1
     [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || return 1
     case "$output" in
-        "$BACKUP"/*.json) ;;
+        "$output_root"/*.json) ;;
         *) return 1 ;;
     esac
     case "$action" in
@@ -1571,37 +1576,37 @@ run_smoke_principal_manager() {
     esac
 
     rm -f "$output"
-    docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
-        rm -f "$SMOKE_PRINCIPAL_CONTAINER_FILE" >/dev/null 2>&1 || return 1
+    docker exec --user 0:0 "$backend_id" \
+        rm -f "$container_file" >/dev/null 2>&1 || return 1
     docker cp \
         "$SMOKE_ENV_FILE" \
-        "${CANDIDATE_BACKEND_ID}:${SMOKE_PRINCIPAL_CONTAINER_FILE}" || return 1
-    if ! docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
+        "${backend_id}:${container_file}" || return 1
+    if ! docker exec --user 0:0 "$backend_id" \
         sh -c 'test -f "$1" && test ! -L "$1" && chmod 0600 "$1" && chown 0:0 "$1" && test -f "$2" && test ! -L "$2"' \
-        sh "$SMOKE_PRINCIPAL_CONTAINER_FILE" "$manager_path"; then
-        docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
-            rm -f "$SMOKE_PRINCIPAL_CONTAINER_FILE" >/dev/null 2>&1 || true
+        sh "$container_file" "$manager_path"; then
+        docker exec --user 0:0 "$backend_id" \
+            rm -f "$container_file" >/dev/null 2>&1 || true
         return 1
     fi
 
     manager_args=(
         env PYTHONPATH=/app python "$manager_path"
         --action "$action"
-        --credentials-file "$SMOKE_PRINCIPAL_CONTAINER_FILE"
+        --credentials-file "$container_file"
         --confirm-environment production
         --confirm-tenant-id "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID"
-        --release-version "$VERSION"
+        --release-version "$release_version"
     )
     if [ "$action" != "inventory" ]; then
         manager_args+=(--operation-id "$operation_id" --apply)
     fi
     if ! timeout --signal=TERM --kill-after=10s 180s \
-        docker exec --user 0:0 -i "$CANDIDATE_BACKEND_ID" \
+        docker exec --user 0:0 -i "$backend_id" \
         "${manager_args[@]}" > "$output" < /dev/null; then
         status=1
     fi
-    docker exec --user 0:0 "$CANDIDATE_BACKEND_ID" \
-        rm -f "$SMOKE_PRINCIPAL_CONTAINER_FILE" >/dev/null 2>&1 || status=1
+    docker exec --user 0:0 "$backend_id" \
+        rm -f "$container_file" >/dev/null 2>&1 || status=1
     chmod 0600 "$output" 2>/dev/null || status=1
     [ "$status" = "0" ] || return 1
 
@@ -1634,27 +1639,40 @@ PY_SMOKE_PRINCIPAL_RESULT
 }
 
 prepare_smoke_principals() {
-    local before="$BACKUP/smoke-principals.inventory-before.json"
-    local provisioned="$BACKUP/smoke-principals.provision.json"
-    local after="$BACKUP/smoke-principals.inventory-ready.json"
+    local backend_id="${1:-${CANDIDATE_BACKEND_ID:-}}"
+    local output_root="${2:-$BACKUP}"
+    local release_version="${3:-$VERSION}"
+    local container_file="${4:-$SMOKE_PRINCIPAL_CONTAINER_FILE}"
+    local before="$output_root/smoke-principals.inventory-before.json"
+    local provisioned="$output_root/smoke-principals.provision.json"
+    local after="$output_root/smoke-principals.inventory-ready.json"
 
     [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] || return 0
     echo "[remote] inventorying the approved Release QA smoke boundary"
-    run_smoke_principal_manager inventory "" "$before" || return 1
+    run_smoke_principal_manager \
+        inventory "" "$before" "$backend_id" "$output_root" \
+        "$release_version" "$container_file" || return 1
     echo "[remote] preparing dedicated release-smoke principals"
     # Arm cleanup before the transaction. A committed DB mutation followed by
     # lost/corrupt command output must still force rollback-time revocation.
     SMOKE_PLATFORM_PRINCIPAL_ACTIVE=1
     run_smoke_principal_manager \
-        provision "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" "$provisioned" || return 1
-    run_smoke_principal_manager inventory "" "$after" || return 1
+        provision "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" "$provisioned" \
+        "$backend_id" "$output_root" "$release_version" "$container_file" || return 1
+    run_smoke_principal_manager \
+        inventory "" "$after" "$backend_id" "$output_root" \
+        "$release_version" "$container_file" || return 1
     validate_smoke_principal_inventory "$after" 1 || return 1
-    write_atomic_line "$BACKUP/smoke-principals-state" \
+    write_atomic_line "$output_root/smoke-principals-state" \
         "prepared:${SMOKE_PRINCIPAL_PROVISION_OPERATION_ID}"
 }
 
 deactivate_smoke_platform_principal() {
     local reason="$1"
+    local backend_id="${2:-${CANDIDATE_BACKEND_ID:-}}"
+    local output_root="${3:-$BACKUP}"
+    local release_version="${4:-$VERSION}"
+    local container_file="${5:-$SMOKE_PRINCIPAL_CONTAINER_FILE}"
     local deactivated
     local after
     local before
@@ -1666,14 +1684,16 @@ deactivate_smoke_platform_principal() {
         after-smoke|rollback) ;;
         *) return 1 ;;
     esac
-    before="$BACKUP/smoke-principals.inventory-cleanup-before-${reason}.json"
-    deactivated="$BACKUP/smoke-principals.deactivate-${reason}.json"
-    after="$BACKUP/smoke-principals.inventory-deactivated-${reason}.json"
-    run_smoke_principal_manager inventory "" "$before" || return 1
+    before="$output_root/smoke-principals.inventory-cleanup-before-${reason}.json"
+    deactivated="$output_root/smoke-principals.deactivate-${reason}.json"
+    after="$output_root/smoke-principals.inventory-deactivated-${reason}.json"
+    run_smoke_principal_manager \
+        inventory "" "$before" "$backend_id" "$output_root" \
+        "$release_version" "$container_file" || return 1
     platform_state="$(smoke_platform_principal_state "$before")" || return 1
     if [ "$platform_state" = "inactive" ]; then
         SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
-        write_atomic_line "$BACKUP/smoke-principals-state" \
+        write_atomic_line "$output_root/smoke-principals-state" \
             "platform-already-inactive:${reason}"
         return 0
     fi
@@ -1682,11 +1702,14 @@ deactivate_smoke_platform_principal() {
     run_smoke_principal_manager \
         deactivate-platform \
         "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" \
-        "$deactivated" || return 1
-    run_smoke_principal_manager inventory "" "$after" || return 1
+        "$deactivated" "$backend_id" "$output_root" \
+        "$release_version" "$container_file" || return 1
+    run_smoke_principal_manager \
+        inventory "" "$after" "$backend_id" "$output_root" \
+        "$release_version" "$container_file" || return 1
     validate_smoke_principal_inventory "$after" 0 || return 1
     SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
-    write_atomic_line "$BACKUP/smoke-principals-state" \
+    write_atomic_line "$output_root/smoke-principals-state" \
         "platform-deactivated:${SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID}:${reason}"
 }
 
@@ -2119,6 +2142,51 @@ regenerate_candidate_business_evidence() {
         "smoke-v2:${evidence_sha256}" || return 1
     echo "authenticated recovery API/browser smoke passed"
     candidate_business_evidence_valid "$target_release_id" "$target_port"
+}
+
+recover_candidate_business_evidence_with_smoke_principals() {
+    local target_release="$1"
+    local target_release_id="$2"
+    local target_port="$3"
+    local target_project="$4"
+    local target_backup="$APP_ROOT/backups/$target_release_id"
+    local target_version
+    local target_backend_id
+    local container_file="/tmp/astra-smoke-principals-${target_release_id}.json"
+    local smoke_status=0
+
+    [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] || return 1
+    target_version="$(tr -d '[:space:]' < "$target_release/VERSION")" || return 1
+    target_backend_id="$(
+        compose_project \
+            "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+            ps -q backend
+    )" || return 1
+    [ -n "$target_backend_id" ] && [[ "$target_backend_id" != *$'\n'* ]] || return 1
+    mkdir -p "$target_backup"
+    [ -d "$target_backup" ] && [ ! -L "$target_backup" ] || return 1
+
+    if ! prepare_smoke_principals \
+        "$target_backend_id" "$target_backup" "$target_version" "$container_file"; then
+        smoke_status=1
+    elif ! regenerate_candidate_business_evidence \
+        "$target_release" "$target_release_id" "$target_port" "$target_project"; then
+        smoke_status=1
+    fi
+
+    # Provision is armed before its transaction because a committed mutation
+    # may outlive lost command output. Recovery must therefore revoke the
+    # temporary platform authority on every post-provision exit path, not only
+    # after a successful browser smoke.
+    if [ "$SMOKE_PLATFORM_PRINCIPAL_ACTIVE" = "1" ] && \
+        ! deactivate_smoke_platform_principal \
+            after-smoke "$target_backend_id" "$target_backup" \
+            "$target_version" "$container_file"; then
+        echo "cannot recover cutover: temporary release-smoke platform authority could not be removed" >&2
+        return 1
+    fi
+    [ "$smoke_status" = "0" ] || return 1
+    RECOVERY_SMOKE_LIFECYCLE_CONSUMED=1
 }
 
 write_atomic_symlink() {
@@ -4605,10 +4673,24 @@ recover_indeterminate_cutover() {
     # silently replaced.
     if ! candidate_business_evidence_valid \
         "$target_release_id" "$target_port"; then
-        if [ "$evidence_must_preexist" = "1" ] || \
-            ! regenerate_candidate_business_evidence \
+        if [ "$evidence_must_preexist" = "1" ]; then
+            echo "cannot recover cutover: candidate business verification is missing or invalid" >&2
+            write_cutover_state "$recovery_incomplete_phase" \
+                "$target_slot" "$target_release_id" || true
+            return 1
+        fi
+        if [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ]; then
+            if ! recover_candidate_business_evidence_with_smoke_principals \
                 "$target_release" "$target_release_id" "$target_port" \
                 "$target_project"; then
+                echo "cannot recover cutover: candidate business verification is missing or invalid" >&2
+                write_cutover_state "$recovery_incomplete_phase" \
+                    "$target_slot" "$target_release_id" || true
+                return 1
+            fi
+        elif ! regenerate_candidate_business_evidence \
+            "$target_release" "$target_release_id" "$target_port" \
+            "$target_project"; then
             echo "cannot recover cutover: candidate business verification is missing or invalid" >&2
             write_cutover_state "$recovery_incomplete_phase" \
                 "$target_slot" "$target_release_id" || true
@@ -4885,6 +4967,27 @@ if [ "$RECOVERY_REQUIRED" = "1" ]; then
     if ! load_active_state || ! parse_cutover_state || ! validate_stable_state; then
         echo "cutover recovery did not produce a consistent terminal state" >&2
         exit 1
+    fi
+    # A retry may resume after the prior invocation already published business
+    # evidence and revoked the temporary platform principal.  In that case the
+    # lifecycle is spent even though this shell did not set the in-memory flag.
+    # Finish the recovered release request instead of attempting to reuse the
+    # same exactly-once operation ids for another candidate.
+    if [ "$PREPARE_REMOTE_SMOKE_PRINCIPALS" = "1" ] && \
+        [ "$RECOVERY_TARGET_RELEASE_ID" != "$RELEASE_ID" ]; then
+        RECOVERED_RELEASE="$(release_for_slot "$RECOVERY_TARGET_SLOT")" || {
+            echo "recovered release journal is missing after terminal recovery" >&2
+            exit 1
+        }
+        RECOVERED_VERSION="$(tr -d '[:space:]' < "$RECOVERED_RELEASE/VERSION")"
+        RECOVERED_COMMIT="$(tr -d '[:space:]' < "$RECOVERED_RELEASE/COMMIT")"
+        write_atomic_line "$BACKUP/recovered-release-result" \
+            "recovered_existing|${RECOVERY_TARGET_RELEASE_ID}|${RECOVERED_VERSION}|${RECOVERED_COMMIT}|${RECOVERY_TARGET_SLOT}"
+        chmod 0600 "$BACKUP/recovered-release-result"
+        cleanup_browser_smoke_runtime
+        rm -f "$PACKAGE" "$SMOKE_ENV_FILE"
+        echo "[remote] recovered and released existing candidate $RECOVERY_TARGET_RELEASE_ID on slot $RECOVERY_TARGET_SLOT"
+        exit 0
     fi
 fi
 
@@ -5760,20 +5863,83 @@ env -u BASH_ENV -u BASHOPTS -u SHELLOPTS \
     bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null
 REMOTE_LOADER
 
+EXPECTED_RELEASE_ID="$RELEASE_ID"
+EXPECTED_VERSION="$VERSION"
+EXPECTED_COMMIT="$COMMIT"
+RECOVERED_RELEASE_RESULT="$(
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- \
+        "$APP_ROOT/backups/$RELEASE_ID/recovered-release-result" <<'READ_RECOVERED_RELEASE_RESULT'
+set -euo pipefail
+result_file="$1"
+if [ -f "$result_file" ] && [ ! -L "$result_file" ]; then
+    [ "$(stat -c '%a' "$result_file")" = "600" ] || {
+        echo "recovered release result has unsafe permissions" >&2
+        exit 1
+    }
+    result_size="$(stat -c '%s' "$result_file")"
+    [ "$result_size" -gt 0 ] && [ "$result_size" -le 512 ] || {
+        echo "recovered release result has invalid size" >&2
+        exit 1
+    }
+    cat "$result_file"
+fi
+READ_RECOVERED_RELEASE_RESULT
+)"
+if [ -n "$RECOVERED_RELEASE_RESULT" ]; then
+    python3 - "$RECOVERED_RELEASE_RESULT" "$VERSION" <<'PY_RECOVERED_RELEASE_RESULT'
+import re
+import sys
+
+payload = sys.argv[1]
+fields = payload.split("|")
+if (
+    len(payload) > 512
+    or "\n" in payload
+    or "\r" in payload
+    or len(fields) != 5
+    or fields[0] != "recovered_existing"
+    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", fields[1]) is None
+    or fields[2] != sys.argv[2]
+    or re.fullmatch(r"[0-9a-f]{40}", fields[3]) is None
+    or fields[4] not in {"a", "b"}
+):
+    raise SystemExit("invalid recovered release result")
+PY_RECOVERED_RELEASE_RESULT
+    IFS='|' read -r RECOVERY_MODE EXPECTED_RELEASE_ID EXPECTED_VERSION EXPECTED_COMMIT EXPECTED_SLOT \
+        <<< "$RECOVERED_RELEASE_RESULT"
+    git cat-file -e "${EXPECTED_COMMIT}^{commit}"
+    git merge-base --is-ancestor "$EXPECTED_COMMIT" "$COMMIT"
+    RECOVERED_DIFF="$(git diff --name-only "$EXPECTED_COMMIT" "$COMMIT")"
+    python3 - "$RECOVERED_DIFF" <<'PY_RECOVERED_RELEASE_DIFF'
+import sys
+
+allowed = {
+    "backend/tests/test_production_deploy_contract.py",
+    "scripts/deploy-astra-production.sh",
+}
+changed = {line for line in sys.argv[1].splitlines() if line}
+if changed and not changed.issubset(allowed):
+    raise SystemExit(
+        "recovered candidate differs from the requested candidate outside release tooling"
+    )
+PY_RECOVERED_RELEASE_DIFF
+fi
+
 echo "[verify] independently checking public release identity"
 PUBLIC_RELEASE_VERIFIED=0
 for _ in $(seq 1 30); do
     PUBLIC_HEALTH_PAYLOAD="$(
         curl -fsS -H 'Cache-Control: no-cache' \
-            "$PUBLIC_URL/api/health?release=$RELEASE_ID" || true
+            "$PUBLIC_URL/api/health?release=$EXPECTED_RELEASE_ID" || true
     )"
     PUBLIC_VERSION_PAYLOAD="$(
         curl -fsS -H 'Cache-Control: no-cache' \
-            "$PUBLIC_URL/api/version?release=$RELEASE_ID" || true
+            "$PUBLIC_URL/api/version?release=$EXPECTED_RELEASE_ID" || true
     )"
     if python3 - \
         "$PUBLIC_HEALTH_PAYLOAD" "$PUBLIC_VERSION_PAYLOAD" \
-        "$VERSION" "$COMMIT" 2>/dev/null <<'PY_PUBLIC_RELEASE_VERIFY'
+        "$EXPECTED_VERSION" "$EXPECTED_COMMIT" "$EXPECTED_RELEASE_ID" \
+        2>/dev/null <<'PY_PUBLIC_RELEASE_VERIFY'
 import json
 import sys
 
@@ -5781,9 +5947,14 @@ health = json.loads(sys.argv[1])
 version = json.loads(sys.argv[2])
 expected_version = sys.argv[3]
 expected_commit = sys.argv[4]
+expected_release_id = sys.argv[5]
 if health.get("status") != "ok" or health.get("version") != expected_version:
     raise SystemExit(1)
-if version.get("version") != expected_version or version.get("commit") != expected_commit:
+if (
+    version.get("version") != expected_version
+    or version.get("commit") != expected_commit
+    or version.get("release_id") != expected_release_id
+):
     raise SystemExit(1)
 PY_PUBLIC_RELEASE_VERIFY
     then
@@ -5797,4 +5968,4 @@ if [ "$PUBLIC_RELEASE_VERIFIED" != "1" ]; then
     exit 1
 fi
 
-echo "[done] deployed $RELEASE_ID to $PUBLIC_URL"
+echo "[done] released $EXPECTED_RELEASE_ID ($EXPECTED_COMMIT) to $PUBLIC_URL"

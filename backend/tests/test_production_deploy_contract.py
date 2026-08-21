@@ -77,6 +77,23 @@ def _shell_function_source(script: str, name: str, next_name: str) -> str:
     return script[start:end]
 
 
+def _heredoc_source(script: str, marker: str) -> str:
+    start_marker = f"<<'{marker}'\n"
+    start = script.index(start_marker) + len(start_marker)
+    end = script.index(f"\n{marker}", start)
+    return script[start:end]
+
+
+def _run_embedded_python(source: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-", *args],
+        input=source,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _recovery_shell_source(script: str) -> tuple[str, str, str]:
     port_function = _shell_function_source(
         script,
@@ -840,6 +857,192 @@ def test_dedicated_smoke_principal_lifecycle_is_explicit_bounded_and_pre_cutover
     assert "temporary release-smoke platform authority requires operator attention" in rollback
 
 
+def test_recovery_prepares_and_revokes_dedicated_smoke_principals_before_public_restore():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    helper = _shell_function_source(
+        script,
+        "recover_candidate_business_evidence_with_smoke_principals",
+        "write_atomic_symlink",
+    )
+    recovery_start = script.index("recover_indeterminate_cutover() {")
+    recovery_end = script.index("\nif ! CURRENT_TARGET=", recovery_start)
+    recovery = script[recovery_start:recovery_end]
+
+    prepare = helper.index("if ! prepare_smoke_principals")
+    smoke = helper.index("elif ! regenerate_candidate_business_evidence", prepare)
+    deactivate = helper.index("! deactivate_smoke_platform_principal", smoke)
+    consumed = helper.index("RECOVERY_SMOKE_LIFECYCLE_CONSUMED=1", deactivate)
+    public_restore = recovery.index('install "$NGINX_SITE"')
+
+    assert prepare < smoke < deactivate < consumed
+    assert "recover_candidate_business_evidence_with_smoke_principals" in recovery
+    assert recovery.index("recover_candidate_business_evidence_with_smoke_principals") < public_restore
+    assert "temporary release-smoke platform authority could not be removed" in helper
+
+
+@pytest.mark.parametrize(
+    (
+        "prepare_status",
+        "smoke_status",
+        "deactivate_status",
+        "expected_status",
+        "expected_active",
+        "expected_consumed",
+    ),
+    [
+        (0, 0, 0, 0, 0, 1),
+        (1, 0, 0, 1, 0, 0),
+        (0, 1, 0, 1, 0, 0),
+        (0, 0, 1, 1, 1, 0),
+    ],
+)
+def test_recovery_smoke_helper_always_attempts_post_provision_cleanup(
+    tmp_path,
+    prepare_status,
+    smoke_status,
+    deactivate_status,
+    expected_status,
+    expected_active,
+    expected_consumed,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    helper = _shell_function_source(
+        script,
+        "recover_candidate_business_evidence_with_smoke_principals",
+        "write_atomic_symlink",
+    )
+    release = _write_test_release(tmp_path, "candidate-release")
+    harness = f"""set -u
+APP_ROOT={shlex.quote(str(tmp_path))}
+COMPOSE_FILE=docker-compose.prod.yml
+PREPARE_REMOTE_SMOKE_PRINCIPALS=1
+SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
+RECOVERY_SMOKE_LIFECYCLE_CONSUMED=0
+compose_project() {{ echo backend-container; }}
+prepare_smoke_principals() {{
+    SMOKE_PLATFORM_PRINCIPAL_ACTIVE=1
+    return {prepare_status}
+}}
+regenerate_candidate_business_evidence() {{ return {smoke_status}; }}
+deactivate_smoke_platform_principal() {{
+    echo cleanup_attempted
+    if [ {deactivate_status} -eq 0 ]; then
+        SMOKE_PLATFORM_PRINCIPAL_ACTIVE=0
+    fi
+    return {deactivate_status}
+}}
+{helper}
+recover_candidate_business_evidence_with_smoke_principals \
+    {shlex.quote(str(release))} candidate-release 3008 candidate-project
+status=$?
+echo "status=$status"
+echo "active=$SMOKE_PLATFORM_PRINCIPAL_ACTIVE"
+echo "consumed=$RECOVERY_SMOKE_LIFECYCLE_CONSUMED"
+exit 0
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "cleanup_attempted" in result.stdout
+    assert f"status={expected_status}" in result.stdout
+    assert f"active={expected_active}" in result.stdout
+    assert f"consumed={expected_consumed}" in result.stdout
+
+
+def test_recovered_release_result_is_identity_bound_and_checks_runtime_equivalence():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    assert 'write_atomic_line "$BACKUP/recovered-release-result"' in script
+    assert 'chmod 0600 "$BACKUP/recovered-release-result"' in script
+    assert 'version.get("release_id") != expected_release_id' in script
+    assert 'git merge-base --is-ancestor "$EXPECTED_COMMIT" "$COMMIT"' in script
+    assert 'stat -c \'%a\' "$result_file"' in script
+    assert 'stat -c \'%s\' "$result_file"' in script
+    assert '"backend/tests/test_production_deploy_contract.py"' in script
+    assert '"scripts/deploy-astra-production.sh"' in script
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "recovered_existing|release-id|1.12.0|" + "a" * 40,
+        "recovered_existing|release-id|1.12.1|" + "a" * 40 + "|a",
+        "recovered_existing|release-id|1.12.0|not-a-commit|a",
+        "recovered_existing|release-id|1.12.0|" + "a" * 40 + "|legacy",
+        "recovered_existing|release-id|1.12.0|" + "a" * 40 + "|a\ntampered",
+        "recovered_existing|release-id|1.12.0|" + "a" * 40 + "|a|extra",
+    ],
+)
+def test_recovered_release_result_parser_rejects_tampering(payload):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    parser = _heredoc_source(script, "PY_RECOVERED_RELEASE_RESULT")
+
+    result = _run_embedded_python(parser, payload, "1.12.0")
+
+    assert result.returncode != 0
+
+
+def test_recovered_release_result_parser_accepts_identity_bound_payload():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    parser = _heredoc_source(script, "PY_RECOVERED_RELEASE_RESULT")
+    payload = "recovered_existing|release-id|1.12.0|" + "a" * 40 + "|a"
+
+    result = _run_embedded_python(parser, payload, "1.12.0")
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "expected_status"),
+    [
+        ("", 0),
+        ("scripts/deploy-astra-production.sh", 0),
+        (
+            "scripts/deploy-astra-production.sh\n"
+            "backend/tests/test_production_deploy_contract.py",
+            0,
+        ),
+        ("backend/app/main.py", 1),
+        ("scripts/deploy-astra-production.sh\nfrontend/src/App.tsx", 1),
+    ],
+)
+def test_recovered_candidate_diff_guard_is_fail_closed(changed_files, expected_status):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    guard = _heredoc_source(script, "PY_RECOVERED_RELEASE_DIFF")
+
+    result = _run_embedded_python(guard, changed_files)
+
+    assert (result.returncode == 0) is (expected_status == 0), result.stderr
+
+
+def test_public_release_verifier_rejects_release_id_mismatch():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    verifier = _heredoc_source(script, "PY_PUBLIC_RELEASE_VERIFY")
+    health = json.dumps({"status": "ok", "version": "1.12.0"})
+    matching = json.dumps(
+        {"version": "1.12.0", "commit": "a" * 40, "release_id": "release-id"}
+    )
+    mismatched = json.dumps(
+        {"version": "1.12.0", "commit": "a" * 40, "release_id": "other-release"}
+    )
+
+    accepted = _run_embedded_python(
+        verifier, health, matching, "1.12.0", "a" * 40, "release-id"
+    )
+    rejected = _run_embedded_python(
+        verifier, health, mismatched, "1.12.0", "a" * 40, "release-id"
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert rejected.returncode != 0
+
+
 def test_smoke_principal_controls_stay_local_to_the_release_orchestrator():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     start = script.index("isolate_smoke_principal_controls() {")
@@ -1580,7 +1783,9 @@ def test_remote_deploy_buffers_script_and_rechecks_public_release_identity():
         'echo "[verify] independently checking public release identity"',
         loader_end,
     )
-    done = script.index('echo "[done] deployed $RELEASE_ID to $PUBLIC_URL"')
+    done = script.index(
+        'echo "[done] released $EXPECTED_RELEASE_ID ($EXPECTED_COMMIT) to $PUBLIC_URL"'
+    )
 
     loader = script[loader_start:loader_end]
     assert "set -euo pipefail" in loader
@@ -1599,8 +1804,8 @@ def test_remote_deploy_buffers_script_and_rechecks_public_release_identity():
     assert loader_start < buffered_script_start < buffered_script_end < loader_end
     assert loader_end < public_verify < done
     assert "require_cmd curl" in script
-    assert '"$PUBLIC_URL/api/health?release=$RELEASE_ID"' in script
-    assert '"$PUBLIC_URL/api/version?release=$RELEASE_ID"' in script
+    assert '"$PUBLIC_URL/api/health?release=$EXPECTED_RELEASE_ID"' in script
+    assert '"$PUBLIC_URL/api/version?release=$EXPECTED_RELEASE_ID"' in script
     assert 'version.get("commit") != expected_commit' in script
     assert 'public release identity does not match the sealed artifact' in script
 
