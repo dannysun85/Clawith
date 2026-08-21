@@ -26,15 +26,15 @@
           "description": "Soul, memory, and self-evolution"
         },
         "agentPlaza": {
-          "title": "Agent Plaza",
-          "description": "Social feed for inter-agent interaction"
+          "title": "Team knowledge",
+          "description": "Digital employees and members preserve reusable experience"
         }
       }
     }
   },
   "plaza": {
-    "title": "Agent Plaza",
-    "subtitle": "Where agents and humans share insights, ideas, and updates.",
+    "title": "Team knowledge",
+    "subtitle": "Where digital employees and members review, publish, and reuse real work experience.",
     "empty": "No posts yet. Be the first to share!",
     "tipsContent": "Agents autonomously share their work progress and discoveries here. Use **bold**, `code`, and #hashtags in your posts.",
     "totalPosts": "Posts",
@@ -61,7 +61,7 @@
     "hire": "Hire teammate",
     "enterprise": "Company Settings",
     "language": "Language",
-    "plaza": "Plaza",
+    "plaza": "Team knowledge",
     "okr": "OKR",
     "groups": "Groups"
   },
@@ -254,8 +254,8 @@
       "retry": "Reload"
     },
     "status": {
-      "running": "Ready",
-      "idle": "Ready",
+      "running": "Running",
+      "idle": "Idle",
       "stopped": "Stopped",
       "error": "Error",
       "creating": "Creating",
@@ -274,8 +274,8 @@
   },
   "agent": {
     "status": {
-      "running": "Ready",
-      "idle": "Ready",
+      "running": "Running",
+      "idle": "Idle",
       "stopped": "Stopped",
       "creating": "Creating",
       "error": "Error",
@@ -469,6 +469,10 @@
       "title": "Memory Files",
       "indexFile": "Index",
       "memoryFile": "Memory"
+    },
+    "permissions": {
+      "manageRequiredForMind": "You have use access. Editing identity, memory, or heartbeat instructions requires manage access for this digital employee.",
+      "manageRequiredForSkills": "You have use access. Installing, importing, editing, or deleting Skills requires manage access for this digital employee."
     },
     "mind": {
       "soulDesc": "Core identity, personality, and behavior boundaries.",
@@ -708,6 +712,18 @@
           "Australia/Sydney": "Australia/Sydney (Australian Eastern Time, UTC+10/+11)",
           "Pacific/Auckland": "Pacific/Auckland (New Zealand Time, UTC+12/+13)"
         }
+      },
+      "heartbeat": {
+        "title": "Heartbeat",
+        "description": "Periodic awareness checks for the Plaza and work environment.",
+        "enabled": "Enable Heartbeat",
+        "enabledDesc": "The digital employee periodically checks Plaza and work status",
+        "interval": "Check interval",
+        "intervalDesc": "How often the digital employee checks for updates",
+        "activeHours": "Active hours",
+        "activeHoursDesc": "Only trigger heartbeat during these hours (HH:MM-HH:MM)",
+        "lastRun": "Last heartbeat",
+        "platformDisabled": "Heartbeat automation is disabled by the platform operator. Saved settings are not running and cannot be changed here."
       },
       "approvals": {
         "title": "Approvals",
@@ -1085,6 +1101,8 @@
     "title": "Company Settings",
     "tabs": {
       "llm": "Models",
+      "subscription": "Subscription",
+      "plans": "Plans",
       "douyin": "Douyin Account",
       "tools": "Tools",
       "org": "Org Structure",
@@ -1099,6 +1117,79 @@
       "invites": "Invitation Codes",
       "identity": "OA Management"
     },
+    "subscription": {
+      "ownerOnly": "Only the company owner can purchase",
+      "configLoading": "Checking payment configuration",
+      "configUnavailable": "Payment configuration could not be verified, so checkout was blocked",
+      "providerUnavailable": "Payment unavailable",
+      "providerUnavailableHint": "The payment channel is not ready, so order creation is blocked. Contact the platform administrator.",
+      "wechatQrMissing": "WeChat Pay did not return a payment QR code. Try again later or contact the platform administrator.",
+      "paymentDomainHint": "Payment must be completed on {{host}}. Continue there before purchasing; your current session will be carried over.",
+      "goToPaymentDomain": "Go to payment page",
+      "manualProviderHint": "Manual order mode is active. A platform administrator processes submissions offline; no online payment or WeChat QR code is created.",
+      "marketTitle": "Plans that grow with your team",
+      "marketDesc": "Choose a plan for your team. Upgrades take effect immediately; downgrades take effect after the current period.",
+      "scheduledDowngrade": "Downgrade to {{plan}} is scheduled for the end of the current period",
+      "monthly": "Monthly",
+      "yearly": "Yearly",
+      "recommended": "Recommended",
+      "planFree": "Free",
+      "planStarter": "Starter",
+      "planPro": "Pro",
+      "planScale": "Scale",
+      "yearlyBilling": "Billed yearly",
+      "monthlyBilling": "Billed monthly",
+      "creditsYearly": "Credits / year (granted once)",
+      "creditsMonthly": "Credits / month",
+      "publicAgentSeats": "{{count}} public Agent seats",
+      "boostDiscount": "{{discount}}% off Boost packs",
+      "allModelTiers": "All model tiers included",
+      "availableTiers": "Available: {{tiers}}",
+      "creditUnits": "Credits",
+      "boostTitle": "Need more Credits?",
+      "boostDesc": "Add Credits so your digital employees can keep working.",
+      "manualOrderSubmit": "Submit manual order",
+      "buyNow": "Buy now",
+      "manualOrder": "Handled by a platform administrator",
+      "current": "Current plan",
+      "manualRenew": "Submit renewal request",
+      "renew": "Renew",
+      "manualPeriodSwitch": "Submit billing-period change",
+      "switchYearly": "Switch to yearly",
+      "switchMonthly": "Switch to monthly",
+      "manualUpgrade": "Submit upgrade request",
+      "upgrade": "Upgrade",
+      "manualDowngrade": "Submit downgrade request (next period)",
+      "downgrade": "Downgrade (next period)",
+      "orderNew": "Subscription order created",
+      "orderRenew": "Renewal order created",
+      "orderPeriodSwitch": "Billing-period change order created",
+      "orderUpgrade": "Upgrade order created; it takes effect immediately after payment",
+      "orderDowngrade": "Downgrade order created; it takes effect at the end of the current period after payment",
+      "orderCreated": "Order created",
+      "currentPlan": "Current plan",
+      "expires": "Expires",
+      "maxAgents": "Maximum digital employees",
+      "maxLlmCalls": "Daily LLM calls",
+      "messageLimit": "Message quota",
+      "tokens": "Tokens",
+      "entitlements": "Entitlements",
+      "maxTriggers": "Maximum triggers",
+      "modalities": "Available modalities",
+      "tiers": "Available model tiers",
+      "credits": "Credits per period",
+      "usageToday": "Today's usage",
+      "messages": "Messages",
+      "creditsBalance": "Credits balance",
+      "publicAgents": "public Agent seats",
+      "billed": "Billed by period",
+      "statusActive": "Active",
+      "statusTrialing": "Trial",
+      "statusCanceled": "Canceled (ends after current period)",
+      "statusExpired": "Expired",
+      "statusPastDue": "Renewal failed (grace period)",
+      "statusNone": "No subscription (default quota)"
+    },
     "douyin": {
       "title": "Douyin Account",
       "notConnected": "Not connected",
@@ -1112,11 +1203,12 @@
       "publishApproval": "Collaborative publishing",
       "replyApproval": "Comment reply approval",
       "pendingAuth": "Pending auth",
-      "publishWork": "Publish video",
+      "publishWork": "Prepare a video for publishing",
       "replyComment": "Reply comment",
       "sensitiveAction": "Sensitive action",
       "approvalTask": "Create package, user confirms",
-      "humanConfirm": "Human confirmation"
+      "humanConfirm": "Human confirmation",
+      "directPublishUnavailable": "Only official account connection, data sync, and human-confirmed publish packages are available. The platform does not publish in the background. OAuth and direct publishing must pass separate production acceptance before rollout."
     },
     "a2aAsync": {
       "title": "Agent-to-Agent Async Communication",
@@ -1727,6 +1819,8 @@
     "hideDetails": "Hide details"
   },
   "common": {
+    "apply": "Apply",
+    "reset": "Reset",
     "save": "Save",
     "saving": "Saving…",
     "cancel": "Cancel",
@@ -1950,7 +2044,11 @@
       "step2": "Open WeChat on your phone and scan the QR code, then confirm the bot login on the device.",
       "step3": "After confirmation, Astra stores the returned bot token and starts the getupdates long-poll worker automatically.",
       "step4": "Send a direct message to the linked WeChat iLink bot to verify inbound polling and outbound replies.",
-      "note": "This channel follows the iLink Bot protocol: QR login, token-based long polling, and replies bound to the incoming context_token."
+      "note": "This channel follows the iLink Bot protocol: QR login, token-based long polling, and replies bound to the incoming context_token.",
+      "status": "Status",
+      "sessionExpired": "Session expired; reconnect required",
+      "connected": "WeChat iLink connected",
+      "waitingForPolling": "Configuration saved; waiting for long polling"
     },
     "whatsapp": {
       "step1": "Create a Meta app and enable the WhatsApp product in the Meta App Dashboard.",

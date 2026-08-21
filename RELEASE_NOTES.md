@@ -1,30 +1,50 @@
-# v1.12.0 — Governed CEO Coordination and Production Readiness
+# v1.12.0 — Product Truth, Runtime Safety, and Release Readiness
 
-## CEO coordination and workforce visibility
+## Customer-visible availability contract
 
-- CEO orchestration keeps observer, human-initiated coordinator, and autonomous
-  coordinator modes behind separate tenant and rollout gates. Delegation uses
-  current Directory capability evidence and the existing durable A2A runtime;
-  it does not grant the CEO or target employee any new Tool authority.
+- This release strengthens the subscription lifecycle, digital-employee
+  topology, tenant recovery, payment readiness, and release controls already
+  exposed by the product. A capability is customer-visible only when both its
+  platform rollout gate and tenant policy are enabled.
+- CEO orchestration, creative v2 pipelines, Code/AgentBay execution, Heartbeat,
+  automatic OKR collection, legacy schedules, Douyin direct publishing, and
+  managed three-reviewer creative quality gates remain dormant or disabled in
+  the default v1.12.0 production contract. Packaged code and database schema do
+  not make any of them a released customer feature.
 - The digital-employee topology projects authoritative live execution from
   Agent Runs, Work tasks, deliverables, and media jobs. It keeps company-visible
   redacted execution, viewer-owned work, and governed analytics as three
   explicit scopes, and refreshes while the employee page is open.
+
+## Dormant CEO control plane
+
+- CEO orchestration keeps observer, human-initiated coordinator, and autonomous
+  coordinator modes behind separate platform, tenant, and rollout gates.
+  Delegation uses current Directory capability evidence and the durable A2A
+  runtime; it does not grant the CEO or target employee any new Tool authority.
 - CEO status remains member-safe while complete settings, member selection,
   budgets, coordination, and auto-dispatch controls require a company governor.
+  With the production gate off, this control plane is operator-only and must not
+  be presented as an available employee workflow.
 
 ## Tenant recovery and control-plane safety
 
-- Company governors can request a tenant-scoped, secret-free legacy CEO
-  migration preview. It classifies formal, absent, clean legacy, contaminated
-  legacy, and ambiguous states without changing data or copying message,
-  Memory, trigger, Tool, or credential content.
+- Company governors can request a tenant-scoped, secret-free legacy CEO migration
+  preview through the governed API and its read-only Company Settings panel. The
+  preview classifies formal, absent, clean legacy, contaminated legacy,
+  and ambiguous states without changing data or copying message, Memory,
+  trigger, Tool, or credential content.
 - Agent `soul.md`, Memory, and Skill control-plane files now require manage
   authority for mutation, revision restore, and related locking operations.
   Workspace paths are canonicalized before both authorization and storage so
   aliases such as `workspace/../memory.md` cannot bypass those controls.
 - Long Memory context keeps a bounded beginning and latest tail, making recent
   approved corrections visible without silently importing prior chat history.
+- Browser authentication bootstrap now distinguishes invalid credentials from
+  a timeout, network outage, or upstream 5xx. Transient outages preserve the
+  confirmed session and current route, show an explicit retry surface, and
+  recover without forcing the employee to sign in again; 401/403 responses
+  still revoke the local session.
 
 ## Payment readiness
 
@@ -39,17 +59,37 @@
   verification remain separate release gates. This version bump does not by
   itself enable WeChat Pay or create a real order.
 
+## Billing recovery and manual-order governance
+
+- Paid subscription effects now use a durable receipt with a bounded lease,
+  attempt fencing, and replay-safe completion. A duplicate paid webhook or the
+  reconciliation worker can finish missing tenant plan/employee-limit effects
+  without issuing a second Credits grant.
+- Manual orders have an evidence-backed operator decision receipt with tenant
+  fencing, hashed idempotency keys, expected-state checks, and a constrained
+  rollback of the latest cancellation. This path cannot finalize a
+  provider-backed order and does not infer payment from an email, screenshot,
+  or stale local state.
+- Provider close failures stay observable as retry/operator-review state rather
+  than being rewritten as locally canceled. Unknown Provider outcomes retain
+  their evidence and do not release or settle Credits speculatively.
+
 ## Creative deliverables
 
-- Poster, video, and presentation v2 flows add structured brief approvals,
-  resumable stages, candidate QA, and clearer preflight/degraded states while
-  preserving the existing canary-off rollout boundary.
+- Poster, video, and presentation v1 remain the customer-facing production
+  contract. Their release gate is structure validation plus creator approval.
+- v2 code packages structured briefs, resumable stages, candidate QA, and
+  clearer preflight/degraded states, but all v2 canaries remain off. The optional
+  managed three-reviewer quality gate also remains off and is not a v1.12.0
+  customer promise.
 
 ## Operations
 
-- Includes Alembic migrations up to `backfill_deliv_audit_tenant`, which
-  expands persisted creative-brief version identifiers for presentation v2
-  and restores tenant scope on historical Deliverable audit events.
+- Includes one linear Alembic head, `manual_order_decisions`. The final two
+  revisions add durable paid-effect receipts/provider-close state and
+  evidence-backed manual-order operator decisions after
+  `backfill_deliv_audit_tenant`; both are included in the isolated PostgreSQL
+  fresh/history/downgrade/re-upgrade release gate.
 - Registration-code business-flow smoke now follows the governed platform
   registration-credential contract and its structured error responses.
 - The production release must use an immutable reviewed commit and separately

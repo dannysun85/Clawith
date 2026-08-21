@@ -32,6 +32,7 @@ from app.services.agent_template_contract import (
 )
 from app.services.builtin_tool_definitions import (
     BUILTIN_TOOL_NAMES,
+    builtin_model_definition,
     builtin_policy,
 )
 from app.services.ceo_briefing import (
@@ -97,6 +98,29 @@ def test_ceo_rollout_defaults_closed() -> None:
     assert s.CEO_BRIEF_SNAPSHOT_MAX_CHARS == 4000
 
 
+def test_ceo_rollout_allowlists_accept_only_exact_uuids() -> None:
+    tenant_id = uuid.uuid4()
+    wildcard = _settings(
+        CEO_ORCHESTRATOR_ENABLED=True,
+        CEO_ORCHESTRATOR_TENANT_IDS="*",
+        CEO_ORCHESTRATOR_AGENT_IDS="all",
+    )
+    assert not ceo_orchestrator_allowed(
+        tenant_id=tenant_id,
+        agent_id=uuid.uuid4(),
+        runtime_settings=wildcard,
+    )
+
+    canonical = _settings(
+        CEO_ORCHESTRATOR_ENABLED=True,
+        CEO_ORCHESTRATOR_TENANT_IDS=str(tenant_id).upper(),
+    )
+    assert ceo_orchestrator_allowed(
+        tenant_id=tenant_id,
+        runtime_settings=canonical,
+    )
+
+
 # ─── Trigger triple gate (FR-CEO-3) ──────────────────────────────────
 
 
@@ -107,6 +131,7 @@ def _settings_row(**overrides: object) -> SimpleNamespace:
         "enabled": True,
         "briefing_enabled": True,
         "morning_meeting_enabled": True,
+        "meeting_group_id": None,
         "enabled_by_user_id": None,
         "daily_credit_cap": 20,
         "monthly_credit_cap": 300,
@@ -164,7 +189,75 @@ async def test_ceo_status_read_exposes_only_member_safe_fields(
         "configured": True,
         "ceo_agent_id": str(row.ceo_agent_id),
         "enabled": True,
+        "can_read_brief": False,
+        "can_start_meeting": False,
+        "can_manage": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_ceo_status_projects_governor_and_enabler_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    enabler_id = uuid.uuid4()
+    member = SimpleNamespace(id=uuid.uuid4())
+    row = _settings_row(
+        tenant_id=tenant_id,
+        enabled_by_user_id=enabler_id,
+        meeting_member_agent_ids=[member.id],
+    )
+    monkeypatch.setattr(ceo_api, "get_ceo_settings", AsyncMock(return_value=row))
+    monkeypatch.setattr(ceo_api, "ceo_orchestrator_allowed", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        ceo_api,
+        "get_validated_ceo_meeting_members",
+        AsyncMock(return_value=[member]),
+    )
+
+    enabler = await ceo_api.get_ceo_orchestrator_status(
+        current_user=SimpleNamespace(id=enabler_id, tenant_id=tenant_id, role="member"),
+        db=SimpleNamespace(),
+    )
+    governor = await ceo_api.get_ceo_orchestrator_status(
+        current_user=SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id, role="org_admin"),
+        db=SimpleNamespace(),
+    )
+
+    assert enabler.can_read_brief is True
+    assert enabler.can_start_meeting is True
+    assert enabler.can_manage is False
+    assert governor.can_read_brief is True
+    assert governor.can_start_meeting is True
+    assert governor.can_manage is True
+
+
+@pytest.mark.asyncio
+async def test_ceo_status_hides_meeting_action_for_observer_only_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    enabler_id = uuid.uuid4()
+    row = _settings_row(
+        tenant_id=tenant_id,
+        enabled_by_user_id=enabler_id,
+        morning_meeting_enabled=False,
+        meeting_member_agent_ids=[],
+    )
+    monkeypatch.setattr(ceo_api, "get_ceo_settings", AsyncMock(return_value=row))
+    monkeypatch.setattr(ceo_api, "ceo_orchestrator_allowed", lambda **_kwargs: True)
+
+    status_out = await ceo_api.get_ceo_orchestrator_status(
+        current_user=SimpleNamespace(
+            id=enabler_id,
+            tenant_id=tenant_id,
+            role="member",
+        ),
+        db=SimpleNamespace(),
+    )
+
+    assert status_out.can_read_brief is True
+    assert status_out.can_start_meeting is False
 
 
 def test_ceo_coordination_gate_and_operating_mode_truth_table() -> None:
@@ -230,6 +323,24 @@ async def test_update_ceo_coordination_requires_canary_and_disabling_clears_auto
     assert row.auto_dispatch_enabled is False
 
 
+@pytest.mark.asyncio
+async def test_update_rejects_enabling_meeting_without_members() -> None:
+    row = _settings_row(
+        morning_meeting_enabled=False,
+        meeting_member_agent_ids=[],
+    )
+
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as exc:
+        await ceo_orchestrator.update_ceo_settings(
+            SimpleNamespace(),
+            settings=row,
+            actor=SimpleNamespace(id=uuid.uuid4()),
+            morning_meeting_enabled=True,
+        )
+
+    assert exc.value.code == "ceo_meeting_members_required"
+
+
 def test_trigger_triple_gate_truth_table(monkeypatch: pytest.MonkeyPatch) -> None:
     allowed = {"value": True}
     monkeypatch.setattr(
@@ -238,7 +349,8 @@ def test_trigger_triple_gate_truth_table(monkeypatch: pytest.MonkeyPatch) -> Non
         lambda **_: allowed["value"],
     )
 
-    row = _settings_row()
+    member_id = uuid.uuid4()
+    row = _settings_row(meeting_member_agent_ids=[member_id])
     assert ceo_orchestrator._trigger_gate_enabled(row, cadence="briefing") is True
     assert ceo_orchestrator._trigger_gate_enabled(row, cadence="meeting") is True
 
@@ -252,7 +364,10 @@ def test_trigger_triple_gate_truth_table(monkeypatch: pytest.MonkeyPatch) -> Non
     assert ceo_orchestrator._trigger_gate_enabled(disabled, cadence="briefing") is False
 
     # Gate 3: cadence switches
-    no_briefing = _settings_row(briefing_enabled=False)
+    no_briefing = _settings_row(
+        briefing_enabled=False,
+        meeting_member_agent_ids=[member_id],
+    )
     assert ceo_orchestrator._trigger_gate_enabled(no_briefing, cadence="briefing") is False
     assert ceo_orchestrator._trigger_gate_enabled(no_briefing, cadence="meeting") is True
     no_meeting = _settings_row(morning_meeting_enabled=False)
@@ -275,6 +390,13 @@ def test_ceo_trigger_names_never_collide_with_okr_names() -> None:
         "ceo_weekly_brief",
     }
     assert "ceo_morning_meeting" in ceo_orchestrator.CEO_SYSTEM_TRIGGER_NAMES
+    assert "ceo_weekly_meeting" in ceo_orchestrator.CEO_SYSTEM_TRIGGER_NAMES
+    meeting_specs = {
+        spec["name"]: spec for spec in ceo_orchestrator._CEO_TRIGGER_SPECS
+        if spec["name"] in {"ceo_morning_meeting", "ceo_weekly_meeting"}
+    }
+    assert meeting_specs["ceo_morning_meeting"].get("scheduled", True) is True
+    assert meeting_specs["ceo_weekly_meeting"]["scheduled"] is False
 
 
 @pytest.mark.asyncio
@@ -440,6 +562,154 @@ class _QueueSession:
         self.committed += 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_member", [False, True])
+async def test_trigger_sync_keeps_meeting_automation_disabled_without_active_members(
+    monkeypatch: pytest.MonkeyPatch,
+    stale_member: bool,
+) -> None:
+    member_ids = [uuid.uuid4()] if stale_member else []
+    settings = _settings_row(meeting_member_agent_ids=member_ids)
+    triggers = [
+        SimpleNamespace(
+            name=spec["name"],
+            config={},
+            reason="old",
+            is_enabled=True,
+            focus_ref=None,
+        )
+        for spec in ceo_orchestrator._CEO_TRIGGER_SPECS
+    ]
+    results = []
+    if stale_member:
+        results.append(_FakeResult(scalar=None))
+    results.append(_FakeResult(items=triggers))
+    db = _QueueSession(results)
+    monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: True)
+    monkeypatch.setattr(
+        ceo_orchestrator,
+        "ensure_focus_item",
+        AsyncMock(return_value=uuid.uuid4()),
+    )
+
+    await ceo_orchestrator._sync_ceo_triggers(db, settings)
+
+    by_name = {trigger.name: trigger for trigger in triggers}
+    assert by_name[ceo_orchestrator.CEO_MORNING_MEETING_TRIGGER].is_enabled is False
+    assert by_name[ceo_orchestrator.CEO_WEEKLY_MEETING_TRIGGER].is_enabled is False
+    assert by_name[ceo_orchestrator.CEO_DAILY_BRIEF_TRIGGER].is_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_enabling_meeting_with_stale_persisted_member() -> None:
+    stale_member_id = uuid.uuid4()
+    row = _settings_row(
+        morning_meeting_enabled=False,
+        meeting_member_agent_ids=[str(stale_member_id)],
+    )
+    db = _QueueSession([_FakeResult(scalar=None)])
+
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as exc:
+        await ceo_orchestrator.update_ceo_settings(
+            db,
+            settings=row,
+            actor=SimpleNamespace(id=uuid.uuid4()),
+            morning_meeting_enabled=True,
+        )
+
+    assert exc.value.code == "ceo_meeting_member_invalid"
+
+
+@pytest.mark.asyncio
+async def test_update_allows_disabling_meeting_with_malformed_legacy_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _settings_row(
+        morning_meeting_enabled=True,
+        meeting_member_agent_ids=["not-a-uuid"],
+    )
+    db = SimpleNamespace(flush=AsyncMock())
+    sync = AsyncMock()
+    monkeypatch.setattr(ceo_orchestrator, "_sync_ceo_triggers", sync)
+
+    await ceo_orchestrator.update_ceo_settings(
+        db,
+        settings=row,
+        actor=SimpleNamespace(id=uuid.uuid4()),
+        morning_meeting_enabled=False,
+    )
+
+    assert row.morning_meeting_enabled is False
+    sync.assert_awaited_once_with(db, row)
+
+
+@pytest.mark.asyncio
+async def test_gate_ceo_meeting_trigger_disables_fire_for_stale_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        is_system=True,
+        name=ceo_orchestrator.CEO_MORNING_MEETING_TRIGGER,
+        is_enabled=True,
+    )
+    settings = _settings_row(
+        ceo_agent_id=trigger.agent_id,
+        meeting_member_agent_ids=[uuid.uuid4()],
+    )
+    stored = SimpleNamespace(
+        id=trigger.id,
+        is_enabled=True,
+        last_fired_at=None,
+    )
+    db = _QueueSession(
+        [
+            _FakeResult(scalar=settings),
+            _FakeResult(scalar=None),
+            _FakeResult(scalar=stored),
+        ]
+    )
+    monkeypatch.setattr(ceo_orchestrator, "async_session", lambda: db)
+    monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: True)
+
+    skipped = await ceo_orchestrator.gate_ceo_trigger_automation(trigger, now)
+
+    assert skipped is True
+    assert stored.is_enabled is False
+    assert stored.last_fired_at == now
+    assert db.committed == 1
+    assert any(
+        isinstance(row, ceo_orchestrator.AuditLog)
+        and row.action == "ceo_automation_membership_blocked"
+        for row in db.added
+    )
+
+
+@pytest.mark.asyncio
+async def test_observer_ceo_model_schema_exposes_consult_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings_row()
+    db = _QueueSession([_FakeResult(scalar=settings)])
+    monkeypatch.setattr(agent_tools, "async_session", lambda: db)
+    monkeypatch.setattr(
+        ceo_briefing,
+        "ceo_operating_mode",
+        lambda _settings: "observer",
+    )
+
+    projected = await agent_tools._apply_ceo_a2a_schema_contract(
+        settings.ceo_agent_id,
+        [builtin_model_definition("send_message_to_agent")],
+    )
+    function = projected[0]["function"]
+    assert function["parameters"]["properties"]["msg_type"]["enum"] == ["consult"]
+    assert "delegation_contract" not in function["parameters"]["properties"]
+    assert "prefer task_delegate" not in function["description"]
+
+
 def _consume_rows(amounts: list[int]) -> _FakeResult:
     return _FakeResult(
         items=[SimpleNamespace(delta=-abs(amount)) for amount in amounts]
@@ -521,14 +791,87 @@ async def test_meeting_start_fail_closed_when_rollout_closed(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_observer_only_ceo_cannot_start_manual_meeting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ceo_orchestrator,
+        "ceo_orchestrator_allowed",
+        lambda **_: True,
+    )
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as excinfo:
+        await ceo_orchestrator.start_ceo_meeting(
+            _QueueSession(),
+            settings=_settings_row(
+                morning_meeting_enabled=False,
+                meeting_member_agent_ids=[],
+            ),
+            actor=SimpleNamespace(id=uuid.uuid4()),
+            kind="morning",
+        )
+    assert excinfo.value.code == "ceo_meeting_not_enabled"
+
+
+@pytest.mark.asyncio
+async def test_manual_meeting_requires_an_active_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ceo_orchestrator,
+        "ceo_orchestrator_allowed",
+        lambda **_: True,
+    )
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as excinfo:
+        await ceo_orchestrator.start_ceo_meeting(
+            _QueueSession(),
+            settings=_settings_row(
+                morning_meeting_enabled=True,
+                meeting_member_agent_ids=[],
+            ),
+            actor=SimpleNamespace(id=uuid.uuid4()),
+            kind="weekly",
+        )
+    assert excinfo.value.code == "ceo_meeting_members_required"
+
+
+@pytest.mark.asyncio
+async def test_existing_ceo_meeting_room_is_repaired_to_neutral_name() -> None:
+    settings = _settings_row(meeting_group_id=uuid.uuid4())
+    group = SimpleNamespace(
+        id=settings.meeting_group_id,
+        tenant_id=settings.tenant_id,
+        deleted_at=None,
+        name="CEO 晨会",
+        description="legacy",
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=group))
+
+    group_id = await ceo_orchestrator._ensure_meeting_group(
+        db,
+        settings=settings,
+        actor=SimpleNamespace(id=uuid.uuid4()),
+    )
+
+    assert group_id == settings.meeting_group_id
+    assert group.name == "CEO 会议室"
+    assert "governed" in group.description
+
+
+@pytest.mark.asyncio
 async def test_meeting_start_budget_block_persists_notify_and_audit_outside_request_tx(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Budget-blocked meeting start: the API layer turns the error into an
     HTTPException and the request transaction rolls back, so the notification
     and audit rows must be written (and committed) in an independent session."""
-    settings = _settings_row()
+    member = SimpleNamespace(id=uuid.uuid4())
+    settings = _settings_row(meeting_member_agent_ids=[member.id])
     monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: True)
+    monkeypatch.setattr(
+        ceo_orchestrator,
+        "get_validated_ceo_meeting_members",
+        AsyncMock(return_value=[member]),
+    )
 
     async def _deny(db, *, settings, **kwargs):  # noqa: ARG001
         return "daily cap reached"
@@ -613,6 +956,43 @@ async def test_enable_fail_closed_when_template_missing(monkeypatch: pytest.Monk
             member_agent_ids=[],
         )
     assert excinfo.value.code == "ceo_template_missing"
+
+
+@pytest.mark.asyncio
+async def test_enable_requires_cadence_or_explicit_observer_only_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: True)
+    db = _QueueSession([_FakeResult(scalar=SimpleNamespace())])
+
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as excinfo:
+        await ceo_orchestrator.enable_ceo_orchestrator(
+            db,
+            tenant=SimpleNamespace(id=uuid.uuid4()),
+            admin=SimpleNamespace(id=uuid.uuid4()),
+            member_agent_ids=[],
+        )
+
+    assert excinfo.value.code == "ceo_enable_intent_required"
+
+
+@pytest.mark.asyncio
+async def test_enable_meeting_cadence_requires_at_least_one_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ceo_orchestrator, "ceo_orchestrator_allowed", lambda **_: True)
+    db = _QueueSession([_FakeResult(scalar=SimpleNamespace())])
+
+    with pytest.raises(ceo_orchestrator.CeoOrchestratorError) as excinfo:
+        await ceo_orchestrator.enable_ceo_orchestrator(
+            db,
+            tenant=SimpleNamespace(id=uuid.uuid4()),
+            admin=SimpleNamespace(id=uuid.uuid4()),
+            member_agent_ids=[],
+            morning_meeting_enabled=True,
+        )
+
+    assert excinfo.value.code == "ceo_meeting_members_required"
 
 
 # ─── Typed adapter fail-closed (FR-CEO-2) ────────────────────────────
@@ -740,7 +1120,8 @@ def test_ceo_template_manifest_passes_strict_validation() -> None:
     manifest = load_agent_template_manifest(_TEMPLATE_ROOT / "ceo")
     assert manifest.schema_version == 2
     assert manifest.role_key == "ceo"
-    assert manifest.lifecycle_status == "enabled"
+    assert manifest.lifecycle_status == "not_recruitable"
+    assert manifest.activation_gate == "ceo_orchestrator_governor_enable_only"
     assert "company_brief_snapshot" in manifest.default_tools
     assert manifest.default_skills == ["meeting-notes"]
 

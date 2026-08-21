@@ -5,12 +5,16 @@ import test from 'node:test';
 const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const layout = readFileSync(new URL('../src/pages/Layout.tsx', import.meta.url), 'utf8');
 const productAccess = readFileSync(new URL('../src/utils/productAccess.ts', import.meta.url), 'utf8');
+const saasAdminAccess = readFileSync(new URL('../src/utils/saasAdmin.ts', import.meta.url), 'utf8');
 const api = readFileSync(new URL('../src/services/api.ts', import.meta.url), 'utf8');
 const companyAdmin = readFileSync(new URL('../src/pages/CompanyAdmin.tsx', import.meta.url), 'utf8');
 const companyAccess = readFileSync(new URL('../src/pages/CompanyAccess.tsx', import.meta.url), 'utf8');
 const accountCompanies = readFileSync(new URL('../src/pages/AccountCompanies.tsx', import.meta.url), 'utf8');
 const platformOperations = readFileSync(new URL('../src/pages/PlatformOperations.tsx', import.meta.url), 'utf8');
 const platformSystemEmail = readFileSync(new URL('../src/pages/PlatformSystemEmail.tsx', import.meta.url), 'utf8');
+const productConsoleShell = readFileSync(new URL('../src/components/ProductConsoleShell.tsx', import.meta.url), 'utf8');
+const productConsoleCss = readFileSync(new URL('../src/pages/productConsole.css', import.meta.url), 'utf8');
+const indexCss = readFileSync(new URL('../src/index.css', import.meta.url), 'utf8');
 const employees = readFileSync(new URL('../src/pages/Employees.tsx', import.meta.url), 'utf8');
 const onboarding = readFileSync(new URL('../src/pages/Onboarding.tsx', import.meta.url), 'utf8');
 const work = readFileSync(new URL('../src/pages/Work.tsx', import.meta.url), 'utf8');
@@ -52,6 +56,18 @@ test('navigation names communicate distinct product responsibilities', () => {
   assert.match(layout, /to="\/company-admin"/);
   assert.doesNotMatch(layout, /'协作角色'|'发现中心'|'企业设置'/);
   assert.doesNotMatch(layout, /sortedAgents\.map/);
+  assert.match(layout, /aria-label=\{isChinese \? '打开账户菜单' : 'Open account menu'\}/);
+  assert.match(layout, /onClick=\{\(\) => setShowLanguageSubmenu\(true\)\}/);
+  assert.match(layout, /langMenuTriggerRef/);
+  assert.match(layout, /window\.innerWidth - menuWidth - viewportPadding/);
+  assert.match(indexCss, /\.account-lang-submenu-portal[\s\S]*?z-index: 10050/);
+});
+
+test('platform SaaS authority follows the server-issued global role and capability', () => {
+  assert.match(saasAdminAccess, /global_roles\?\.includes\('platform_operator'\)/);
+  assert.match(saasAdminAccess, /effective_capabilities\?\.includes\('platform\.billing\.manage'\)/);
+  assert.doesNotMatch(saasAdminAccess, /SAAS_ADMIN_EMAIL|VITE_SAAS_ADMIN_EMAIL|admin@reeftotem\.ai/);
+  assert.match(platformOperations, /hasEffectiveCapability\(user, 'platform\.billing\.manage'\)/);
 });
 
 test('assistant navigation keeps one stable relationship and hides compatibility history by default', () => {
@@ -174,6 +190,12 @@ test('platform operations use an independent shell and separated registration gr
     platformOperations,
     /to: '\/employees'|to="\/employees"|to: '\/groups'|to="\/groups"|to: '\/assistant'|to="\/assistant"/,
   );
+});
+
+test('product governance consoles keep security and logout reachable on mobile', () => {
+  assert.match(productConsoleShell, /product-console__mobile-account/);
+  assert.match(productConsoleShell, /aria-label="移动端账号操作"/);
+  assert.match(productConsoleCss, /\.product-console__mobile-account \{ display: flex; \}/);
 });
 
 test('platform system email remains reachable, secret-safe, and testable', () => {

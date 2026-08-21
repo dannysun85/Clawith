@@ -1076,13 +1076,13 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                                 )}
                                 {ch.id === 'wechat' && (
                                     <div style={{ background: 'var(--bg-secondary)', borderRadius: '6px', padding: '10px', fontSize: '12px', marginBottom: '12px' }}>
-                                        <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>Status</div>
+                                        <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{t('channelGuide.wechat.status', 'Status')}</div>
                                         <div style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
                                             {config.extra_config?.session_expired
-                                                ? 'Session expired, reconnect required'
+                                                ? t('channelGuide.wechat.sessionExpired', 'Session expired; reconnect required')
                                                 : config.is_connected
-                                                    ? 'WeChat iLink connected'
-                                                    : 'Configured, waiting for long polling'}
+                                                    ? t('channelGuide.wechat.connected', 'WeChat iLink connected')
+                                                    : t('channelGuide.wechat.waitingForPolling', 'Configuration saved; waiting for long polling')}
                                         </div>
                                         {config.app_id && <div style={{ color: 'var(--text-tertiary)', marginTop: '4px', fontSize: '11px' }}>Bot ID: <code>{config.app_id}</code></div>}
                                         {config.extra_config?.ilink_user_id && <div style={{ color: 'var(--text-tertiary)', marginTop: '4px', fontSize: '11px' }}>Linked User: <code>{config.extra_config.ilink_user_id}</code></div>}

@@ -408,6 +408,8 @@ class OKRSettingsOut(BaseModel):
     period_frequency_locked: bool = False
     # OKR Agent UUID for the chat-link button in the UI
     okr_agent_id: str | None = None
+    automation_available: bool
+    automation_unavailable_reason: str | None = None
 
 
 class OKRSettingsUpdate(BaseModel):
@@ -419,6 +421,37 @@ class OKRSettingsUpdate(BaseModel):
     weekly_report_day: int | None = None
     period_frequency: str | None = None
     period_length_days: int | None = None
+
+
+def _okr_automation_projection() -> dict[str, bool | str | None]:
+    available = bool(runtime_settings.OKR_AUTOMATION_ENABLED)
+    return {
+        "automation_available": available,
+        "automation_unavailable_reason": (
+            None if available else "platform_automation_disabled"
+        ),
+    }
+
+
+def _validate_okr_automation_update(
+    body: OKRSettingsUpdate,
+    persisted: OKRSettings,
+) -> None:
+    """Reject new automatic collection intent while preserving legacy cleanup."""
+
+    if (
+        body.daily_report_enabled is True
+        and not runtime_settings.OKR_AUTOMATION_ENABLED
+        and not persisted.daily_report_enabled
+    ):
+        raise HTTPException(
+            409,
+            {
+                "code": "okr_automation_unavailable",
+                "message": "OKR automation is disabled by the platform operator",
+                "capability": "okr_automation",
+            },
+        )
 
 
 class KeyResultOut(BaseModel):
@@ -881,6 +914,7 @@ async def get_okr_settings(user=Depends(get_current_user)):
             period_length_days=settings.period_length_days,
             period_frequency_locked=settings.first_enabled_at is not None,
             okr_agent_id=okr_agent_id_str,
+            **_okr_automation_projection(),
         )
 
 
@@ -896,6 +930,7 @@ async def update_okr_settings(
     async with async_session() as db:
         settings = await _get_or_create_settings(db, user.tenant_id)
         period_is_locked = settings.first_enabled_at is not None
+        _validate_okr_automation_update(body, settings)
 
         if period_is_locked:
             if body.period_frequency is not None and body.period_frequency != settings.period_frequency:
@@ -961,6 +996,7 @@ async def update_okr_settings(
             period_length_days=settings.period_length_days,
             period_frequency_locked=settings.first_enabled_at is not None,
             okr_agent_id=okr_agent_id_str,
+            **_okr_automation_projection(),
         )
 
 

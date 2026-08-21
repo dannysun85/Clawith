@@ -124,6 +124,41 @@ async def test_disabled_template_id_cannot_bypass_recruitment_gate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ceo_template_cannot_be_created_through_standard_recruitment() -> None:
+    template = _template(lifecycle_status="not_recruitable")
+    template.name = "CEO"
+    template.role_key = "ceo"
+    template.activation_gate = "ceo_orchestrator_governor_enable_only"
+    session = _Session([template])
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        role="org_owner",
+        identity=None,
+        quota_agent_ttl_hours=24,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agents_api.create_agent(
+            AgentCreate(
+                name="CEO",
+                template_id=template.id,
+                permission_scope_type="company",
+            ),
+            BackgroundTasks(),
+            current_user=user,
+            db=session,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "code": "agent_template_not_recruitable",
+        "lifecycle_status": "not_recruitable",
+        "activation_gate": "ceo_orchestrator_governor_enable_only",
+    }
+
+
+@pytest.mark.asyncio
 async def test_platform_catalog_exposes_decisions_without_enabling_roles() -> None:
     response = await workforce_api.get_workforce_catalog(
         decision="merge_or_reject",

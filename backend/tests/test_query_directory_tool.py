@@ -245,6 +245,10 @@ def test_directory_capability_summary_is_safe_and_honest_about_preflight():
 
     local = agent_directory._safe_capability_summary(local_tool)
     configured = agent_directory._safe_capability_summary(configured_tool)
+    exact = agent_directory._safe_capability_summary(
+        configured_tool,
+        include_exact_names=True,
+    )
 
     assert local["availability"] == "available"
     assert local["readiness"] == "local"
@@ -252,6 +256,36 @@ def test_directory_capability_summary_is_safe_and_honest_about_preflight():
     assert configured["readiness"] == "email_configuration"
     assert "config" not in local and "parameters_schema" not in local
     assert "config" not in configured and "parameters_schema" not in configured
+    assert "name" not in local and "display_name" not in local
+    assert "name" not in configured and "display_name" not in configured
+    assert exact["name"] == "send_email"
+    assert exact["display_name"] == "Send Email"
+
+
+@pytest.mark.asyncio
+async def test_capability_projection_grants_exact_names_only_to_coordinator_ceo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_agent(is_system=True)
+    settings = SimpleNamespace()
+    db = RecordingDB([DummyResult(scalar_value=settings)])
+    monkeypatch.setattr(
+        "app.services.ceo_briefing.ceo_operating_mode",
+        lambda _settings: "coordinator",
+    )
+
+    assert await agent_directory._resolve_capability_projection(
+        db,
+        source=source,
+        requested="auto",
+    ) == "exact"
+
+    ordinary = _make_agent(is_system=False)
+    assert await agent_directory._resolve_capability_projection(
+        RecordingDB(),
+        source=ordinary,
+        requested="auto",
+    ) == "safe"
 
 
 def test_format_roster_agent_marks_stopped_agent_uncontactable():

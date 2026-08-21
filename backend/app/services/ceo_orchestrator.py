@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import async_session
 from app.models.agent import Agent, AgentPermission, AgentTemplate
 from app.models.ceo import CeoOrchestratorSettings
+from app.models.group import Group
 from app.models.audit import AuditLog, ChatMessage
 from app.models.org import AgentAgentRelationship
 from app.models.subscription import CreditTransaction
@@ -58,6 +59,7 @@ CEO_DAILY_BRIEF_TRIGGER = "ceo_daily_brief"
 CEO_DAILY_COLLECTION_TRIGGER = "ceo_daily_collection"
 CEO_WEEKLY_BRIEF_TRIGGER = "ceo_weekly_brief"
 CEO_MORNING_MEETING_TRIGGER = "ceo_morning_meeting"
+CEO_WEEKLY_MEETING_TRIGGER = "ceo_weekly_meeting"
 
 CEO_BRIEFING_TRIGGER_NAMES = frozenset(
     {
@@ -70,6 +72,7 @@ CEO_SYSTEM_TRIGGER_NAMES = frozenset(
     {
         *CEO_BRIEFING_TRIGGER_NAMES,
         CEO_MORNING_MEETING_TRIGGER,
+        CEO_WEEKLY_MEETING_TRIGGER,
     }
 )
 
@@ -123,6 +126,23 @@ _CEO_TRIGGER_SPECS = (
             "send_message_to_agent（msg_type=consult）定向询问一次进展（等待回复，不重复发送）；"
             "3. 汇总后用 write_file 把纪要写入 workspace 的 meeting-minutes/YYYY-MM-DD.md，"
             "纪要中的行动项仅以文本“建议行动项”呈现；4. 最终回复是会议汇总。"
+            "禁止创建任务、禁止修改任何人的 Focus 或 OKR、禁止外发消息。"
+        ),
+    },
+    {
+        "name": CEO_WEEKLY_MEETING_TRIGGER,
+        "expr": "0 9 * * 1",
+        "cadence": "meeting",
+        # Weekly meetings are a distinct manual run today.  Keeping a disabled
+        # system trigger gives them their own durable identity without adding a
+        # second Monday automation beside the weekday morning meeting.
+        "scheduled": False,
+        "reason": (
+            "系统触发器：主持手动周会（单轮定向询问 + 汇总）。执行要求："
+            "1. 调用 company_brief_snapshot 获取最近 7 天业务全景；2. 对会议成员中的每位员工用 "
+            "send_message_to_agent（msg_type=consult）定向询问一次本周进展（等待回复，不重复发送）；"
+            "3. 汇总后用 write_file 把纪要写入 workspace 的 meeting-minutes/YYYY-Www.md，"
+            "纪要中的行动项仅以文本“建议行动项”呈现；4. 最终回复是周会汇总。"
             "禁止创建任务、禁止修改任何人的 Focus 或 OKR、禁止外发消息。"
         ),
     },
@@ -225,6 +245,40 @@ async def _validate_member_agents(
             )
         members.append(member)
     return members
+
+
+def _parse_ceo_meeting_member_ids(raw_ids: list[object] | None) -> list[uuid.UUID]:
+    """Normalize persisted/API meeting members or fail closed on bad data."""
+    member_ids: list[uuid.UUID] = []
+    for raw_id in raw_ids or []:
+        try:
+            member_ids.append(uuid.UUID(str(raw_id)))
+        except (TypeError, ValueError) as exc:
+            raise CeoOrchestratorError(
+                "ceo_meeting_member_invalid",
+                "CEO meeting membership contains an invalid employee identifier",
+            ) from exc
+    return list(dict.fromkeys(member_ids))
+
+
+async def get_validated_ceo_meeting_members(
+    db: AsyncSession,
+    *,
+    settings: CeoOrchestratorSettings,
+) -> list[Agent]:
+    """Resolve the persisted meeting roster to active tenant employees.
+
+    Settings are validated when written, but an employee can later be deleted
+    or legacy data can contain a malformed identifier.  Manual meetings must
+    fail closed against that current state instead of creating a CEO-only room.
+    """
+
+    member_ids = _parse_ceo_meeting_member_ids(settings.meeting_member_agent_ids)
+    return await _validate_member_agents(
+        db,
+        tenant_id=settings.tenant_id,
+        member_agent_ids=member_ids,
+    )
 
 
 async def _ensure_company_use_permission(db: AsyncSession, agent_id: uuid.UUID) -> None:
@@ -367,6 +421,20 @@ async def _sync_ceo_triggers(db: AsyncSession, settings: CeoOrchestratorSettings
             "_origin_source_channel": "platform",
         }
 
+    meeting_members_ready = False
+    if _trigger_gate_enabled(settings, cadence="meeting"):
+        try:
+            meeting_members_ready = bool(
+                await get_validated_ceo_meeting_members(db, settings=settings)
+            )
+        except CeoOrchestratorError as exc:
+            logger.warning(
+                "[CEO] meeting trigger kept disabled tenant={} agent={} reason={}",
+                settings.tenant_id,
+                settings.ceo_agent_id,
+                exc.code,
+            )
+
     result = await db.execute(
         select(AgentTrigger).where(
             AgentTrigger.agent_id == settings.ceo_agent_id,
@@ -381,7 +449,12 @@ async def _sync_ceo_triggers(db: AsyncSession, settings: CeoOrchestratorSettings
             "attach_brief_snapshot": True,
             **delivery_config,
         }
-        is_enabled = _trigger_gate_enabled(settings, cadence=spec["cadence"])
+        is_enabled = bool(spec.get("scheduled", True)) and _trigger_gate_enabled(
+            settings,
+            cadence=spec["cadence"],
+        )
+        if spec["cadence"] == "meeting":
+            is_enabled = is_enabled and meeting_members_ready
         trigger = existing.get(spec["name"])
         if trigger is None:
             db.add(
@@ -412,6 +485,7 @@ async def enable_ceo_orchestrator(
     member_agent_ids: list[uuid.UUID],
     briefing_enabled: bool = False,
     morning_meeting_enabled: bool = False,
+    observer_only_confirmed: bool = False,
     daily_credit_cap: int = DEFAULT_DAILY_CREDIT_CAP,
     monthly_credit_cap: int = DEFAULT_MONTHLY_CREDIT_CAP,
 ) -> CeoOrchestratorSettings:
@@ -430,6 +504,16 @@ async def enable_ceo_orchestrator(
         raise CeoOrchestratorError(
             "ceo_template_missing",
             "The builtin 'ceo' Agent template is not seeded yet; restart the backend first",
+        )
+    if not briefing_enabled and not morning_meeting_enabled and not observer_only_confirmed:
+        raise CeoOrchestratorError(
+            "ceo_enable_intent_required",
+            "Select at least one CEO cadence or explicitly confirm observer-only enablement",
+        )
+    if morning_meeting_enabled and not member_agent_ids:
+        raise CeoOrchestratorError(
+            "ceo_meeting_members_required",
+            "Select at least one active digital employee before enabling the meeting cadence",
         )
     members = await _validate_member_agents(
         db,
@@ -533,6 +617,33 @@ async def update_ceo_settings(
     max_parallel_delegations: int | None = None,
 ) -> CeoOrchestratorSettings:
     """Patch CEO settings while preserving the independent P2 authority gate."""
+    projected_meeting_enabled = (
+        bool(settings.morning_meeting_enabled)
+        if morning_meeting_enabled is None
+        else bool(morning_meeting_enabled)
+    )
+    meeting_configuration_changed = (
+        morning_meeting_enabled is not None or member_agent_ids is not None
+    )
+    projected_member_ids: list[uuid.UUID] | None = None
+    if member_agent_ids is not None:
+        projected_member_ids = _parse_ceo_meeting_member_ids(list(member_agent_ids))
+    elif projected_meeting_enabled and meeting_configuration_changed:
+        projected_member_ids = _parse_ceo_meeting_member_ids(
+            list(settings.meeting_member_agent_ids or [])
+        )
+    validated_members: list[Agent] | None = None
+    if projected_meeting_enabled and meeting_configuration_changed:
+        if not projected_member_ids:
+            raise CeoOrchestratorError(
+                "ceo_meeting_members_required",
+                "Select at least one active digital employee before enabling the meeting cadence",
+            )
+        validated_members = await _validate_member_agents(
+            db,
+            tenant_id=settings.tenant_id,
+            member_agent_ids=projected_member_ids,
+        )
     if briefing_enabled is not None:
         settings.briefing_enabled = bool(briefing_enabled)
     if morning_meeting_enabled is not None:
@@ -581,11 +692,14 @@ async def update_ceo_settings(
             )
         settings.auto_dispatch_enabled = bool(auto_dispatch_enabled)
     if member_agent_ids is not None:
-        members = await _validate_member_agents(
-            db,
-            tenant_id=settings.tenant_id,
-            member_agent_ids=member_agent_ids,
-        )
+        member_ids_to_validate = projected_member_ids or []
+        members = validated_members
+        if members is None:
+            members = await _validate_member_agents(
+                db,
+                tenant_id=settings.tenant_id,
+                member_agent_ids=member_ids_to_validate,
+            )
         settings.meeting_member_agent_ids = [str(member.id) for member in members]
         await _sync_ceo_relationships(
             db,
@@ -723,6 +837,29 @@ def _audit_ceo_automation_blocked(
     )
 
 
+def _audit_ceo_meeting_membership_blocked(
+    db: AsyncSession,
+    *,
+    settings: CeoOrchestratorSettings,
+    reason: str,
+    trigger: AgentTrigger,
+) -> None:
+    db.add(
+        AuditLog(
+            tenant_id=settings.tenant_id,
+            user_id=settings.enabled_by_user_id,
+            action="ceo_automation_membership_blocked",
+            details={
+                "tenant_id": str(settings.tenant_id),
+                "ceo_agent_id": str(settings.ceo_agent_id),
+                "trigger_id": str(trigger.id),
+                "trigger_name": trigger.name,
+                "reason": reason,
+            },
+        )
+    )
+
+
 async def gate_ceo_trigger_automation(trigger: AgentTrigger, now: datetime) -> bool:
     """Budget/opt-in gate for CEO system triggers inside the daemon tick.
 
@@ -753,6 +890,44 @@ async def gate_ceo_trigger_automation(trigger: AgentTrigger, now: datetime) -> b
                 stored.is_enabled = False
                 await db.commit()
             return True
+        if trigger.name in {
+            CEO_MORNING_MEETING_TRIGGER,
+            CEO_WEEKLY_MEETING_TRIGGER,
+        }:
+            meeting_denial: str | None = None
+            if not settings.morning_meeting_enabled:
+                meeting_denial = "ceo_meeting_not_enabled"
+            else:
+                try:
+                    members = await get_validated_ceo_meeting_members(
+                        db,
+                        settings=settings,
+                    )
+                    if not members:
+                        meeting_denial = "ceo_meeting_members_required"
+                except CeoOrchestratorError as exc:
+                    meeting_denial = exc.code
+            if meeting_denial is not None:
+                trigger_result = await db.execute(
+                    select(AgentTrigger).where(AgentTrigger.id == trigger.id)
+                )
+                stored = trigger_result.scalar_one_or_none()
+                if stored is not None:
+                    stored.is_enabled = False
+                    stored.last_fired_at = now
+                _audit_ceo_meeting_membership_blocked(
+                    db,
+                    settings=settings,
+                    reason=meeting_denial,
+                    trigger=trigger,
+                )
+                await db.commit()
+                logger.warning(
+                    "[CEO] meeting automation fire blocked trigger={} reason={}",
+                    trigger.id,
+                    meeting_denial,
+                )
+                return True
         denial = await automation_budget_denial(db, settings=settings, now=now)
         if denial is None:
             return False
@@ -781,10 +956,22 @@ async def _ensure_meeting_group(
     *,
     settings: CeoOrchestratorSettings,
     actor: User,
+    member_agents: list[Agent] | None = None,
 ) -> uuid.UUID:
     """Lazily create the meeting Group on first use (never at enable time)."""
     if settings.meeting_group_id is not None:
-        return settings.meeting_group_id
+        existing = await db.get(Group, settings.meeting_group_id)
+        if (
+            existing is not None
+            and existing.tenant_id == settings.tenant_id
+            and existing.deleted_at is None
+        ):
+            # Repair the legacy morning-only label because this one room is
+            # shared by both morning and weekly meetings.
+            existing.name = "CEO 会议室"
+            existing.description = "CEO orchestrator meeting room: governed summaries and minutes."
+            return settings.meeting_group_id
+        settings.meeting_group_id = None
 
     creator = await get_or_create_user_participant(
         db,
@@ -802,14 +989,12 @@ async def _ensure_meeting_group(
             ceo_agent.avatar_url,
         )
         member_participant_ids.append(ceo_participant.id)
-    for raw_id in settings.meeting_member_agent_ids or []:
-        try:
-            member_id = uuid.UUID(str(raw_id))
-        except (TypeError, ValueError):
-            continue
-        member = await db.get(Agent, member_id)
-        if member is None or member.deleted_at is not None:
-            continue
+    if member_agents is None:
+        member_agents = await get_validated_ceo_meeting_members(
+            db,
+            settings=settings,
+        )
+    for member in member_agents:
         participant = await get_or_create_agent_participant(
             db,
             member.id,
@@ -822,8 +1007,8 @@ async def _ensure_meeting_group(
         db,
         tenant_id=settings.tenant_id,
         creator_participant_id=creator.id,
-        name="CEO 晨会",
-        description="CEO orchestrator meeting room (P1 observer): minutes and summaries.",
+        name="CEO 会议室",
+        description="CEO orchestrator meeting room: governed summaries and minutes.",
         member_participant_ids=member_participant_ids,
     )
     settings.meeting_group_id = group.id
@@ -866,6 +1051,20 @@ async def start_ceo_meeting(
             "ceo_orchestrator_not_available",
             "CEO orchestrator rollout gate is closed for this company",
         )
+    if not settings.morning_meeting_enabled:
+        raise CeoOrchestratorError(
+            "ceo_meeting_not_enabled",
+            "Enable the CEO meeting cadence before starting a meeting",
+        )
+    meeting_members = await get_validated_ceo_meeting_members(
+        db,
+        settings=settings,
+    )
+    if not meeting_members:
+        raise CeoOrchestratorError(
+            "ceo_meeting_members_required",
+            "Select at least one active digital employee before starting a meeting",
+        )
     denial = await automation_budget_denial(db, settings=settings)
     if denial is not None:
         # The API layer converts the error below into HTTPException and the
@@ -889,12 +1088,22 @@ async def start_ceo_meeting(
             f"CEO automation budget cap reached ({denial}); the meeting was not started",
         )
 
-    group_id = await _ensure_meeting_group(db, settings=settings, actor=actor)
+    group_id = await _ensure_meeting_group(
+        db,
+        settings=settings,
+        actor=actor,
+        member_agents=meeting_members,
+    )
 
+    trigger_name = (
+        CEO_MORNING_MEETING_TRIGGER
+        if kind == "morning"
+        else CEO_WEEKLY_MEETING_TRIGGER
+    )
     trigger_result = await db.execute(
         select(AgentTrigger).where(
             AgentTrigger.agent_id == settings.ceo_agent_id,
-            AgentTrigger.name == CEO_MORNING_MEETING_TRIGGER,
+            AgentTrigger.name == trigger_name,
         )
     )
     trigger = trigger_result.scalar_one_or_none()
@@ -956,6 +1165,7 @@ __all__ = [
     "CEO_MEETING_KINDS",
     "CEO_MEETING_MEMBER_LIMIT",
     "CEO_MORNING_MEETING_TRIGGER",
+    "CEO_WEEKLY_MEETING_TRIGGER",
     "CEO_SYSTEM_TRIGGER_NAMES",
     "CEO_TEMPLATE_ROLE_KEY",
     "CeoOrchestratorError",
@@ -966,6 +1176,7 @@ __all__ = [
     "enable_ceo_orchestrator",
     "gate_ceo_trigger_automation",
     "get_ceo_settings",
+    "get_validated_ceo_meeting_members",
     "get_enabled_ceo_settings_for_agent",
     "is_enabled_ceo_agent",
     "start_ceo_meeting",

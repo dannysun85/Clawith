@@ -73,22 +73,13 @@ interface PaymentOrder {
     change_kind?: string | null;
 }
 
-const STATUS_LABEL: Record<string, string> = {
-    active: '生效中',
-    trialing: '试用中',
-    canceled: '已取消(周期末失效)',
-    expired: '已过期',
-    past_due: '续费失败(宽限中)',
-    none: '无订阅(使用默认配额)',
-};
-
-const planDisplayName = (plan: Plan) => {
+const planDisplayName = (plan: Plan, t: (key: string, fallback: string) => string) => {
     const mapped: Record<string, string> = {
-        free: '免费版',
-        starter: '入门版',
-        pro: '专业版',
-        scale: '规模版',
-        enterprise: '规模版',
+        free: t('enterprise.subscription.planFree', '免费版'),
+        starter: t('enterprise.subscription.planStarter', '入门版'),
+        pro: t('enterprise.subscription.planPro', '专业版'),
+        scale: t('enterprise.subscription.planScale', '规模版'),
+        enterprise: t('enterprise.subscription.planScale', '规模版'),
     };
     return String(plan.features?.display_name || mapped[plan.code] || plan.name);
 };
@@ -115,11 +106,10 @@ const planPrice = (plan: Plan, period: 'monthly' | 'yearly') => {
     };
 };
 
-const boostDiscountLine = (plan: Plan) => {
+const boostDiscountPercent = (plan: Plan) => {
     const explicit = featureNumber(plan.features, 'boost_discount_percent', 0);
     const byCode: Record<string, number> = { pro: 10, scale: 20, enterprise: 20 };
-    const discount = explicit || byCode[plan.code] || 0;
-    return discount > 0 ? `加餐包 ${discount}% off` : null;
+    return explicit || byCode[plan.code] || 0;
 };
 
 const formatUnitPrice = (currency: string, priceCents: number, credits: number, usdCnyRate: number) => {
@@ -284,6 +274,14 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     });
 
     const status = ent?.subscription_status || 'none';
+    const statusLabel: Record<string, string> = {
+        active: t('enterprise.subscription.statusActive', '生效中'),
+        trialing: t('enterprise.subscription.statusTrialing', '试用中'),
+        canceled: t('enterprise.subscription.statusCanceled', '已取消（周期末失效）'),
+        expired: t('enterprise.subscription.statusExpired', '已过期'),
+        past_due: t('enterprise.subscription.statusPastDue', '续费失败（宽限中）'),
+        none: t('enterprise.subscription.statusNone', '无订阅（使用默认配额）'),
+    };
     const planCode = ent?.plan_code || 'free';
     const sortedPlans = useMemo(() => [...plans].sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)), [plans]);
 
@@ -410,7 +408,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                     <div style={{ textAlign: 'center', marginBottom: 28 }}>
                         <h2 style={{ margin: '0 0 8px', fontSize: 24, fontWeight: 700 }}>{t('enterprise.subscription.marketTitle', '和你一起成长的套餐')}</h2>
                         <p style={{ margin: '0 0 22px', color: 'var(--text-tertiary)', fontSize: 13 }}>
-                            {t('enterprise.subscription.marketDesc', '选择适合团队的方案，随时可切换。')}
+                            {t('enterprise.subscription.marketDesc', '选择适合团队的方案；升级立即生效，降级在当前周期结束后生效。')}
                         </p>
                         {scheduledPlanCode && (
                             <p style={{ margin: '0 0 16px', color: 'var(--warning)', fontSize: 13 }}>
@@ -446,7 +444,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                             const action = planAction(plan);
                             const recommended = plan.features?.recommended === true || plan.code === 'pro';
                             const price = planPrice(plan, billingPeriod);
-                            const boostLine = boostDiscountLine(plan);
+                                    const boostDiscount = boostDiscountPercent(plan);
                             return (
                                 <div
                                     key={plan.id}
@@ -464,11 +462,11 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                 >
                                     {recommended && (
                                         <span style={{ position: 'absolute', right: 18, top: -10, background: 'var(--success)', color: '#fff', borderRadius: 4, padding: '3px 8px', fontSize: 11, fontWeight: 650 }}>
-                                            推荐
+                                            {t('enterprise.subscription.recommended', '推荐')}
                                         </span>
                                     )}
                                     <div>
-                                        <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 10 }}>{planDisplayName(plan)}</div>
+                                        <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 10 }}>{planDisplayName(plan, t)}</div>
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, minHeight: 42 }}>
                                             <span style={{ fontSize: 32, lineHeight: 1, fontWeight: 750 }}>{formatMoneyCny(plan.currency, price.current, cnyRate)}</span>
                                             <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>/ {billingPeriod === 'yearly' ? t('common.year', '年') : t('common.month', '月')}</span>
@@ -477,25 +475,27 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                             )}
                                         </div>
                                         <div style={{ color: plan.price_cents > 0 ? 'var(--success)' : 'var(--text-tertiary)', fontSize: 12, marginTop: 8 }}>
-                                            {plan.price_cents > 0
-                                                ? billingPeriod === 'yearly'
-                                                    ? '首年 · 按年计费'
-                                                    : '首月 · 按月计费'
-                                                : billingPeriod === 'yearly'
-                                                    ? '按年计费'
-                                                    : '按月计费'}
+                                            {billingPeriod === 'yearly'
+                                                ? t('enterprise.subscription.yearlyBilling', '每年计费')
+                                                : t('enterprise.subscription.monthlyBilling', '每月计费')}
                                         </div>
                                     </div>
 
                                     <div style={{ height: 1, background: 'var(--border-subtle)', margin: '8px 0 2px' }} />
                                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, flexWrap: 'nowrap' }}>
                                         <span style={{ fontSize: plan.credits_per_period >= 100_000 ? 26 : 28, fontWeight: 750 }}>{plan.credits_per_period.toLocaleString()}</span>
-                                        <span style={{ color: 'var(--text-tertiary)', fontSize: 11, whiteSpace: 'nowrap' }}>Credits / 月</span>
+                                        <span style={{ color: 'var(--text-tertiary)', fontSize: 11, whiteSpace: 'nowrap' }}>
+                                            {billingPeriod === 'yearly'
+                                                ? t('enterprise.subscription.creditsYearly', 'Credits / 年（一次发放）')
+                                                : t('enterprise.subscription.creditsMonthly', 'Credits / 月')}
+                                        </span>
                                     </div>
                                     <div style={{ display: 'grid', gap: 9, color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.4 }}>
-                                        <PlanBullet>{plan.max_agents} 个公开 Agent 坐席</PlanBullet>
-                                        {boostLine && <PlanBullet>{boostLine}</PlanBullet>}
-                                        <PlanBullet>{(plan.allowed_tiers?.length || 0) >= 3 || !plan.allowed_tiers?.length ? '解锁全部模型档位' : `可用 ${plan.allowed_tiers.join(', ')}`}</PlanBullet>
+                                        <PlanBullet>{t('enterprise.subscription.publicAgentSeats', '{{count}} 个公开 Agent 坐席').replace('{{count}}', String(plan.max_agents))}</PlanBullet>
+                                        {boostDiscount > 0 && <PlanBullet>{t('enterprise.subscription.boostDiscount', '加餐包 {{discount}}% 优惠').replace('{{discount}}', String(boostDiscount))}</PlanBullet>}
+                                        <PlanBullet>{(plan.allowed_tiers?.length || 0) >= 3 || !plan.allowed_tiers?.length
+                                            ? t('enterprise.subscription.allModelTiers', '解锁全部模型档位')
+                                            : t('enterprise.subscription.availableTiers', '可用 {{tiers}}').replace('{{tiers}}', plan.allowed_tiers.join(', '))}</PlanBullet>
                                     </div>
 
                                     <button
@@ -526,7 +526,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
                                     <span style={{ color: 'var(--text-tertiary)' }}>⚡</span>
                                     <span style={{ fontSize: 24, fontWeight: 750 }}>{pack.credits.toLocaleString()}</span>
-                                    <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>额度</span>
+                                    <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>{t('enterprise.subscription.creditUnits', '额度')}</span>
                                 </div>
                                 <div style={{ color: 'var(--text-secondary)', fontWeight: 700 }}>
                                     {formatMoneyCny(pack.currency, pack.price_cents, cnyRate)}
@@ -574,7 +574,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                         </div>
                         <h3 style={{ margin: '0 0 6px', textTransform: 'capitalize' }}>{planCode}</h3>
                         <p style={{ color: 'var(--text-secondary)', margin: 0, fontSize: 13 }}>
-                            {STATUS_LABEL[status] || status}
+                            {statusLabel[status] || status}
                             {ent?.period_end &&
                                 ` · ${t('enterprise.subscription.expires', '到期')}: ${new Date(ent.period_end).toLocaleDateString()}`}
                         </p>
@@ -654,7 +654,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                     <section style={{ textAlign: 'center', marginBottom: 24 }}>
                         <h2 style={{ margin: '0 0 6px', fontSize: 22 }}>{t('enterprise.subscription.marketTitle', '和你一起成长的套餐')}</h2>
                         <p style={{ margin: '0 0 18px', color: 'var(--text-tertiary)', fontSize: 13 }}>
-                            {t('enterprise.subscription.marketDesc', '选择适合团队的方案，随时可切换。')}
+                            {t('enterprise.subscription.marketDesc', '选择适合团队的方案；升级立即生效，降级在当前周期结束后生效。')}
                         </p>
                         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, borderBottom: '1px solid var(--border-subtle)' }}>
                             {(['monthly', 'yearly'] as const).map((period) => (
@@ -682,7 +682,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 16, marginBottom: 32 }}>
                         {sortedPlans.map((plan) => {
                             const action = planAction(plan);
-                            const displayPrice = billingPeriod === 'yearly' ? plan.price_cents * 10 : plan.price_cents;
+                            const displayPrice = planPrice(plan, billingPeriod).current;
                             return (
                                 <div key={plan.id} className="card" style={{ minHeight: 250, display: 'flex', flexDirection: 'column', gap: 12, borderColor: action.disabled && !action.primary ? 'var(--text-primary)' : undefined }}>
                                     <div>

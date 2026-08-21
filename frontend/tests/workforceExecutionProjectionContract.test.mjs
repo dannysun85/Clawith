@@ -19,7 +19,8 @@ test('employee topology keeps health separate from authoritative execution state
 });
 
 test('employee and dashboard projections recover after navigation, focus and reconnect', () => {
-  assert.match(employees, /refetchInterval: \(query\) => query\.state\.status === 'error' \? false : 5_000/);
+  assert.match(employees, /document\.visibilityState === 'hidden'/);
+  assert.match(employees, /: 15_000/);
   for (const source of [employees, dashboard]) {
     assert.match(source, /refetchIntervalInBackground: false/);
     assert.match(source, /refetchOnMount: 'always'/);
@@ -36,4 +37,6 @@ test('workforce topology declares and explains its three visibility scopes', () 
   assert.match(employees, /执行状态：公司可见，敏感详情按权限脱敏/);
   assert.match(employees, /当前工作：仅显示你拥有或可见的工作/);
   assert.match(employees, /关系与活动：仅管理员或受托管理范围/);
+  assert.match(employees, /scope === 'governance'/);
+  assert.match(employees, /node\.visibility !== 'private'/);
 });

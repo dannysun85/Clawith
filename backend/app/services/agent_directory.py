@@ -15,6 +15,7 @@ from app.models.user import User as UserModel
 from app.services.builtin_tool_definitions import builtin_policy, builtin_readiness
 
 DirectoryMemberType = Literal["all", "agent", "human"]
+CapabilityProjection = Literal["safe", "exact", "auto"]
 
 
 class DirectoryQueryError(ValueError):
@@ -100,6 +101,7 @@ def format_roster_agent(
     *,
     authorized_custom_target: bool = False,
     capabilities: list[dict] | None = None,
+    capability_projection: Literal["safe", "exact"] = "safe",
 ) -> dict | None:
     visibility = evaluate_roster_agent_visibility(
         source_agent,
@@ -114,7 +116,8 @@ def format_roster_agent(
         "display_name": target_agent.name,
         "role_description": target_agent.role_description or "",
         "capabilities": capabilities or [],
-        "capability_summary_version": 1,
+        "capability_summary_version": 2,
+        "capability_projection": capability_projection,
         "department": None,
         "skills": [],
         "access_mode": getattr(target_agent, "access_mode", None) or "company",
@@ -124,7 +127,11 @@ def format_roster_agent(
     }
 
 
-def _safe_capability_summary(tool: Tool) -> dict:
+def _safe_capability_summary(
+    tool: Tool,
+    *,
+    include_exact_names: bool = False,
+) -> dict:
     """Project one granted tool without leaking schemas, credentials, or config."""
     tool_type = str(getattr(tool, "type", None) or "builtin")
     if tool_type == "builtin":
@@ -134,9 +141,7 @@ def _safe_capability_summary(tool: Tool) -> dict:
         readiness = "mcp_runtime"
         policy = {"effect": "external_write"}
     available = readiness == "local"
-    return {
-        "name": tool.name,
-        "display_name": tool.display_name,
+    payload = {
         "category": tool.category,
         "type": tool_type,
         "effect": policy["effect"],
@@ -144,6 +149,14 @@ def _safe_capability_summary(tool: Tool) -> dict:
         "readiness": readiness,
         "reason": None if available else "runtime_preflight_required",
     }
+    if include_exact_names:
+        payload.update(
+            {
+                "name": tool.name,
+                "display_name": tool.display_name,
+            }
+        )
+    return payload
 
 
 async def _load_agent_capability_summaries(
@@ -151,6 +164,7 @@ async def _load_agent_capability_summaries(
     *,
     tenant_id: uuid.UUID | None,
     agent_ids: list[uuid.UUID],
+    projection: Literal["safe", "exact"] = "safe",
 ) -> dict[uuid.UUID, list[dict]]:
     """Batch-load enabled grants for the current Directory page.
 
@@ -172,9 +186,55 @@ async def _load_agent_capability_summaries(
         .order_by(AgentTool.agent_id.asc(), Tool.category.asc(), Tool.name.asc())
     )
     summaries: dict[uuid.UUID, list[dict]] = {agent_id: [] for agent_id in agent_ids}
+    seen_safe: dict[uuid.UUID, set[tuple[str, str, str, str]]] = {
+        agent_id: set() for agent_id in agent_ids
+    }
     for agent_id, tool in result.all():
-        summaries.setdefault(agent_id, []).append(_safe_capability_summary(tool))
+        summary = _safe_capability_summary(
+            tool,
+            include_exact_names=projection == "exact",
+        )
+        if projection == "safe":
+            identity = (
+                str(summary.get("category") or "other"),
+                str(summary.get("effect") or "read"),
+                str(summary.get("availability") or "requires_preflight"),
+                str(summary.get("readiness") or "runtime_preflight"),
+            )
+            if identity in seen_safe.setdefault(agent_id, set()):
+                continue
+            seen_safe[agent_id].add(identity)
+        summaries.setdefault(agent_id, []).append(summary)
     return summaries
+
+
+async def _resolve_capability_projection(
+    db: AsyncSession,
+    *,
+    source: AgentModel,
+    requested: CapabilityProjection,
+) -> Literal["safe", "exact"]:
+    """Grant exact tool names only to a governed coordinator CEO."""
+    if requested == "exact":
+        return "exact"
+    if requested != "auto" or not bool(getattr(source, "is_system", False)):
+        return "safe"
+
+    from app.models.ceo import CeoOrchestratorSettings
+    from app.services.ceo_briefing import ceo_operating_mode
+
+    result = await db.execute(
+        select(CeoOrchestratorSettings).where(
+            CeoOrchestratorSettings.tenant_id == source.tenant_id,
+            CeoOrchestratorSettings.ceo_agent_id == source.id,
+        )
+    )
+    settings = result.scalar_one_or_none()
+    return (
+        "exact"
+        if ceo_operating_mode(settings) in {"coordinator", "coordinator_auto"}
+        else "safe"
+    )
 
 
 def format_roster_human(
@@ -417,6 +477,7 @@ async def query_agent_directory(
     limit: int = 50,
     offset: int = 0,
     max_limit: int = 100,
+    capability_projection: CapabilityProjection = "safe",
 ) -> dict:
     query = (query or "").strip()
     member_type = _validate_member_type(member_type)
@@ -434,6 +495,12 @@ async def query_agent_directory(
     source = (await db.execute(select(AgentModel).where(AgentModel.id == source_agent_id))).scalar_one_or_none()
     if not source:
         raise DirectoryQueryError("source_agent_not_found", "Source agent was not found.", status_code=404)
+
+    resolved_capability_projection = await _resolve_capability_projection(
+        db,
+        source=source,
+        requested=capability_projection,
+    )
 
     source_mode = getattr(source, "access_mode", None) or "company"
 
@@ -505,6 +572,7 @@ async def query_agent_directory(
                 db,
                 tenant_id=source.tenant_id,
                 agent_ids=agent_ids,
+                projection=resolved_capability_projection,
             )
 
         humans_by_id: dict[uuid.UUID, tuple[OrgMember, IdentityProvider | None, OrgDepartment | None, UserModel | None]] = {}
@@ -528,6 +596,7 @@ async def query_agent_directory(
                     target_agent,
                     authorized_custom_target=(getattr(target_agent, "access_mode", None) == "custom"),
                     capabilities=capabilities_by_agent.get(target_agent.id, []),
+                    capability_projection=resolved_capability_projection,
                 )
             else:
                 human_row = humans_by_id.get(member_id)
@@ -579,6 +648,7 @@ async def query_agent_directory(
             db,
             tenant_id=source.tenant_id,
             agent_ids=[agent.id for agent in page_agents],
+            projection=resolved_capability_projection,
         )
         for target_agent in page_agents:
             payload = format_roster_agent(
@@ -586,6 +656,7 @@ async def query_agent_directory(
                 target_agent,
                 authorized_custom_target=(getattr(target_agent, "access_mode", None) == "custom"),
                 capabilities=capabilities_by_agent.get(target_agent.id, []),
+                capability_projection=resolved_capability_projection,
             )
             if payload and (include_uncontactable or payload["can_contact"]):
                 members.append(payload)

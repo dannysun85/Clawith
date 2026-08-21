@@ -531,12 +531,16 @@ class WeChatBillingProvider(BillingProvider):
         except ValueError as exc:
             raise ValueError("Invalid WeChat out_trade_no") from exc
         amount = payload.get("amount") if isinstance(payload.get("amount"), dict) else {}
+        status = self._order_status_from_trade_state(str(payload.get("trade_state") or ""))
+        if payload.get("_verified_refund_event") is True:
+            status = "refunded"
+        refund_amount = payload.get("_refund_amount_cents")
         return PaymentProviderEventState(
             provider=self.name,
             event_id=event_id,
             event_type=event_type,
             order_id=order_id,
-            status=self._order_status_from_trade_state(str(payload.get("trade_state") or "")),
+            status=status,
             provider_session_id=order_id.hex,
             provider_payment_id=payload.get("transaction_id"),
             amount_cents=amount.get("total"),
@@ -545,6 +549,11 @@ class WeChatBillingProvider(BillingProvider):
             app_id=payload.get("appid"),
             trade_type=payload.get("trade_type"),
             tenant_id=self._tenant_id_from_attach(payload.get("attach")),
+            refund_amount_cents=(
+                int(refund_amount)
+                if isinstance(refund_amount, int) and not isinstance(refund_amount, bool)
+                else None
+            ),
         )
 
     async def load_remote_event_state(self, event: dict):
@@ -562,15 +571,37 @@ class WeChatBillingProvider(BillingProvider):
             )
 
         state = decrypted
+        decrypted_amount = (
+            decrypted.get("amount")
+            if isinstance(decrypted.get("amount"), dict)
+            else {}
+        )
+        refund_amount = decrypted_amount.get("refund")
+        verified_refund_event = (
+            "REFUND" in str(event.get("type") or "").upper()
+            and str(decrypted.get("refund_status") or "").upper() == "SUCCESS"
+        )
         try:
             remote = await self._request(
                 "GET",
                 f"/v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={self.settings.WECHAT_PAY_MCHID}",
             )
             if remote:
-                state = {**remote, "out_trade_no": remote.get("out_trade_no") or out_trade_no}
+                state = {
+                    **remote,
+                    "out_trade_no": remote.get("out_trade_no") or out_trade_no,
+                    "_verified_refund_event": verified_refund_event,
+                    "_refund_amount_cents": refund_amount,
+                }
         except ValueError:
             pass  # fall back to the AEAD-authenticated webhook body
+
+        if state is decrypted:
+            state = {
+                **decrypted,
+                "_verified_refund_event": verified_refund_event,
+                "_refund_amount_cents": refund_amount,
+            }
 
         return self._state_from_payload(
             event_id=str(event.get("id")),

@@ -15,6 +15,26 @@ import pytest
 
 ROOT = Path(__file__).parents[2]
 NGINX_CONFIGURATOR = ROOT / "scripts/configure_production_nginx.py"
+PRODUCTION_CLOSED_FEATURE_FLAGS = {
+    "CEO_ORCHESTRATOR_ENABLED": "false",
+    "CEO_ORCHESTRATOR_TENANT_IDS": "",
+    "CEO_ORCHESTRATOR_AGENT_IDS": "",
+    "CEO_COORDINATION_ENABLED": "false",
+    "CEO_COORDINATION_TENANT_IDS": "",
+    "CEO_COORDINATION_AGENT_IDS": "",
+    "DELIVERABLE_POSTER_V2_ENABLED": "false",
+    "DELIVERABLE_POSTER_V2_TENANT_IDS": "",
+    "DELIVERABLE_POSTER_V2_AGENT_IDS": "",
+    "DELIVERABLE_VIDEO_V2_ENABLED": "false",
+    "DELIVERABLE_VIDEO_V2_TENANT_IDS": "",
+    "DELIVERABLE_VIDEO_V2_AGENT_IDS": "",
+    "DELIVERABLE_PRESENTATION_V2_ENABLED": "false",
+    "DELIVERABLE_PRESENTATION_V2_TENANT_IDS": "",
+    "DELIVERABLE_PRESENTATION_V2_AGENT_IDS": "",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED": "false",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS": "",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS": "",
+}
 
 
 def _load_nginx_configurator():
@@ -318,6 +338,206 @@ def test_polluted_parent_environment_cannot_activate_code_in_effective_compose()
         assert effective["SANDBOX_API_URL"] == ""
         assert effective["SANDBOX_ALLOW_NETWORK"] == "false"
         assert effective["SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING"] == "false"
+
+
+def test_production_closed_feature_contract_is_literal_and_release_bound():
+    compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
+        encoding="utf-8"
+    )
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for key, value in PRODUCTION_CLOSED_FEATURE_FLAGS.items():
+        assert compose.count(f'{key}: "{value}"') == 1, key
+        assert f"{key}: ${{" not in compose
+        assert f'"{key}": "{value}"' in script
+
+    verifier = script.index("inspect_candidate_closed_feature_contract() {")
+    candidate_healthy = script.index(
+        'test "$(docker inspect -f \'{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}\' "$CANDIDATE_BACKEND_ID")" = "healthy"'
+    )
+    candidate_verify = script.index(
+        'inspect_candidate_closed_feature_contract "$CANDIDATE_BACKEND_ID"',
+        candidate_healthy,
+    )
+    frontend_start = script.index(
+        'compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps frontend',
+        candidate_verify,
+    )
+    assert verifier < candidate_healthy < candidate_verify < frontend_start
+
+    governance_inventory = script.index(
+        "python -m app.scripts.inventory_production_governance",
+        candidate_verify,
+    )
+    assert candidate_verify < governance_inventory < frontend_start
+    assert "--fail-on-ledger-drift" in script[governance_inventory:frontend_start]
+    assert "production-governance-inventory.candidate.json" in script[
+        governance_inventory:frontend_start
+    ]
+    assert 'chmod 0600 "$BACKUP/production-governance-inventory.candidate.json"' in script
+
+    if shutil.which("docker") is None:
+        return
+    version = subprocess.run(
+        ["docker", "compose", "version"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    if version.returncode != 0:
+        return
+
+    env = {
+        **os.environ,
+        "POSTGRES_PASSWORD": "contract-test",
+        "SECRET_KEY": "contract-test-secret",
+        "JWT_SECRET_KEY": "contract-test-jwt",
+        "CORS_ORIGINS": "https://example.test",
+        "PUBLIC_BASE_URL": "https://example.test",
+        "ASTRA_ALERT_WORKER_ACTOR_ID": "00000000-0000-4000-8000-000000000001",
+        **{
+            key: ("true" if value == "false" else "polluted-parent-value")
+            for key, value in PRODUCTION_CLOSED_FEATURE_FLAGS.items()
+        },
+    }
+    rendered = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            "deploy/astra-poc/docker-compose.prod.yml",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    config = json.loads(rendered.stdout)
+    for service_name in ("backend", "worker"):
+        effective = config["services"][service_name]["environment"]
+        assert {
+            key: effective[key] for key in PRODUCTION_CLOSED_FEATURE_FLAGS
+        } == PRODUCTION_CLOSED_FEATURE_FLAGS
+
+
+def test_candidate_closed_feature_verifier_rejects_runtime_drift():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+    function = _shell_function_source(
+        script,
+        "inspect_candidate_closed_feature_contract",
+        "inspect_rollback_worker_runtime_identity",
+    )
+    harness = f"""
+set -euo pipefail
+docker() {{
+    [ "$1" = inspect ]
+    printf '%s\\n' "$DOCKER_ENV_OUTPUT"
+}}
+{function}
+inspect_candidate_closed_feature_contract candidate-backend
+"""
+    closed_output = "\n".join(
+        f"{key}={value}" for key, value in PRODUCTION_CLOSED_FEATURE_FLAGS.items()
+    )
+    passed = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=ROOT,
+        env={**os.environ, "DOCKER_ENV_OUTPUT": closed_output},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert passed.returncode == 0, passed.stderr
+    assert "candidate_closed_feature_contract=ok" in passed.stdout
+
+    drifted_output = closed_output.replace(
+        "CEO_COORDINATION_ENABLED=false",
+        "CEO_COORDINATION_ENABLED=true",
+    )
+    rejected = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=ROOT,
+        env={**os.environ, "DOCKER_ENV_OUTPUT": drifted_output},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "candidate closed-feature contract drifted" in rejected.stderr
+
+
+def test_release_env_preserves_live_data_plane_identity_and_rejects_drift(
+    tmp_path: Path,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+    marker = 'python3 - "$PREVIOUS/.env" "$RELEASE/.env" <<\'PY\'\n'
+    source_start = script.index(marker) + len(marker)
+    source_end = script.index("\nPY\n", source_start)
+    continuity_source = script[source_start:source_end]
+
+    assert '"POSTGRES_VOLUME": f' not in script
+    assert '"REDIS_VOLUME": f' not in script
+    assert '"AGENT_DATA_VOLUME": f' not in script
+    assert "data-plane identity continuity verified" in continuity_source
+    assert "separate authorized data-plane change" in continuity_source
+
+    previous = tmp_path / "previous.env"
+    candidate = tmp_path / "candidate.env"
+    live_env = "\n".join(
+        (
+            'SECRET_KEY="envelope-secret"',
+            'DOCKER_NETWORK="astra_network"',
+            'POSTGRES_VOLUME="astra-poc_pgdata_restored"',
+            'REDIS_VOLUME="astra-poc_redisdata"',
+            'AGENT_DATA_VOLUME="astra-poc_agentdata"',
+            'POSTGRES_USER="astra"',
+            'POSTGRES_DB="astra"',
+            'POSTGRES_PASSWORD="database-secret"',
+            "",
+        )
+    )
+    previous.write_text(live_env, encoding="utf-8")
+    candidate.write_text(live_env, encoding="utf-8")
+
+    preserved = subprocess.run(
+        [sys.executable, "-", str(previous), str(candidate)],
+        input=continuity_source,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert preserved.returncode == 0, preserved.stderr
+    assert "SECRET_KEY continuity verified" in preserved.stdout
+    assert "data-plane identity continuity verified" in preserved.stdout
+
+    candidate.write_text(
+        live_env.replace("astra-poc_pgdata_restored", "astra-poc_pgdata"),
+        encoding="utf-8",
+    )
+    rejected = subprocess.run(
+        [sys.executable, "-", str(previous), str(candidate)],
+        input=continuity_source,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "data-plane identity continuity check failed: POSTGRES_VOLUME" in rejected.stderr
 
 
 def test_production_release_gate_covers_code_execution_security():
@@ -5190,6 +5410,45 @@ def test_data_plane_dns_preflight_accepts_unique_shared_postgres(tmp_path):
     assert calls
     assert all(call[0] in {"network", "ps", "inspect", "exec"} for call in calls)
     assert not any(call[0] in {"start", "stop", "rm", "kill", "compose"} for call in calls)
+
+
+def test_data_plane_dns_preflight_ignores_other_products_on_other_networks(tmp_path):
+    spec = _healthy_data_plane_spec()
+    spec["containers"]["id-quant-postgres"] = _data_plane_container(
+        "id-quant-postgres",
+        "quantagent-postgres-1",
+        project="quantagent",
+        service="postgres",
+        ip="172.19.0.2",
+        aliases=["postgres", "quantagent-postgres-1"],
+        network="quantagent_default",
+        network_id="quant-netid",
+    )
+    spec["containers"]["id-quant-redis"] = _data_plane_container(
+        "id-quant-redis",
+        "quantagent-redis-1",
+        project="quantagent",
+        service="redis",
+        ip="172.19.0.3",
+        aliases=["redis", "quantagent-redis-1"],
+        network="quantagent_default",
+        network_id="quant-netid",
+    )
+    spec["ps"]["label=com.docker.compose.service=postgres"].append(
+        "id-quant-postgres"
+    )
+    spec["ps"]["label=com.docker.compose.service=redis"].append("id-quant-redis")
+
+    result = _run_data_plane_checker(
+        tmp_path,
+        spec,
+        "--network",
+        "astra_network",
+        "--compose-project",
+        "astra-poc",
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

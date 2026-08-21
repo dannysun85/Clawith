@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -373,6 +374,47 @@ class GrantCreditsIn(BaseModel):
     reason: str
     confirm: bool = False
     audit_reason: str | None = None
+
+
+class ManualOrderDecisionIn(BaseModel):
+    """Exact, evidence-backed disposition for one manual payment order."""
+
+    expected_tenant_id: uuid.UUID
+    expected_status: Literal["pending", "canceled"]
+    disposition: Literal[
+        "keep_pending",
+        "mark_paid",
+        "cancel_expired",
+        "cancel_test",
+        "cancel_invalid",
+        "restore_pending",
+    ]
+    evidence_ref: str = Field(min_length=8, max_length=500)
+    reason: str = Field(min_length=8, max_length=500)
+    rollback_of_decision_id: uuid.UUID | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("evidence_ref", "reason")
+    @classmethod
+    def normalize_operator_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 8:
+            raise ValueError("value must contain at least 8 non-whitespace characters")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_rollback_shape(self):
+        if self.disposition == "restore_pending":
+            if self.rollback_of_decision_id is None:
+                raise ValueError("restore_pending requires rollback_of_decision_id")
+            if self.expected_status != "canceled":
+                raise ValueError("restore_pending requires expected_status=canceled")
+        elif self.rollback_of_decision_id is not None:
+            raise ValueError("rollback_of_decision_id is only valid for restore_pending")
+        elif self.expected_status != "pending":
+            raise ValueError(f"{self.disposition} requires expected_status=pending")
+        return self
 
 
 class MediaFailureRemediationIn(BaseModel):

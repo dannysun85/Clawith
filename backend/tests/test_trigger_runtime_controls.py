@@ -235,7 +235,7 @@ async def test_okr_automation_kill_switch_avoids_database_and_llm_work(
     with patch("app.services.trigger_runtime.evaluator.async_session") as session:
         handled = await handler(trigger, datetime.now(timezone.utc))
 
-    assert handled is True
+    assert handled is False
     session.assert_not_called()
     assert await evaluator.evaluate_trigger(trigger, datetime.now(timezone.utc)) is False
 

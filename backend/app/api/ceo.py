@@ -38,6 +38,7 @@ from app.services.ceo_orchestrator import (
     disable_ceo_orchestrator,
     enable_ceo_orchestrator,
     get_ceo_settings,
+    get_validated_ceo_meeting_members,
     is_enabled_ceo_agent,
     start_ceo_meeting,
     update_ceo_settings,
@@ -51,6 +52,7 @@ class CeoEnableIn(BaseModel):
     member_agent_ids: list[uuid.UUID] = Field(default_factory=list, max_length=12)
     briefing_enabled: bool = False
     morning_meeting_enabled: bool = False
+    observer_only_confirmed: bool = False
     daily_credit_cap: int = Field(default=20, ge=0)
     monthly_credit_cap: int = Field(default=300, ge=0)
 
@@ -73,6 +75,9 @@ class CeoStatusOut(BaseModel):
     configured: bool
     ceo_agent_id: uuid.UUID | None
     enabled: bool
+    can_read_brief: bool
+    can_start_meeting: bool
+    can_manage: bool
 
 
 def _settings_out(
@@ -195,6 +200,9 @@ def _translate_ceo_error(exc: CeoOrchestratorError) -> HTTPException:
         "ceo_meeting_kind_invalid": status.HTTP_422_UNPROCESSABLE_ENTITY,
         "ceo_meeting_member_invalid": status.HTTP_400_BAD_REQUEST,
         "ceo_meeting_member_limit": status.HTTP_400_BAD_REQUEST,
+        "ceo_enable_intent_required": status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "ceo_meeting_not_enabled": status.HTTP_409_CONFLICT,
+        "ceo_meeting_members_required": status.HTTP_422_UNPROCESSABLE_ENTITY,
         "ceo_coordination_not_available": status.HTTP_403_FORBIDDEN,
         "ceo_coordination_required": status.HTTP_409_CONFLICT,
         "ceo_parallel_delegation_limit_invalid": status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -213,14 +221,43 @@ async def get_ceo_orchestrator_status(
     """Return only the CEO fields every company member may read."""
     tenant_id = _tenant_id(current_user)
     row = await get_ceo_settings(db, tenant_id)
+    can_manage = is_company_governor(current_user)
+    can_operate = bool(
+        can_manage
+        or (
+            row is not None
+            and row.enabled_by_user_id is not None
+            and row.enabled_by_user_id == current_user.id
+        )
+    )
+    feature_available = ceo_orchestrator_allowed(
+        tenant_id=tenant_id,
+        agent_id=row.ceo_agent_id if row else None,
+    )
+    can_start_meeting = False
+    if (
+        can_operate
+        and feature_available
+        and row is not None
+        and row.enabled
+        and row.morning_meeting_enabled
+    ):
+        try:
+            can_start_meeting = bool(
+                await get_validated_ceo_meeting_members(db, settings=row)
+            )
+        except CeoOrchestratorError:
+            # Legacy/stale membership must not expose an action that the
+            # authoritative start endpoint will reject.
+            can_start_meeting = False
     return CeoStatusOut(
-        feature_available=ceo_orchestrator_allowed(
-            tenant_id=tenant_id,
-            agent_id=row.ceo_agent_id if row else None,
-        ),
+        feature_available=feature_available,
         configured=row is not None,
         ceo_agent_id=row.ceo_agent_id if row else None,
         enabled=bool(row.enabled) if row else False,
+        can_read_brief=can_operate,
+        can_start_meeting=can_start_meeting,
+        can_manage=can_manage,
     )
 
 
@@ -274,6 +311,7 @@ async def enable_ceo(
             member_agent_ids=body.member_agent_ids,
             briefing_enabled=body.briefing_enabled,
             morning_meeting_enabled=body.morning_meeting_enabled,
+            observer_only_confirmed=body.observer_only_confirmed,
             daily_credit_cap=body.daily_credit_cap,
             monthly_credit_cap=body.monthly_credit_cap,
         )

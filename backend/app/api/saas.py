@@ -9,7 +9,7 @@ import csv
 from dataclasses import asdict
 from io import StringIO
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +25,7 @@ from app.models.subscription import (
     CreditTransaction,
     ModelRoute,
     PaymentOrder,
+    PaymentOrderOperatorDecision,
     Plan,
     Subscription,
 )
@@ -46,13 +47,19 @@ from app.schemas.saas import (
     MediaRouteUpdateIn,
     MediaFailureRemediationIn,
     MediaProviderDebtResolutionIn,
+    ManualOrderDecisionIn,
     ModelRouteCreateIn,
     ModelRouteOut,
     ModelRouteUpdateIn,
     SaasTenantOut,
 )
-from app.schemas.subscription import CreditPackOut, CreditTransactionOut, PaymentOrderOut
-from app.services.billing_events import finalize_order_in_session
+from app.schemas.subscription import (
+    CreditPackOut,
+    CreditTransactionOut,
+    ManualOrderDecisionResultOut,
+    PaymentOrderOperatorDecisionOut,
+    PaymentOrderOut,
+)
 from app.services.billing_reconciliation import (
     check_credit_ledger_integrity,
     expire_stale_credit_reservations,
@@ -68,9 +75,14 @@ from app.services.media_incident_remediation import (
     resolve_media_provider_debt,
 )
 from app.services.llm_credit_reconciliation import resolve_llm_credit_holds
+from app.services.manual_order_governance import (
+    ManualOrderGovernanceError,
+    apply_manual_order_decision_in_session,
+)
 from app.services.entitlements import get_active_subscription, get_tenant_entitlements
 from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
 from app.services.subscription_lifecycle import (
+    apply_paid_subscribe_effects,
     enforce_agent_limit,
     ensure_free_subscription_for_tenant,
     restore_stopped_agents,
@@ -1327,6 +1339,33 @@ async def list_orders(
     return result.scalars().all()
 
 
+@router.get(
+    "/order-decisions",
+    response_model=list[PaymentOrderOperatorDecisionOut],
+)
+async def list_manual_order_decisions(
+    order_id: uuid.UUID | None = None,
+    tenant_id: uuid.UUID | None = None,
+    limit: int = 500,
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List bounded, platform-admin-only receipts for manual-order decisions."""
+
+    stmt = select(PaymentOrderOperatorDecision)
+    if order_id is not None:
+        stmt = stmt.where(PaymentOrderOperatorDecision.order_id == order_id)
+    if tenant_id is not None:
+        stmt = stmt.where(PaymentOrderOperatorDecision.tenant_id == tenant_id)
+    result = await db.execute(
+        stmt.order_by(
+            PaymentOrderOperatorDecision.created_at.desc(),
+            PaymentOrderOperatorDecision.id.desc(),
+        ).limit(min(max(limit, 1), 1000))
+    )
+    return result.scalars().all()
+
+
 def _orders_query(
     *,
     tenant_id: uuid.UUID | None = None,
@@ -1557,47 +1596,117 @@ async def resolve_ambiguous_llm_credit_holds(
     return result.to_dict()
 
 
-@router.post("/orders/{order_id}/mark-paid", response_model=PaymentOrderOut)
-async def mark_order_paid(
+async def _apply_manual_order_decision(
+    *,
     order_id: uuid.UUID,
+    data: ManualOrderDecisionIn,
+    idempotency_key: str | None,
+    current_user: User,
+    db: AsyncSession,
+) -> ManualOrderDecisionResultOut:
+    try:
+        result = await apply_manual_order_decision_in_session(
+            db,
+            order_id=order_id,
+            expected_tenant_id=data.expected_tenant_id,
+            expected_status=data.expected_status,
+            disposition=data.disposition,
+            evidence_ref=data.evidence_ref,
+            reason=data.reason,
+            rollback_of_decision_id=data.rollback_of_decision_id,
+            actor_user_id=current_user.id,
+            idempotency_key=idempotency_key,
+        )
+    except ManualOrderGovernanceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    if not result.replayed:
+        db.add(
+            AuditLog(
+                tenant_id=result.order.tenant_id,
+                user_id=current_user.id,
+                agent_id=None,
+                action="saas_manual_order_decision",
+                details={
+                    "decision_id": str(result.decision.id),
+                    "order_id": str(result.order.id),
+                    "tenant_id": str(result.order.tenant_id),
+                    "disposition": result.decision.disposition,
+                    "evidence_ref": result.decision.evidence_ref,
+                    "reason": result.decision.reason,
+                    "before": {"status": result.decision.previous_status},
+                    "after": {"status": result.decision.resulting_status},
+                    "idempotency_key_hash": result.decision.idempotency_key_hash,
+                    "rollback_of_decision_id": (
+                        str(result.decision.rollback_of_decision_id)
+                        if result.decision.rollback_of_decision_id
+                        else None
+                    ),
+                    "non_targets": [
+                        "provider-backed orders",
+                        "other tenants",
+                        "unreferenced payment orders",
+                    ],
+                },
+            )
+        )
+
+    await db.commit()
+    await db.refresh(result.order)
+    await db.refresh(result.decision)
+    if result.order.type == "subscribe" and result.order.status == "paid":
+        await apply_paid_subscribe_effects(result.order)
+    return ManualOrderDecisionResultOut(
+        order=PaymentOrderOut.model_validate(result.order),
+        decision=PaymentOrderOperatorDecisionOut.model_validate(result.decision),
+        replayed=result.replayed,
+    )
+
+
+@router.post(
+    "/orders/{order_id}/operator-decisions",
+    response_model=ManualOrderDecisionResultOut,
+)
+async def decide_manual_order(
+    order_id: uuid.UUID,
+    data: ManualOrderDecisionIn,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Mark a pending manual order as paid and apply its effects idempotently."""
+    """Keep, pay, cancel, or restore one manual order with a durable receipt."""
 
-    order = await db.get(PaymentOrder, order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if order.status == "paid":
-        return order
-    if order.provider != "manual":
+    return await _apply_manual_order_decision(
+        order_id=order_id,
+        data=data,
+        idempotency_key=idempotency_key,
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post(
+    "/orders/{order_id}/mark-paid",
+    response_model=ManualOrderDecisionResultOut,
+)
+async def mark_order_paid(
+    order_id: uuid.UUID,
+    data: ManualOrderDecisionIn,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Compatibility route for an evidence-backed mark-paid decision."""
+
+    if data.disposition != "mark_paid":
         raise HTTPException(
-            status_code=409,
-            detail="Provider-backed orders can only be finalized by a verified provider event",
+            status_code=422,
+            detail="mark-paid requires disposition=mark_paid",
         )
-    if order.status != "pending":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Manual order cannot be paid from status {order.status}",
-        )
-
-    before = _snapshot(order, ["status", "provider", "provider_session_id", "provider_payment_id", "paid_at"])
-    await finalize_order_in_session(db, order, actor_user_id=current_user.id)
-    db.add(_admin_audit(
-        action="saas_order_mark_paid",
-        actor=current_user,
-        details={
-            "order_id": str(order.id),
-            "tenant_id": str(order.tenant_id),
-            "before": before,
-            "after": _snapshot(order, ["status", "provider", "provider_session_id", "provider_payment_id", "paid_at"]),
-        },
-    ))
-
-    await db.commit()
-    await db.refresh(order)
-    if order.type == "subscribe":
-        await reconcile_tenant_agent_plan_selections(order.tenant_id)
-        await restore_stopped_agents(order.tenant_id)
-        await enforce_agent_limit(order.tenant_id)
-    return order
+    return await _apply_manual_order_decision(
+        order_id=order_id,
+        data=data,
+        idempotency_key=idempotency_key,
+        current_user=current_user,
+        db=db,
+    )

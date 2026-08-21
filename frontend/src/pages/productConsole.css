@@ -203,6 +203,30 @@
     gap: 8px;
 }
 
+.product-console__mobile-account {
+    display: none;
+    align-items: center;
+    gap: 6px;
+}
+
+.product-console__mobile-account button {
+    display: inline-flex;
+    width: 36px;
+    height: 36px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border-subtle);
+    border-radius: 9px;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    cursor: pointer;
+}
+
+.product-console__mobile-account button:hover {
+    color: var(--text-primary);
+    border-color: var(--border-default);
+}
+
 .product-console__content {
     width: min(1180px, calc(100% - 48px));
     margin: 0 auto;
@@ -446,6 +470,7 @@
     .product-console__nav a.active { box-shadow: inset 0 -2px var(--accent-primary); }
     .product-console__workspace { margin-left: 0; }
     .product-console__topbar { top: 59px; padding: 10px 16px; }
+    .product-console__mobile-account { display: flex; }
     .product-console__content { width: min(100% - 28px, 1180px); padding-top: 22px; }
     .console-card, .console-card--half { grid-column: 1 / -1; }
 }

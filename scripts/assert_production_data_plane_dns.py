@@ -218,6 +218,12 @@ def assert_unique_shared_data_plane(
     for alias in aliases:
         service_ids = _ps_ids(docker_bin, f"label={COMPOSE_SERVICE_LABEL}={alias}")
         for container in _inspect_containers(docker_bin, service_ids):
+            # This host can run other products with their own postgres/redis
+            # services. They are non-targets unless they are attached to this
+            # product's application network and publish the conflicting DNS
+            # alias there.
+            if _alias_matches(container, network_name, network_id, alias) is None:
+                continue
             project = _labels(container).get(COMPOSE_PROJECT_LABEL, "")
             name = _container_name(container)
             if project != compose_project:

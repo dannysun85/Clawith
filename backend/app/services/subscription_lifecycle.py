@@ -33,6 +33,7 @@ from app.services.llm.load_balancer import reset_daily_usage
 # Hourly — cheap query, catches expiries within the hour. Webhooks handle the
 # common case immediately; this is the safety net.
 LIFECYCLE_INTERVAL_SECONDS = 3600
+PAID_EFFECTS_LEASE_TIMEOUT = timedelta(minutes=10)
 
 
 async def ensure_free_subscription_for_tenant(
@@ -193,9 +194,7 @@ async def enforce_agent_limit(tenant_id: uuid.UUID) -> int:
     from app.models.onboarding import UserTenantOnboarding
 
     max_agents = await _effective_max_agents(tenant_id)
-    personal_assistant_ids = select(
-        UserTenantOnboarding.personal_assistant_agent_id
-    ).where(
+    personal_assistant_ids = select(UserTenantOnboarding.personal_assistant_agent_id).where(
         UserTenantOnboarding.tenant_id == tenant_id,
         UserTenantOnboarding.personal_assistant_agent_id.isnot(None),
     )
@@ -232,9 +231,7 @@ async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
     from app.models.onboarding import UserTenantOnboarding
 
     max_agents = await _effective_max_agents(tenant_id)
-    personal_assistant_ids = select(
-        UserTenantOnboarding.personal_assistant_agent_id
-    ).where(
+    personal_assistant_ids = select(UserTenantOnboarding.personal_assistant_agent_id).where(
         UserTenantOnboarding.tenant_id == tenant_id,
         UserTenantOnboarding.personal_assistant_agent_id.isnot(None),
     )
@@ -283,19 +280,112 @@ async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
         return len(to_restore)
 
 
-async def apply_paid_subscribe_effects(order: PaymentOrder) -> None:
+async def _claim_paid_subscribe_effects(
+    order_id: uuid.UUID,
+) -> tuple[uuid.UUID, int] | None:
+    """Claim one retryable effects receipt without holding a cross-service lock."""
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        result = await db.execute(select(PaymentOrder).where(PaymentOrder.id == order_id).with_for_update())
+        order = result.scalar_one_or_none()
+        if order is None or order.type != "subscribe" or order.status not in {"paid", "partially_refunded"}:
+            return None
+        effects_status = order.paid_effects_status or "pending"
+        if effects_status == "applied":
+            return None
+        if (
+            effects_status == "processing"
+            and order.paid_effects_started_at is not None
+            and order.paid_effects_started_at > now - PAID_EFFECTS_LEASE_TIMEOUT
+        ):
+            return None
+        order.paid_effects_status = "processing"
+        order.paid_effects_attempts = max(int(order.paid_effects_attempts or 0), 0) + 1
+        order.paid_effects_started_at = now
+        order.paid_effects_error = None
+        attempt = order.paid_effects_attempts
+        tenant_id = order.tenant_id
+        await db.commit()
+    return tenant_id, attempt
+
+
+async def _finish_paid_subscribe_effects(
+    order_id: uuid.UUID,
+    *,
+    attempt: int,
+    applied: bool,
+    error: Exception | None = None,
+) -> bool:
+    """Finish only the lease attempt that performed the side effects."""
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        result = await db.execute(
+            select(PaymentOrder)
+            .where(
+                PaymentOrder.id == order_id,
+                PaymentOrder.paid_effects_status == "processing",
+                PaymentOrder.paid_effects_attempts == attempt,
+            )
+            .with_for_update()
+        )
+        order = result.scalar_one_or_none()
+        if order is None:
+            return False
+        order.paid_effects_status = "applied" if applied else "failed"
+        order.paid_effects_error = None if error is None else f"{type(error).__name__}: {str(error)}"[:500]
+        order.paid_effects_applied_at = now if applied else None
+        await db.commit()
+    return True
+
+
+async def apply_paid_subscribe_effects(order: PaymentOrder) -> bool:
     """Restore routing and agent slots after a subscribe order is marked paid.
 
     Shared by the webhook, QR poll, and missed-webhook reconciler. Safe to
     call more than once for the same paid order.
     """
-    if order.type != "subscribe" or order.status != "paid":
-        return
+    if order.type != "subscribe" or order.status not in {"paid", "partially_refunded"}:
+        return False
+    claim = await _claim_paid_subscribe_effects(order.id)
+    if claim is None:
+        return False
+    tenant_id, attempt = claim
     from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
 
-    await reconcile_tenant_agent_plan_selections(order.tenant_id)
-    await restore_stopped_agents(order.tenant_id)
-    await enforce_agent_limit(order.tenant_id)
+    try:
+        await reconcile_tenant_agent_plan_selections(tenant_id)
+        await restore_stopped_agents(tenant_id)
+        await enforce_agent_limit(tenant_id)
+    except Exception as exc:
+        receipt_updated = await _finish_paid_subscribe_effects(
+            order.id,
+            attempt=attempt,
+            applied=False,
+            error=exc,
+        )
+        from app.services.production_issue_monitor import record_production_issue
+
+        if receipt_updated:
+            await record_production_issue(
+                source="billing_reconciliation",
+                category="paid_subscribe_effects",
+                summary="Paid subscription effects require retry",
+                severity="critical",
+                error_code="paid_effects_incomplete",
+                operation="apply_paid_subscribe_effects",
+                tenant_id=tenant_id,
+                metadata={
+                    "order_id": str(order.id),
+                    "attempt": attempt,
+                    "error_type": type(exc).__name__,
+                },
+            )
+        raise
+    return await _finish_paid_subscribe_effects(
+        order.id,
+        attempt=attempt,
+        applied=True,
+    )
 
 
 async def start_subscription_lifecycle_daemon() -> None:

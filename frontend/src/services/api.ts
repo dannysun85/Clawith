@@ -257,11 +257,11 @@ export const authApi = {
     emailHint: (username: string) =>
         request<{ hint: string }>(`/auth/email-hint?username=${encodeURIComponent(username)}`),
 
-    me: (accessToken?: string) => request<User>(
+    me: (accessToken?: string, signal?: AbortSignal) => request<User>(
         '/auth/me',
         accessToken
-            ? { headers: { Authorization: `Bearer ${accessToken}` } }
-            : undefined,
+            ? { headers: { Authorization: `Bearer ${accessToken}` }, signal }
+            : { signal },
     ),
 
     updateMe: (data: Partial<User> & { current_password?: string }) =>
@@ -1341,6 +1341,42 @@ export type CeoOrchestratorStatus = {
     configured: boolean;
     ceo_agent_id: string | null;
     enabled: boolean;
+    can_read_brief: boolean;
+    can_start_meeting: boolean;
+    can_manage: boolean;
+};
+
+export type CeoMigrationPreview = {
+    schema_version: string;
+    mode: 'dry_run';
+    tenant_id: string;
+    classification: 'formal_ceo' | 'none' | 'ambiguous_manual_review' | 'legacy_contaminated_archive' | 'legacy_clean_adoptable';
+    formal_ceo_agent_id: string | null;
+    candidates: Array<{
+        agent_id: string;
+        name: string;
+        is_system: boolean;
+        template_role_key: string | null;
+        session_count: number;
+        message_count: number;
+        active_trigger_count: number;
+        control_plane_revision_count: number;
+        control_plane_bytes: number;
+        enabled_tool_count: number;
+        relationship_count: number;
+        has_last_activity: boolean;
+        has_behavioral_history: boolean;
+    }>;
+    recommended_action: string;
+    warnings: string[];
+    safeguards: {
+        mutates_data: false;
+        includes_message_content: false;
+        includes_memory_content: false;
+        includes_trigger_or_tool_config: false;
+        automatic_adoption_allowed: false;
+        automatic_archive_allowed: false;
+    };
 };
 
 export type CeoCompanyBrief = {
@@ -1370,10 +1406,13 @@ export const ceoApi = {
 
     settings: () => request<CeoOrchestratorSettings>('/companies/current/ceo/settings'),
 
+    migrationPreview: () => request<CeoMigrationPreview>('/companies/current/ceo/migration-preview'),
+
     enable: (data: {
         member_agent_ids?: string[];
         briefing_enabled?: boolean;
         morning_meeting_enabled?: boolean;
+        observer_only_confirmed?: boolean;
         daily_credit_cap?: number;
         monthly_credit_cap?: number;
     }) => request<CeoOrchestratorSettings>('/companies/current/ceo/enable', {

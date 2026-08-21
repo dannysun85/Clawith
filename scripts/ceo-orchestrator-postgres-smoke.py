@@ -8,8 +8,9 @@ Proves the FR-CEO-1/2/3/4/5 contracts end to end with zero provider calls:
 - FR-CEO-2: company_brief_snapshot typed adapter succeeds for the enabled CEO
   and stays fail-closed (ceo_only) for any other Agent; the projection output
   respects the hard length bound.
-- FR-CEO-3: four is_system cron triggers exist under the CEO, default to
-  disabled, and follow the triple gate when cadence switches flip.
+- FR-CEO-3: five is_system trigger identities exist under the CEO (including a
+  distinct manual weekly-meeting identity), default to disabled, and follow
+  the triple gate when cadence switches flip.
 - FR-CEO-4: a manual meeting start registers a durable trigger-runtime run with
   stable identity, lazily creates the meeting Group, and writes zero Task rows.
 - FR-CEO-5: budget caps fail closed (skip + enabler notification + audit) for
@@ -178,6 +179,7 @@ async def main() -> None:
                 tenant=tenant_row,
                 admin=owner_row,
                 member_agent_ids=[employee.id for employee in employees],
+                observer_only_confirmed=True,
             )
             await db.commit()
             ceo_agent_id = settings_row.ceo_agent_id
@@ -242,7 +244,7 @@ async def main() -> None:
                 )
             ).scalars().all()
             assert any(item.kind == "system" for item in focus), "system focus item missing"
-        _ok("FR-CEO-1 entity/permissions/triggers/seat", "seats before=after=2, 4 disabled system triggers")
+        _ok("FR-CEO-1 entity/permissions/triggers/seat", "seats before=after=2, 5 disabled system triggers")
 
         # ── Idempotent re-enable + uniqueness ──
         async with async_session() as db:

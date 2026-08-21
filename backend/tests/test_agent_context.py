@@ -51,6 +51,35 @@ def test_memory_context_truncation_keeps_identity_and_latest_corrections():
     assert bounded.endswith("LATEST CORRECTION: use the new policy")
 
 
+def test_memory_context_truncation_preserves_middle_policy_sections():
+    from app.services.agent_context import _truncate_context_text
+
+    content = "\n".join(
+        [
+            "# Memory",
+            "Company identity and operating context.",
+            "## Old history",
+            "old event " * 500,
+            "## Security Policy",
+            "Never reveal credentials. Require approval before an external write.",
+            "policy details " * 500,
+            "## Customer notes",
+            "customer history " * 500,
+            "## Latest correction",
+            "LATEST CORRECTION: external publishing remains disabled",
+        ]
+    )
+
+    bounded = _truncate_context_text(content, 2000, preserve_tail=True)
+
+    assert len(bounded) <= 2000
+    assert bounded.startswith("# Memory")
+    assert "# Security Policy" in bounded
+    assert "Never reveal credentials" in bounded
+    assert "Section index:" in bounded
+    assert bounded.endswith("LATEST CORRECTION: external publishing remains disabled")
+
+
 def test_active_trigger_prompt_omits_internal_routing_and_webhook_secrets():
     from types import SimpleNamespace
 
@@ -133,24 +162,27 @@ def test_active_trigger_prompt_is_empty_when_only_internal_triggers_exist():
 
     from app.services.agent_context import _render_active_trigger_lines
 
-    assert _render_active_trigger_lines(
-        [
-            SimpleNamespace(
-                name="a2a_wake",
-                type="a2a",
-                config={},
-                reason="Internal A2A routing",
-                focus_ref=None,
-            ),
-            SimpleNamespace(
-                name="__a2a_wake__",
-                type="event",
-                config={},
-                reason="Internal A2A routing",
-                focus_ref=None,
-            )
-        ]
-    ) == []
+    assert (
+        _render_active_trigger_lines(
+            [
+                SimpleNamespace(
+                    name="a2a_wake",
+                    type="a2a",
+                    config={},
+                    reason="Internal A2A routing",
+                    focus_ref=None,
+                ),
+                SimpleNamespace(
+                    name="__a2a_wake__",
+                    type="event",
+                    config={},
+                    reason="Internal A2A routing",
+                    focus_ref=None,
+                ),
+            ]
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -191,14 +223,8 @@ def test_send_channel_file_contract_matches_runtime_channel_support():
     from app.services.agent_tools import AGENT_TOOLS
     from app.services.tool_seeder import BUILTIN_TOOLS
 
-    runtime_tool = next(
-        tool["function"]
-        for tool in AGENT_TOOLS
-        if tool["function"]["name"] == "send_channel_file"
-    )
-    seeded_tool = next(
-        tool for tool in BUILTIN_TOOLS if tool["name"] == "send_channel_file"
-    )
+    runtime_tool = next(tool["function"] for tool in AGENT_TOOLS if tool["function"]["name"] == "send_channel_file")
+    seeded_tool = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_channel_file")
 
     for schema in (
         runtime_tool["parameters"],

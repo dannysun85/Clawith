@@ -86,6 +86,8 @@ export default function SettingsTab(props: Props) {
     const selectedModality = settingsForm.preferred_modality || agent?.preferred_modality || allowedModalities[0] || 'text';
     const readOnly = !canManage;
     const canSave = canManage && hasChanges && !settingsSaving;
+    const heartbeatAvailable = agent?.execution_capabilities?.heartbeat_execution === true;
+    const heartbeatRunning = heartbeatAvailable && (agent?.heartbeat_enabled ?? false);
 
     if ((agent as any)?.agent_type === 'openclaw') {
         return <OpenClawSettings agent={agent} agentId={agentId} canManage={canManage} />;
@@ -325,26 +327,31 @@ export default function SettingsTab(props: Props) {
             <div className="card" style={{ marginBottom: '12px' }}>
                 <h4 style={{ marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>{t('agent.settings.heartbeat.title', 'Heartbeat')}</h4>
                 <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '16px' }}>{t('agent.settings.heartbeat.description', 'Periodic awareness check — agent proactively monitors the plaza and work environment.')}</p>
+                {!heartbeatAvailable && (
+                    <div role="status" style={{ marginBottom: '14px', padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--warning, #d97706)', background: 'rgba(217,119,6,0.08)', color: 'var(--text-secondary)', fontSize: '12px', lineHeight: 1.5 }}>
+                        {t('agent.settings.heartbeat.platformDisabled', 'Heartbeat automation is disabled by the platform operator. Saved settings are not running and cannot be changed here.')}
+                    </div>
+                )}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: 'var(--bg-elevated)', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
                         <div>
                             <div style={{ fontWeight: 500, fontSize: '13px' }}>{t('agent.settings.heartbeat.enabled', 'Enable Heartbeat')}</div>
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('agent.settings.heartbeat.enabledDesc', 'Agent will periodically check plaza and work status')}</div>
                         </div>
-                        <label style={{ position: 'relative', display: 'inline-block', width: '44px', height: '24px', cursor: canManage ? 'pointer' : 'default' }}>
+                        <label style={{ position: 'relative', display: 'inline-block', width: '44px', height: '24px', cursor: canManage && heartbeatAvailable ? 'pointer' : 'default' }}>
                             <input
                                 type="checkbox"
-                                checked={agent?.heartbeat_enabled ?? false}
-                                disabled={!canManage}
+                                checked={heartbeatRunning}
+                                disabled={!canManage || !heartbeatAvailable}
                                 onChange={async (e) => {
-                                    if (!canManage) return;
+                                    if (!canManage || !heartbeatAvailable) return;
                                     await agentApi.update(agentId, { heartbeat_enabled: e.target.checked } as any);
                                     queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
                                 }}
                                 style={{ opacity: 0, width: 0, height: 0 }}
                             />
-                            <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: (agent?.heartbeat_enabled ?? false) ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '12px', transition: 'background 0.2s', opacity: canManage ? 1 : 0.6 }}>
-                                <span style={{ position: 'absolute', top: '3px', left: (agent?.heartbeat_enabled ?? false) ? '23px' : '3px', width: '18px', height: '18px', background: 'white', borderRadius: '50%', transition: 'left 0.2s' }} />
+                            <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: heartbeatRunning ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '12px', transition: 'background 0.2s', opacity: canManage && heartbeatAvailable ? 1 : 0.6 }}>
+                                <span style={{ position: 'absolute', top: '3px', left: heartbeatRunning ? '23px' : '3px', width: '18px', height: '18px', background: 'white', borderRadius: '50%', transition: 'left 0.2s' }} />
                             </span>
                         </label>
                     </div>
@@ -358,18 +365,18 @@ export default function SettingsTab(props: Props) {
                             <input
                                 type="number"
                                 className="input"
-                                disabled={!canManage}
+                                disabled={!canManage || !heartbeatAvailable}
                                 min={1}
                                 defaultValue={agent?.heartbeat_interval_minutes ?? 120}
                                 key={agent?.heartbeat_interval_minutes}
                                 onBlur={async (e) => {
-                                    if (!canManage) return;
+                                    if (!canManage || !heartbeatAvailable) return;
                                     const value = Math.max(1, Number(e.target.value) || 120);
                                     e.target.value = String(value);
                                     await agentApi.update(agentId, { heartbeat_interval_minutes: value } as any);
                                     queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
                                 }}
-                                style={{ width: '80px', fontSize: '12px', opacity: canManage ? 1 : 0.6 }}
+                                style={{ width: '80px', fontSize: '12px', opacity: canManage && heartbeatAvailable ? 1 : 0.6 }}
                             />
                             <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.minutes', 'min')}</span>
                         </div>
@@ -382,14 +389,14 @@ export default function SettingsTab(props: Props) {
                         </div>
                         <input
                             className="input"
-                            disabled={!canManage}
+                            disabled={!canManage || !heartbeatAvailable}
                             value={agent?.heartbeat_active_hours ?? '09:00-18:00'}
                             onChange={async (e) => {
-                                if (!canManage) return;
+                                if (!canManage || !heartbeatAvailable) return;
                                 await agentApi.update(agentId, { heartbeat_active_hours: e.target.value } as any);
                                 queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
                             }}
-                            style={{ width: '140px', fontSize: '12px', textAlign: 'center', opacity: canManage ? 1 : 0.6 }}
+                            style={{ width: '140px', fontSize: '12px', textAlign: 'center', opacity: canManage && heartbeatAvailable ? 1 : 0.6 }}
                             placeholder="09:00-18:00"
                         />
                     </div>

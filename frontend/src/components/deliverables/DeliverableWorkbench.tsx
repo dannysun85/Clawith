@@ -68,6 +68,10 @@ interface DeliverableReviewCardProps {
     onUpdated: (request: DeliverableRequest) => void;
 }
 
+export function isFormalDeliverableWorkType(workType: DeliverableRequest['work_type']) {
+    return workType === 'presentation' || workType === 'poster' || workType === 'video';
+}
+
 const WORK_TYPE_ICONS: Record<string, React.ReactNode> = {
     presentation: <IconFileTypePpt size={20} stroke={1.75} />,
     poster: <IconPhoto size={20} stroke={1.75} />,
@@ -700,12 +704,14 @@ export function DeliverableRequestCard({ request, launchable, onRemove, onOpen, 
     const [clarifySaving, setClarifySaving] = useState(false);
     const clarifying = request.current_stage === 'brief_clarifying';
     const nextAction = deliverableNextAction(request);
+    const formalDelivery = isFormalDeliverableWorkType(request.work_type);
+    const canLaunchFormalDelivery = formalDelivery && launchable;
     const label = {
         presentation: isZh ? 'PPT 演示文稿' : 'Presentation',
         poster: isZh ? '海报 / 图片' : 'Poster / Image',
         video: isZh ? '短视频' : 'Short video',
-        report: isZh ? '报告' : 'Report',
-        spreadsheet: isZh ? '表格' : 'Spreadsheet',
+        report: isZh ? '报告工作说明' : 'Report brief',
+        spreadsheet: isZh ? '表格工作说明' : 'Spreadsheet brief',
     }[request.work_type];
 
     const openClarification = async () => {
@@ -759,9 +765,11 @@ export function DeliverableRequestCard({ request, launchable, onRemove, onOpen, 
                     <small>
                         {clarifying
                             ? (isZh ? '工作说明待补充 · 暂不启动生成' : 'Brief needs details · generation not started')
-                            : launchable
+                            : canLaunchFormalDelivery
                                 ? (isZh ? '工作说明已保存 · 发送后启动' : 'Brief saved · send to launch')
-                                : (isZh ? '工作说明已保存 · 暂不启动生成' : 'Brief saved · generation not started')}
+                                : formalDelivery
+                                    ? (isZh ? '工作说明已保存 · 暂不启动生成' : 'Brief saved · generation not started')
+                                    : (isZh ? '仅保存工作说明 · 当前版本不提供正式生成' : 'Brief only · formal generation is not available in this release')}
                     </small>
                     {!launchable && nextAction && <small>{nextAction}</small>}
                 </span>
@@ -971,8 +979,8 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         presentation: isZh ? 'PPT 交付任务' : 'Presentation delivery',
         poster: isZh ? '图片交付任务' : 'Image delivery',
         video: isZh ? '视频交付任务' : 'Video delivery',
-        report: isZh ? '报告交付任务' : 'Report delivery',
-        spreadsheet: isZh ? '表格交付任务' : 'Spreadsheet delivery',
+        report: isZh ? '报告工作说明（暂不生成）' : 'Report brief (generation unavailable)',
+        spreadsheet: isZh ? '表格工作说明（暂不生成）' : 'Spreadsheet brief (generation unavailable)',
     }[request.work_type];
     const eligibleReviewerCount = qualityReviewers.filter((reviewer) => reviewer.eligible).length;
     const qualityStatus = qualityReview?.status;
@@ -1188,8 +1196,8 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                 presentation: isZh ? 'PPT 已生成' : 'Presentation ready',
                 poster: isZh ? '图片已生成' : 'Image ready',
                 video: isZh ? '视频已生成' : 'Video ready',
-                report: isZh ? '报告已生成' : 'Report ready',
-                spreadsheet: isZh ? '表格已生成' : 'Spreadsheet ready',
+                report: isZh ? '报告工作说明已保存' : 'Report brief saved',
+                spreadsheet: isZh ? '表格工作说明已保存' : 'Spreadsheet brief saved',
             }[request.work_type]
             : presentation.title;
     const compactDescription = hasPartialArtifacts

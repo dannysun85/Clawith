@@ -207,12 +207,50 @@ class PaymentOrderOut(BaseModel):
     provider_payment_id: str | None = None
     session_url: str | None = None
     status: str
+    refunded_amount_cents: int = 0
+    refunded_credits: int = 0
+    paid_effects_status: str = "not_applicable"
+    paid_effects_attempts: int = 0
+    paid_effects_error: str | None = None
+    paid_effects_started_at: datetime | None = None
+    paid_effects_applied_at: datetime | None = None
+    provider_close_status: str = "not_requested"
+    provider_close_attempts: int = 0
+    provider_close_error: str | None = None
+    provider_close_last_attempt_at: datetime | None = None
+    provider_close_next_retry_at: datetime | None = None
     period: str | None = None
     change_kind: str | None = None
     created_at: datetime
     paid_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PaymentOrderOperatorDecisionOut(BaseModel):
+    """Audit receipt for an explicit manual-order operator decision."""
+
+    id: uuid.UUID
+    order_id: uuid.UUID
+    tenant_id: uuid.UUID
+    actor_user_id: uuid.UUID | None = None
+    disposition: str
+    evidence_ref: str
+    reason: str
+    previous_status: str
+    resulting_status: str
+    rollback_of_decision_id: uuid.UUID | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ManualOrderDecisionResultOut(BaseModel):
+    """Current order state plus its durable operator-decision receipt."""
+
+    order: PaymentOrderOut
+    decision: PaymentOrderOperatorDecisionOut
+    replayed: bool
 
 
 class SubscriptionSummaryOut(BaseModel):

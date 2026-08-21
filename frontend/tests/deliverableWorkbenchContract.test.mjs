@@ -7,6 +7,10 @@ const workbench = readFileSync(
   new URL('../src/components/deliverables/DeliverableWorkbench.tsx', import.meta.url),
   'utf8',
 );
+const agentDetail = readFileSync(
+  new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url),
+  'utf8',
+);
 
 function selectorZIndex(selector) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -61,6 +65,17 @@ test('presentation preflight receives the same business goal used by the deliver
   assert.match(
     workbench,
     /workflow_version:\s*selectedWorkflow\.workflow_version,[\s\S]*goal:\s*goal\.trim\(\),[\s\S]*spec,/,
+  );
+});
+
+test('task handoff keeps explicit session uploads available to the deliverable brief', () => {
+  assert.match(
+    agentDetail,
+    /attachments=\{attachedFiles\.map\(\(file\) => \(\{[\s\S]*name: file\.name,[\s\S]*path: file\.path/,
+  );
+  assert.doesNotMatch(
+    agentDetail,
+    /attachments=\{requestedDeliverableHandoff[\s\S]*\? \[\]/,
   );
 });
 

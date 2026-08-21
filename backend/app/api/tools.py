@@ -407,6 +407,20 @@ def _is_platform_admin(user: User) -> bool:
     return is_platform_operator(user)
 
 
+def _tool_hidden_by_release_policy(tool: Tool, user: User) -> bool:
+    """Hide disabled Code/AgentBay product surfaces from tenant operators."""
+
+    if _is_platform_admin(user):
+        return False
+    from app.config import get_settings
+    from app.services.code_execution_policy import is_code_execution_tool
+
+    return not get_settings().CODE_EXECUTION_ENABLED and (
+        tool.category in {"code", "agentbay"}
+        or is_code_execution_tool(tool.name)
+    )
+
+
 async def _require_agent_tool_access(
     db: AsyncSession,
     current_user: User,
@@ -711,6 +725,8 @@ async def list_tools(
     tools = result.scalars().all()
     response = []
     for t in tools:
+        if _tool_hidden_by_release_policy(t, current_user):
+            continue
         company_config = await get_tool_company_config(db, t, target_tenant_id)
         available, availability_reason = await _code_tool_availability(
             db,
@@ -1000,6 +1016,8 @@ async def get_agent_tools(
 
     result = []
     for t in all_tools:
+        if _tool_hidden_by_release_policy(t, current_user):
+            continue
         # Hide feishu tools for agents without Feishu channel
         if t.category == "feishu" and not has_feishu:
             continue
@@ -1657,6 +1675,8 @@ async def get_agent_tools_with_config(
 
     result = []
     for t in all_tools:
+        if _tool_hidden_by_release_policy(t, current_user):
+            continue
         # Hide feishu tools for agents without Feishu channel
         if t.category == "feishu" and not has_feishu:
             continue

@@ -634,6 +634,40 @@ def test_wechat_refund_state_is_explicit():
     assert provider._order_status_from_trade_state("REFUND") == "refunded"
 
 
+async def test_wechat_verified_partial_refund_preserves_refund_delta():
+    provider = _make_provider()
+    order = _order(amount_cents=7000, currency="CNY")
+    provider._request = AsyncMock(  # type: ignore[assignment]
+        return_value={
+            "out_trade_no": order.id.hex,
+            "trade_state": "SUCCESS",
+            "transaction_id": "4200007777",
+            "mchid": "1230000109",
+            "appid": "wx1234567890abcdef",
+            "trade_type": "NATIVE",
+            "attach": f"tenant:{order.tenant_id.hex}",
+            "amount": {"total": 7000, "currency": "CNY"},
+        }
+    )
+
+    state = await provider.load_remote_event_state(
+        {
+            "id": "evt-refund-partial",
+            "type": "REFUND.SUCCESS",
+            "decrypted": {
+                "out_trade_no": order.id.hex,
+                "refund_status": "SUCCESS",
+                "amount": {"total": 7000, "refund": 1250, "currency": "CNY"},
+            },
+        }
+    )
+
+    assert state.status == "refunded"
+    assert state.refund_amount_cents == 1250
+    assert state.amount_cents == 7000
+    provider.validate_event_state(order, state)
+
+
 async def test_query_order_state_returns_none_on_api_error():
     provider = _make_provider()
     order = _order(status="pending")

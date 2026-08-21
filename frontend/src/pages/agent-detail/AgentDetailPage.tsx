@@ -20,7 +20,7 @@ import {
     DeliverableReviewCard,
 } from '../../components/deliverables/DeliverableWorkbench';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, workApi, type DeliverableRequest } from '../../services/api';
+import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, workApi, type DeliverableRequest } from '../../services/api';
 import { websocketAuthProtocols } from '../../utils/authTransport';
 import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
@@ -415,18 +415,6 @@ const formatTokensParts = (n: number): { value: string; unit: string } => {
     if (n >= 1000) return { value: (n / 1000).toFixed(1), unit: 'K' };
     return { value: String(n), unit: '' };
 };
-
-/** Convert rich schedule JSON to cron expression */
-function schedToCron(sched: { freq: string; interval: number; time: string; weekdays?: number[] }): string {
-    const [h, m] = (sched.time || '09:00').split(':').map(Number);
-    if (sched.freq === 'weekly') {
-        const days = (sched.weekdays || [1, 2, 3, 4, 5]).join(',');
-        return sched.interval > 1 ? `${m} ${h} * * ${days}` : `${m} ${h} * * ${days}`;
-    }
-    // daily
-    if (sched.interval === 1) return `${m} ${h} * * *`;
-    return `${m} ${h} */${sched.interval} * *`;
-}
 
 const getRelationOptions = (t: any) => [
     { value: 'supervisor', label: t('agent.detail.supervisor') },
@@ -5662,71 +5650,6 @@ export default function AgentDetailPage() {
     const [agentUrlInput, setAgentUrlInput] = useState('');
     const [agentUrlImporting, setAgentUrlImporting] = useState(false);
 
-    const { data: schedules = [] } = useQuery({
-        queryKey: ['schedules', id],
-        queryFn: () => scheduleApi.list(id!),
-        enabled: !!id && (activeTab as string) === 'tasks',
-    });
-
-    // Schedule form state
-    const [showScheduleForm, setShowScheduleForm] = useState(false);
-    const schedDefaults = { freq: 'daily', interval: 1, time: '09:00', weekdays: [1, 2, 3, 4, 5] };
-    const [schedForm, setSchedForm] = useState({ name: '', instruction: '', schedule: JSON.stringify(schedDefaults), due_date: '' });
-
-    const createScheduleMut = useMutation({
-        mutationFn: () => {
-            if (agent?.execution_capabilities?.schedule_execution !== true) {
-                throw new Error(t('agent.aware.executionPausedDetail'));
-            }
-            let sched: any;
-            try { sched = JSON.parse(schedForm.schedule); } catch { sched = schedDefaults; }
-            return scheduleApi.create(id!, { name: schedForm.name, instruction: schedForm.instruction, cron_expr: schedToCron(sched) });
-        },
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['schedules', id] });
-            setShowScheduleForm(false);
-            setSchedForm({ name: '', instruction: '', schedule: JSON.stringify(schedDefaults), due_date: '' });
-        },
-        onError: (err: any) => {
-            const msg = err?.detail || err?.message || String(err);
-            toast.error(t('common.error.planCreateFailed', '创建计划任务失败'), { details: String(msg) });
-        },
-    });
-
-    const toggleScheduleMut = useMutation({
-        mutationFn: ({ sid, enabled }: { sid: string; enabled: boolean }) => {
-            if (enabled && agent?.execution_capabilities?.schedule_execution !== true) {
-                throw new Error(t('agent.aware.executionPausedDetail'));
-            }
-            return scheduleApi.update(id!, sid, { is_enabled: enabled });
-        },
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['schedules', id] }),
-    });
-
-    const deleteScheduleMut = useMutation({
-        mutationFn: (sid: string) => scheduleApi.delete(id!, sid),
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['schedules', id] }),
-    });
-
-    const triggerScheduleMut = useMutation({
-        mutationFn: async (sid: string) => {
-            if (agent?.execution_capabilities?.schedule_execution !== true) {
-                throw new Error(t('agent.aware.executionPausedDetail'));
-            }
-            const res = await scheduleApi.trigger(id!, sid);
-            return res;
-        },
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['schedules', id] });
-            showToast(t('agent.aware.scheduleAccepted'), 'success');
-        },
-        onError: (err: any) => {
-            const msg = err?.response?.data?.detail || err?.message || 'Failed to trigger schedule';
-            showToast(msg, 'error');
-        },
-    });
-
-
     const { data: metrics } = useQuery({
         queryKey: ['metrics', id],
         queryFn: () => agentApi.metrics(id!).catch(() => null),
@@ -8728,9 +8651,10 @@ export default function AgentDetailPage() {
                                                             initialSpecOverrides={requestedDeliverableHandoff?.specOverrides}
                                                             autoOpenKey={requestedDeliverableHandoff?.taskId}
                                                             tier={effectiveChatTier || 'lite'}
-                                                            attachments={requestedDeliverableHandoff
-                                                                ? []
-                                                                : attachedFiles.map((file) => ({ name: file.name, path: file.path }))}
+                                                            attachments={attachedFiles.map((file) => ({
+                                                                name: file.name,
+                                                                path: file.path,
+                                                            }))}
                                                             disabled={chatInputDisabled || !wsConnected || !effectiveChatTier || isWaiting || isStreaming || (agent as any)?.agent_type === 'openclaw'}
                                                             onCreated={(request, launchable) => {
                                                                 dismissedDeliverableRequestIdsRef.current.delete(request.id);

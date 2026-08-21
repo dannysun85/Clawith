@@ -31,6 +31,7 @@ class DouyinAccountOut(BaseModel):
 
 class DouyinStatusOut(BaseModel):
     configured: bool
+    direct_publish_available: bool
     status: str
     message: str
     required_scopes: list[str]

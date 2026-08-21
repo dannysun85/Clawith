@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from app.config import Settings
 from app.models.agent import Agent
@@ -176,3 +177,32 @@ def test_agent_capabilities_distinguish_user_automation_from_supervision():
     assert '"schedule_execution": AUTOMATIC_SCHEDULE_EXECUTION_ENABLED' in source
     assert '"trigger_execution": AUTOMATIC_TRIGGER_EXECUTION_ENABLED' in source
     assert '"supervision_execution": SUPERVISION_EXECUTION_ENABLED' in source
+    assert '"heartbeat_execution": bool(settings.HEARTBEAT_ENABLED)' in source
+
+
+def test_agent_capabilities_expose_disabled_heartbeat(monkeypatch):
+    from app.api import agents
+
+    model = AgentOut.model_construct()
+    monkeypatch.setattr(agents.settings, "HEARTBEAT_ENABLED", False)
+
+    agents._apply_release_capabilities(model)
+
+    assert model.execution_capabilities["heartbeat_execution"] is False
+
+
+def test_disabled_heartbeat_allows_cleanup_but_rejects_new_configuration(monkeypatch):
+    from app.api import agents
+
+    monkeypatch.setattr(agents.settings, "HEARTBEAT_ENABLED", False)
+
+    agents._validate_heartbeat_release_update({"heartbeat_enabled": False})
+
+    with pytest.raises(HTTPException) as enable_error:
+        agents._validate_heartbeat_release_update({"heartbeat_enabled": True})
+    assert enable_error.value.status_code == 409
+    assert enable_error.value.detail["code"] == "heartbeat_automation_unavailable"
+
+    with pytest.raises(HTTPException) as config_error:
+        agents._validate_heartbeat_release_update({"heartbeat_active_hours": "08:00-19:00"})
+    assert config_error.value.status_code == 409

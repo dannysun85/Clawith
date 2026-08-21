@@ -83,9 +83,10 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
     });
 
     if (isLoading) return <div style={{ padding: '20px' }}>{t('common.loading', 'Loading...')}</div>;
-    const s = settings || { enabled: false, first_enabled_at: null, daily_report_enabled: false, daily_report_time: '18:00', daily_report_skip_non_workdays: true, weekly_report_enabled: false, weekly_report_day: 0, period_frequency: 'quarterly', period_length_days: null, period_frequency_locked: false };
+    const s = settings || { enabled: false, first_enabled_at: null, daily_report_enabled: false, daily_report_time: '18:00', daily_report_skip_non_workdays: true, weekly_report_enabled: false, weekly_report_day: 0, period_frequency: 'quarterly', period_length_days: null, period_frequency_locked: false, automation_available: false, automation_unavailable_reason: 'platform_automation_disabled' };
     const periodFrequencyLocked = !!s.period_frequency_locked || !!s.first_enabled_at;
     const effectiveTimezone = tenantInfo?.timezone || 'UTC';
+    const automationAvailable = s.automation_available === true;
 
     // Primary source: /settings now embeds okr_agent_id directly.
     // Fallback to members-without-okr response for backward compat.
@@ -103,10 +104,13 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                                 {zh ? 'OKR 系统开关' : 'OKR System'}
                             </div>
                             <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                                {zh
-                                    ? '启用后，组织内成员和数字员工均可使用 OKR 功能管理目标。Agent 将主动跟进并报告进展。'
-                                    : 'When enabled, all members and AI agents in the organization can use OKR to manage objectives. The OKR Agent will proactively track and report progress.'
-                                }
+                                {automationAvailable
+                                    ? (zh
+                                        ? '启用后，组织内成员和数字员工可管理目标；平台已开放自动收集与汇总。'
+                                        : 'When enabled, members and digital employees can manage objectives; automated collection and summaries are available.')
+                                    : (zh
+                                        ? '启用后可手动管理目标、关键结果与进度。平台当前未开放自动收集、自动日报、周报或月报。'
+                                        : 'When enabled, objectives, key results, and progress remain available manually. Automated collection and daily, weekly, or monthly reports are not enabled by the platform.')}
                             </div>
                         </div>
                         {/* Wider toggle so the knob has comfortable room */}
@@ -171,6 +175,13 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
 
                 {s.enabled && (
                     <div style={{ padding: '20px' }}>
+                        {!automationAvailable && (
+                            <div role="status" style={{ marginBottom: '20px', padding: '12px 14px', borderRadius: '8px', border: '1px solid var(--warning, #d97706)', background: 'rgba(217,119,6,0.08)', color: 'var(--text-secondary)', fontSize: '12px', lineHeight: 1.6 }}>
+                                {zh
+                                    ? '自动化能力由平台运营开关控制，目前处于关闭状态。已保存的自动收集配置不会执行；手动 OKR 管理和手动进度更新不受影响。'
+                                    : 'Automation is controlled by a platform operator switch and is currently off. Saved collection settings will not run; manual OKR management and progress updates remain available.'}
+                            </div>
+                        )}
                         {/* Phase 1 Onboarding Guidance Card */}
                         <div style={{
                             marginBottom: '24px',
@@ -346,7 +357,8 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
                                 <input
                                     type="checkbox"
-                                    checked={s.daily_report_enabled}
+                                    checked={automationAvailable && s.daily_report_enabled}
+                                    disabled={!automationAvailable}
                                     onChange={(e) => saveOkrSettings({ ...s, daily_report_enabled: e.target.checked })}
                                 />
                                 <div>
@@ -354,19 +366,23 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                                         {zh ? '启用成员日报收集' : 'Enable Member Daily Collection'}
                                     </div>
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                        {zh
-                                            ? '成员只提交日报。公司日报会在次日 09:00 自动生成，周报和月报也会自动汇总。'
-                                            : 'Members only submit daily reports. The company daily report is generated at 09:00 the next day, and weekly/monthly summaries are generated automatically.'
-                                        }
+                                        {automationAvailable
+                                            ? (zh
+                                                ? '成员只提交日报。公司日报会在次日 09:00 自动生成，周报和月报也会自动汇总。'
+                                                : 'Members only submit daily reports. The company daily report is generated at 09:00 the next day, with automatic weekly and monthly summaries.')
+                                            : (zh
+                                                ? '平台未开放自动收集；当前只能由成员手动提交和更新。'
+                                                : 'Automated collection is unavailable; members can only submit and update reports manually.')}
                                     </div>
                                 </div>
                             </div>
-                            {s.daily_report_enabled && (
+                            {automationAvailable && s.daily_report_enabled && (
                                 <div style={{ marginLeft: '28px', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '12px' }}>
                                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--text-secondary)' }}>
                                         <input
                                             type="checkbox"
                                             checked={s.daily_report_skip_non_workdays ?? true}
+                                            disabled={!automationAvailable}
                                             onChange={(e) => saveOkrSettings({ ...s, daily_report_skip_non_workdays: e.target.checked })}
                                         />
                                         {zh ? '自动跳过休息日' : 'Skip non-workdays automatically'}
@@ -379,6 +395,7 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                                         type="time"
                                         className="form-input"
                                         value={s.daily_report_time}
+                                        disabled={!automationAvailable}
                                         onChange={(e) => saveOkrSettings({ ...s, daily_report_time: e.target.value })}
                                         style={{ width: '120px' }}
                                     />
@@ -386,7 +403,7 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                                         type="button"
                                         className="btn btn-secondary"
                                         onClick={runDailyCollectionTest}
-                                        disabled={dailyTestState === 'running'}
+                                        disabled={!automationAvailable || dailyTestState === 'running'}
                                         style={{ padding: '6px 12px', fontSize: '12px' }}
                                     >
                                         {dailyTestState === 'running'

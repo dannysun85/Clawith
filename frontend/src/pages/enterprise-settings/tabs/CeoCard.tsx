@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 
 import { useDialog } from '../../../components/Dialog/DialogProvider';
-import { agentApi, ceoApi, type CeoOrchestratorSettings } from '../../../services/api';
+import { agentApi, ceoApi, type CeoMigrationPreview, type CeoOrchestratorSettings } from '../../../services/api';
 import type { Agent } from '../../../types';
 
 /**
@@ -13,7 +13,8 @@ import type { Agent } from '../../../types';
  * Rendered as an independent card on the OKR/company settings tab. It never
  * mixes into the OKR (094) settings semantics: all state comes from the
  * /companies/current/ceo/* endpoints. When the rollout canary does not cover
- * this tenant (feature_available=false) the card renders nothing at all.
+ * this tenant (feature_available=false), governance controls stay disabled but
+ * the read-only legacy CEO migration preview remains visible to governors.
  */
 export default function CeoCard({ tenantId }: { tenantId: string }) {
     const { i18n } = useTranslation();
@@ -26,6 +27,9 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
     const [dailyCap, setDailyCap] = useState('20');
     const [monthlyCap, setMonthlyCap] = useState('300');
     const [maxParallel, setMaxParallel] = useState('3');
+    const [initialBriefingEnabled, setInitialBriefingEnabled] = useState(false);
+    const [initialMeetingEnabled, setInitialMeetingEnabled] = useState(false);
+    const [observerOnlyConfirmed, setObserverOnlyConfirmed] = useState(false);
     const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
     const [saveError, setSaveError] = useState('');
     const saveTimerRef = useRef<number | null>(null);
@@ -43,12 +47,22 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
         retry: false,
     });
 
+    const { data: migrationPreview, isLoading: migrationLoading } = useQuery({
+        queryKey: ['ceo-migration-preview', tenantId],
+        queryFn: () => ceoApi.migrationPreview(),
+        enabled: Boolean(tenantId) && Boolean(settings),
+        retry: false,
+    });
+
     useEffect(() => {
         if (!settings) return;
         setSelectedMemberIds(settings.meeting_member_agent_ids ?? []);
         setDailyCap(String(settings.daily_credit_cap ?? 20));
         setMonthlyCap(String(settings.monthly_credit_cap ?? 300));
         setMaxParallel(String(settings.max_parallel_delegations ?? 3));
+        setInitialBriefingEnabled(Boolean(settings.briefing_enabled));
+        setInitialMeetingEnabled(Boolean(settings.morning_meeting_enabled));
+        setObserverOnlyConfirmed(false);
     }, [settings]);
 
     useEffect(() => () => {
@@ -73,6 +87,9 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
     const enableMutation = useMutation({
         mutationFn: () => ceoApi.enable({
             member_agent_ids: selectedMemberIds,
+            briefing_enabled: initialBriefingEnabled,
+            morning_meeting_enabled: initialMeetingEnabled,
+            observer_only_confirmed: observerOnlyConfirmed,
             daily_credit_cap: Math.max(0, Number.parseInt(dailyCap, 10) || 0),
             monthly_credit_cap: Math.max(0, Number.parseInt(monthlyCap, 10) || 0),
         }),
@@ -111,14 +128,33 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
     });
 
     if (isLoading) return null;
-    // Rollout gate closed → zero entry points.
-    if (!settings?.feature_available) return null;
+    if (!settings) return null;
+
+    if (!settings.feature_available) {
+        return (
+            <div className="card" style={{ marginBottom: '24px' }}>
+                <div style={{ padding: '20px' }}>
+                    <div style={{ fontWeight: 600, fontSize: '15px' }}>{zh ? '公司 CEO 治理' : 'Company CEO governance'}</div>
+                    <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                        {zh
+                            ? '当前部署未向本公司开放 CEO 运行 canary，因此不能启用或创建 CEO。管理员仍可先检查历史 CEO 数据的只读迁移预览。'
+                            : 'The CEO runtime canary is closed for this company, so a CEO cannot be enabled or created. Governors may still inspect the read-only legacy CEO migration preview.'}
+                    </div>
+                    <MigrationPreviewPanel preview={migrationPreview} loading={migrationLoading} zh={Boolean(zh)} />
+                </div>
+            </div>
+        );
+    }
 
     const employeeAgents = (agents as Agent[]).filter(
         (agent) => !agent.is_system && agent.id !== settings.ceo_agent_id,
     );
     const configured = settings.configured;
     const enabled = settings.enabled;
+    const briefingEnabled = enabled ? settings.briefing_enabled : initialBriefingEnabled;
+    const meetingEnabled = enabled ? settings.morning_meeting_enabled : initialMeetingEnabled;
+    const cadenceIntentReady = briefingEnabled || meetingEnabled || observerOnlyConfirmed;
+    const meetingMembersReady = !meetingEnabled || selectedMemberIds.length > 0;
 
     const toggleMember = (agentId: string, checked: boolean) => {
         const next = checked
@@ -133,9 +169,21 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
     };
 
     const toggleCadence = (field: 'briefing_enabled' | 'morning_meeting_enabled', value: boolean) => {
+        if (!enabled) {
+            if (field === 'briefing_enabled') setInitialBriefingEnabled(value);
+            else setInitialMeetingEnabled(value);
+            if (value) setObserverOnlyConfirmed(false);
+            return;
+        }
         setSaveState('saving');
         setSaveError('');
         patchMutation.mutate({ [field]: value });
+    };
+
+    const enableCeo = () => {
+        setSaveState('saving');
+        setSaveError('');
+        enableMutation.mutate();
     };
 
     const saveCaps = () => {
@@ -268,6 +316,8 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                     )}
                 </div>
 
+                <MigrationPreviewPanel preview={migrationPreview} loading={migrationLoading} zh={Boolean(zh)} />
+
                 {saveState !== 'idle' && (
                     <div style={{
                         marginTop: '12px', fontSize: '12px',
@@ -329,8 +379,7 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                         </div>
                     </div>
 
-                    {configured && enabled && (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '16px' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '16px' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', maxWidth: '560px' }}>
                                 <div style={{ fontSize: '13px' }}>
                                     <div style={{ fontWeight: 500 }}>{zh ? '每日简报节奏' : 'Daily briefing cadence'}</div>
@@ -338,7 +387,7 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                                         {zh ? '每日 09:00 简报 + 18:00 日报可见性摘要 + 周一 09:00 周报' : '09:00 brief, 18:00 collection digest, Monday 09:00 weekly brief'}
                                     </div>
                                 </div>
-                                {renderToggle(settings.briefing_enabled, patchMutation.isPending, (value) => toggleCadence('briefing_enabled', value), 'briefing_enabled')}
+                                {renderToggle(briefingEnabled, patchMutation.isPending || enableMutation.isPending, (value) => toggleCadence('briefing_enabled', value), 'briefing_enabled')}
                             </div>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', maxWidth: '560px' }}>
                                 <div style={{ fontSize: '13px' }}>
@@ -347,10 +396,28 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                                         {zh ? '工作日 09:00 自动主持晨会；也可在 CEO 详情页手动开始' : 'Weekday 09:00 auto meeting; manual start stays available on the CEO page'}
                                     </div>
                                 </div>
-                                {renderToggle(settings.morning_meeting_enabled, patchMutation.isPending, (value) => toggleCadence('morning_meeting_enabled', value), 'morning_meeting_enabled')}
+                                {renderToggle(meetingEnabled, patchMutation.isPending || enableMutation.isPending, (value) => toggleCadence('morning_meeting_enabled', value), 'morning_meeting_enabled')}
                             </div>
-                        </div>
-                    )}
+                            {!enabled && !briefingEnabled && !meetingEnabled && (
+                                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, maxWidth: 620, fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={observerOnlyConfirmed}
+                                        onChange={(event) => setObserverOnlyConfirmed(event.target.checked)}
+                                    />
+                                    <span>
+                                        {zh
+                                            ? '我确认仅启用观察型 CEO 对话，不开启简报或会议节奏。系统会创建 CEO，但不会自动运行。'
+                                            : 'I confirm observer-only chat with no briefing or meeting cadence. The CEO will be created but will not run automatically.'}
+                                    </span>
+                                </label>
+                            )}
+                            {!meetingMembersReady && (
+                                <div role="alert" style={{ fontSize: 12, color: 'var(--danger, #dc2626)' }}>
+                                    {zh ? '开启会议节奏前必须至少选择一名数字员工。' : 'Select at least one digital employee before enabling the meeting cadence.'}
+                                </div>
+                            )}
+                    </div>
 
                     {configured && enabled && (
                         <div style={{ marginTop: '18px', paddingTop: '16px', borderTop: '1px solid var(--border-subtle)' }}>
@@ -406,8 +473,8 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                             <button
                                 type="button"
                                 className="btn btn-primary"
-                                disabled={enableMutation.isPending}
-                                onClick={() => enableMutation.mutate()}
+                                disabled={enableMutation.isPending || !cadenceIntentReady || !meetingMembersReady}
+                                onClick={enableCeo}
                             >
                                 {enableMutation.isPending
                                     ? (zh ? '正在启用…' : 'Enabling…')
@@ -429,5 +496,79 @@ export default function CeoCard({ tenantId }: { tenantId: string }) {
                 </div>
             </div>
         </div>
+    );
+}
+
+function MigrationPreviewPanel({
+    preview,
+    loading,
+    zh,
+}: {
+    preview: CeoMigrationPreview | undefined;
+    loading: boolean;
+    zh: boolean;
+}) {
+    const classificationLabels: Record<CeoMigrationPreview['classification'], string> = {
+        formal_ceo: zh ? '已存在正式 CEO' : 'Formal CEO exists',
+        none: zh ? '未发现 CEO' : 'No CEO found',
+        ambiguous_manual_review: zh ? '多个候选，需人工审查' : 'Multiple candidates require review',
+        legacy_contaminated_archive: zh ? '历史 CEO 有行为数据，需隔离归档' : 'Legacy CEO history requires isolated archive',
+        legacy_clean_adoptable: zh ? '干净候选，可生成采纳清单' : 'Clean candidate eligible for an adoption manifest',
+    };
+
+    return (
+        <details style={{ marginTop: 14, border: '1px solid var(--border-subtle)', borderRadius: 8, padding: '10px 12px' }}>
+            <summary style={{ cursor: 'pointer', fontSize: 13, fontWeight: 500 }}>
+                {zh ? '历史 CEO 迁移预览（只读）' : 'Legacy CEO migration preview (read-only)'}
+            </summary>
+            {loading ? (
+                <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-tertiary)' }}>
+                    {zh ? '正在检查历史数据…' : 'Inspecting legacy records…'}
+                </div>
+            ) : preview ? (
+                <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.65, color: 'var(--text-secondary)' }}>
+                    <div>
+                        <strong>{zh ? '判定：' : 'Classification: '}</strong>
+                        {classificationLabels[preview.classification]}
+                    </div>
+                    <div>
+                        <strong>{zh ? '候选数量：' : 'Candidates: '}</strong>
+                        {preview.candidates.length}
+                    </div>
+                    <div style={{ marginTop: 4 }}>
+                        <strong>{zh ? '建议：' : 'Recommendation: '}</strong>
+                        {preview.recommended_action}
+                    </div>
+                    {preview.warnings.length > 0 && (
+                        <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                            {preview.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                        </ul>
+                    )}
+                    {preview.candidates.length > 0 && (
+                        <div style={{ marginTop: 8, display: 'grid', gap: 6 }}>
+                            {preview.candidates.map((candidate) => (
+                                <div key={candidate.agent_id} style={{ padding: '8px 10px', borderRadius: 6, background: 'var(--bg-secondary)' }}>
+                                    <strong>{candidate.name}</strong>
+                                    <span style={{ marginLeft: 8, color: 'var(--text-tertiary)' }}>
+                                        {candidate.has_behavioral_history
+                                            ? (zh ? '有历史行为数据' : 'behavioral history present')
+                                            : (zh ? '无历史行为数据' : 'no behavioral history')}
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    <div style={{ marginTop: 8, color: 'var(--text-tertiary)' }}>
+                        {zh
+                            ? '此预览不读取消息或记忆正文，不修改、采纳、合并或归档任何数据。'
+                            : 'This preview reads no message or memory content and cannot mutate, adopt, merge, or archive data.'}
+                    </div>
+                </div>
+            ) : (
+                <div style={{ marginTop: 10, fontSize: 12, color: 'var(--danger, #dc2626)' }}>
+                    {zh ? '迁移预览暂时不可用。' : 'Migration preview is currently unavailable.'}
+                </div>
+            )}
+        </details>
     );
 }

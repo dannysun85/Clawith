@@ -558,21 +558,24 @@ async def get_company_or_platform_admin(current_user=Depends(get_current_user)):
 
 
 async def get_saas_admin(current_user=Depends(get_current_user)):
-    """Require the configured owner of the platform-wide SaaS console.
+    """Require global platform authority for the platform-wide SaaS console.
 
     Global billing catalogs, cross-tenant subscription assignments, credential
-    pools, and model routes share this boundary. A tenant ``org_admin`` must
-    never be able to mutate those platform-wide resources.
+    pools, and model routes share the ``platform_operator`` boundary.  The
+    server-issued global role is authoritative; an email allowlist must not
+    contradict the ``platform_admin`` surface and effective capabilities that
+    the same server issued.  A tenant ``org_admin`` still never gains this
+    authority from its company membership.
     """
     from app.services.access_control import is_platform_operator
 
-    is_platform_admin = is_platform_operator(current_user)
-    expected_email = (settings.SAAS_ADMIN_EMAIL or "").strip().lower()
-    user_email = (getattr(current_user, "email", None) or "").strip().lower()
-    if not is_platform_admin or not expected_email or user_email != expected_email:
+    if not is_platform_operator(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="SaaS admin access is restricted to the configured owner account.",
+            detail={
+                "code": "platform_operator_required",
+                "message": "Platform operator access required",
+            },
         )
     return current_user
 

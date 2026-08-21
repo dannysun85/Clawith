@@ -96,9 +96,9 @@ function ThemeColorPicker() {
                     style={{ width: '120px', fontSize: '13px', fontFamily: 'var(--font-mono)' }}
                     onKeyDown={e => e.key === 'Enter' && handleCustom()}
                 />
-                <button className="btn btn-secondary" style={{ fontSize: '12px' }} onClick={handleCustom}>Apply</button>
+                <button className="btn btn-secondary" style={{ fontSize: '12px' }} onClick={handleCustom}>{t('common.apply', 'Apply')}</button>
                 {currentColor && (
-                    <button className="btn btn-ghost" style={{ fontSize: '12px', color: 'var(--text-tertiary)' }} onClick={handleReset}>Reset</button>
+                    <button className="btn btn-ghost" style={{ fontSize: '12px', color: 'var(--text-tertiary)' }} onClick={handleReset}>{t('common.reset', 'Reset')}</button>
                 )}
                 {currentColor && (
                     <div style={{ width: '20px', height: '20px', borderRadius: '4px', background: currentColor, border: '1px solid var(--border-default)' }} />
@@ -120,6 +120,7 @@ function DouyinAccountTab({ onCreateAgent }: { onCreateAgent: () => void }) {
     const accounts = data?.accounts || [];
     const primaryAccount = accounts[0];
     const configured = !!data?.configured;
+    const directPublishAvailable = data?.direct_publish_available === true;
     const capabilityRows: Array<[string, string]> = primaryAccount?.capabilities?.length
         ? primaryAccount.capabilities.map((row: any): [string, string] => [row.label, row.status === 'ready' ? t('enterprise.douyin.ready', '已授权') : t('enterprise.douyin.missing', '缺权限')])
         : [
@@ -224,6 +225,19 @@ function DouyinAccountTab({ onCreateAgent }: { onCreateAgent: () => void }) {
                     </button>
                 </div>
             </section>
+
+            {!directPublishAvailable && (
+                <section
+                    className="card"
+                    role="status"
+                    style={{ padding: '14px 16px', borderColor: 'var(--warning)', color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6 }}
+                >
+                    {t(
+                        'enterprise.douyin.directPublishUnavailable',
+                        '当前仅支持官方账号连接、数据同步和人工确认发布包；平台不会后台直发。OAuth 与直发能力需分别完成生产验收后开放。',
+                    )}
+                </section>
+            )}
 
             {accounts.length > 0 && (
                 <section className="card" style={{ padding: '18px' }}>

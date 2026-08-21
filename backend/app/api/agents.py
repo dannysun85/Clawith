@@ -550,6 +550,7 @@ def _apply_release_capabilities(model: AgentOut) -> None:
     )
     model.approval_execution_enabled = APPROVAL_AUTOMATIC_EXECUTION_ENABLED
     model.execution_capabilities = {
+        "heartbeat_execution": bool(settings.HEARTBEAT_ENABLED),
         "schedule_execution": AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
         "task_execution": AUTOMATIC_TASK_EXECUTION_ENABLED,
         "supervision_execution": SUPERVISION_EXECUTION_ENABLED,
@@ -560,6 +561,27 @@ def _apply_release_capabilities(model: AgentOut) -> None:
         "gateway_human_delivery": False,
     }
     model.deletion_state = "cleanup_pending" if model.deletion_requested_at is not None else "active"
+
+
+def _validate_heartbeat_release_update(update_data: dict) -> None:
+    """Keep disabled proactive automation read-only while allowing cleanup."""
+
+    heartbeat_configuration_fields = {
+        "heartbeat_interval_minutes",
+        "heartbeat_active_hours",
+    }
+    if not settings.HEARTBEAT_ENABLED and (
+        update_data.get("heartbeat_enabled") is True
+        or heartbeat_configuration_fields & set(update_data)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "heartbeat_automation_unavailable",
+                "message": "Heartbeat automation is disabled by the platform operator",
+                "capability": "heartbeat_execution",
+            },
+        )
 
 
 def _format_agent_setup_error(stage: str, exc: Exception) -> str:
@@ -1739,6 +1761,7 @@ async def update_agent(
     )
 
     update_data = data.model_dump(exclude_unset=True)
+    _validate_heartbeat_release_update(update_data)
 
     # These fields select a subscription tier in the shared model pool; they
     # never grant direct access to a tenant-owned model object. Validate any

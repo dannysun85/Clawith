@@ -25,6 +25,11 @@ export default function MindTab({
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
+            {!canEdit && (
+                <div role="note" style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--bg-secondary)', fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                    {t('agent.permissions.manageRequiredForMind', 'You have use access. Editing identity, memory, or heartbeat instructions requires manage access.')}
+                </div>
+            )}
             <div>
                 <h3 style={{ marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <IconDna size={18} stroke={1.8} /> {t('agent.soul.title')}

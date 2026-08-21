@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models.agent import Agent, AgentPermission
 from app.models.org import AgentAgentRelationship, OrgMember
 from app.models.user import User
+from app.services.access_control import is_company_governor
 from app.services.agent_directory import DirectoryQueryError, query_agent_directory
 
 router = APIRouter(prefix="/agents/{agent_id}/directory", tags=["agent-directory"])
@@ -69,6 +70,9 @@ async def get_agent_directory(
             limit=limit,
             offset=offset,
             max_limit=100,
+            capability_projection=(
+                "exact" if is_company_governor(current_user) else "safe"
+            ),
         )
     except DirectoryQueryError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc

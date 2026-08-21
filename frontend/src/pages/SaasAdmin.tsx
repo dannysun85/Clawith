@@ -192,6 +192,46 @@ type PaymentOrder = {
     paid_at?: string | null;
 };
 
+type ManualOrderDisposition =
+    | 'keep_pending'
+    | 'mark_paid'
+    | 'cancel_expired'
+    | 'cancel_test'
+    | 'cancel_invalid'
+    | 'restore_pending';
+
+type ManualOrderDecision = {
+    id: string;
+    order_id: string;
+    tenant_id: string;
+    disposition: ManualOrderDisposition;
+    evidence_ref: string;
+    reason: string;
+    previous_status: string;
+    resulting_status: string;
+    rollback_of_decision_id?: string | null;
+    created_at: string;
+};
+
+type ManualOrderDecisionResult = {
+    order: PaymentOrder;
+    decision: ManualOrderDecision;
+    replayed: boolean;
+};
+
+type ManualOrderDecisionRequest = {
+    order: PaymentOrder;
+    disposition: ManualOrderDisposition;
+    evidenceRef: string;
+    reason: string;
+    rollbackOfDecisionId?: string | null;
+    idempotencyKey: string;
+};
+
+type ManualOrderDecisionDraft = ManualOrderDecisionRequest & {
+    confirmed: boolean;
+};
+
 type InitializeFreeResult = {
     total_candidates: number;
     created: number;
@@ -642,14 +682,16 @@ function RuntimeModelSettingsCard() {
     );
 }
 
-const MEDIA_LABELS: Record<MediaRoute['modality'], string> = {
-    image: '图片',
-    audio: '语音',
-    music: '音乐',
-    video: '视频',
+const MEDIA_LABELS: Record<MediaRoute['modality'], { zh: string; en: string }> = {
+    image: { zh: '图片', en: 'Image' },
+    audio: { zh: '语音', en: 'Speech' },
+    music: { zh: '音乐', en: 'Music' },
+    video: { zh: '视频', en: 'Video' },
 };
 
 function MediaRoutesTab() {
+    const { i18n } = useTranslation();
+    const isZh = i18n.language?.startsWith('zh');
     const { data: routes = [], isLoading, error } = useQuery({
         queryKey: ['saas-media-routes'],
         queryFn: () => fetchJson<MediaRoute[]>('/saas/media-routes'),
@@ -658,28 +700,31 @@ function MediaRoutesTab() {
     return (
         <div>
             <div className="card" style={{ marginBottom: 16, padding: 16 }}>
-                <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>媒体生成路由（平台统一配置）</div>
+                <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>
+                    {isZh ? '媒体生成路由（平台统一配置）' : 'Media generation routes (platform-managed)'}
+                </div>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                    “输入理解路由”和“媒体生成执行策略”是两条独立链路。视频优先消耗 MiniMax Plan 每账号每日 3 次额度，额度耗尽后自动接续火山 Agent Plan；只有供应商明确拒绝且尚未接受任务时才切换，accepted/unknown 均禁止重复提交。
-                    火山档位固定为 Lite=Seedance 2.0-mini/480P、Pro=2.0-fast/720P、Ultra=标准 2.0/720P；Ultra 只有请求明确指定 1080P 才升级。页面严格区分账号 readiness、真实生成 receipt 与人工商用品质。
+                    {isZh
+                        ? '“输入理解路由”和“媒体生成执行策略”是两条独立链路。视频优先消耗 MiniMax Plan 每账号每日 3 次额度，额度耗尽后自动接续火山 Agent Plan；只有供应商明确拒绝且尚未接受任务时才切换，accepted/unknown 均禁止重复提交。火山档位固定为 Lite=Seedance 2.0-mini/480P、Pro=2.0-fast/720P、Ultra=标准 2.0/720P；Ultra 只有请求明确指定 1080P 才升级。页面严格区分账号 readiness、真实生成 receipt 与人工商用品质。'
+                        : 'Input-understanding routes and media-generation execution strategies are separate chains. Video first uses the MiniMax Plan allowance of three runs per account per day, then continues with Volcengine Agent Plan after exhaustion. Failover is allowed only after an explicit provider rejection before acceptance; accepted or unknown submissions must never be duplicated. Volcengine tiers are fixed at Lite=Seedance 2.0-mini/480P, Pro=2.0-fast/720P, and Ultra=standard 2.0/720P; Ultra upgrades to 1080P only when explicitly requested. Account readiness, real generation receipts, and human commercial-quality review remain distinct.'}
                 </div>
             </div>
             {error && (
                 <div className="card" style={{ marginBottom: 16, padding: 14, color: 'var(--error)' }}>
-                    媒体路由加载失败：{error instanceof Error ? error.message : String(error)}
+                    {isZh ? '媒体路由加载失败：' : 'Failed to load media routes: '}{error instanceof Error ? error.message : String(error)}
                 </div>
             )}
             <DataTable
                 rows={routes}
-                empty={isLoading ? '正在读取生产媒体路由…' : '暂无媒体路由'}
-                renderHeader={() => <><th>媒体生成策略</th><th>Tier</th><th>MiniMax 免费路线</th><th>MiniMax 参数</th><th>Provider 报价</th><th>可用性</th><th>配置来源</th><th /></>}
-                renderRow={(route) => <MediaRouteRow route={route} />}
+                empty={isLoading ? (isZh ? '正在读取生产媒体路由…' : 'Loading production media routes…') : (isZh ? '暂无媒体路由' : 'No media routes')}
+                renderHeader={() => <><th>{isZh ? '媒体生成策略' : 'Media strategy'}</th><th>Tier</th><th>MiniMax</th><th>{isZh ? '媒体参数' : 'Media parameters'}</th><th>{isZh ? '供应商报价' : 'Provider quote'}</th><th>{isZh ? '可用性' : 'Availability'}</th><th>{isZh ? '配置来源' : 'Source'}</th><th /></>}
+                renderRow={(route) => <MediaRouteRow route={route} isZh={isZh} />}
             />
         </div>
     );
 }
 
-function MediaRouteRow({ route }: { route: MediaRoute }) {
+function MediaRouteRow({ route, isZh }: { route: MediaRoute; isZh: boolean }) {
     const qc = useQueryClient();
     const [model, setModel] = useState(route.model);
     const [enabled, setEnabled] = useState(route.enabled);
@@ -697,7 +742,7 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
             { method: 'PATCH', body: JSON.stringify(data) },
         ),
         onSuccess: () => qc.invalidateQueries({ queryKey: ['saas-media-routes'] }),
-        onError: (err) => window.alert(`保存失败：${err instanceof Error ? err.message : String(err)}`),
+        onError: (err) => window.alert(`${isZh ? '保存失败：' : 'Save failed: '}${err instanceof Error ? err.message : String(err)}`),
     });
 
     const setSetting = (key: string, value: string | number) => {
@@ -710,71 +755,77 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
             ? 'MiniMax'
             : provider;
     const statusLabel = route.capability_status === 'available'
-        ? '账号线路可路由'
+        ? (isZh ? '账号线路可路由' : 'Account route available')
         : route.capability_status === 'degraded'
-            ? '仅降级线路可路由'
-            : '不可路由';
+            ? (isZh ? '仅降级线路可路由' : 'Fallback route only')
+            : (isZh ? '不可路由' : 'Unavailable');
     const statusColor = route.capability_status === 'available'
         ? 'var(--success)'
         : route.capability_status === 'degraded'
             ? 'var(--warning)'
             : 'var(--error)';
     const readinessLabel = route.readiness_status === 'generation_observed'
-        ? '真实生成成功，质量未评审'
+        ? (isZh ? '真实生成成功，质量未评审' : 'Real generation observed; quality not reviewed')
         : route.readiness_status === 'generation_unverified'
-            ? '账号已验证，生成未验证'
+            ? (isZh ? '账号已验证，生成未验证' : 'Account verified; generation unverified')
             : route.readiness_status === 'account_verification_required'
-                ? '已配置，等待账号验证'
-                : '尚未配置账号';
+                ? (isZh ? '已配置，等待账号验证' : 'Configured; account verification required')
+                : (isZh ? '尚未配置账号' : 'Account not configured');
     const receiptTime = (receipt: Record<string, unknown> | null | undefined, field: string) => {
         const value = receipt?.[field];
         return typeof value === 'string' && value ? new Date(value).toLocaleString() : null;
     };
     const strategyLabel = (strategy: string) => strategy === 'commercial_quality'
-        ? '商用品质'
+        ? (isZh ? '商用品质' : 'Commercial quality')
         : strategy === 'creative_exploration'
-            ? '创意探索'
-            : '默认策略';
+            ? (isZh ? '创意探索' : 'Creative exploration')
+            : (isZh ? '默认策略' : 'Default strategy');
 
     return (
         <>
             <td style={{ minWidth: 180 }}>
-                <strong>{MEDIA_LABELS[route.modality]}</strong>
+                <strong>{isZh ? MEDIA_LABELS[route.modality].zh : MEDIA_LABELS[route.modality].en}</strong>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4 }}>
-                    账号池策略基线：{route.provider_order.map(providerLabel).join(' → ')}
+                    {isZh ? '账号池策略基线：' : 'Account-pool baseline: '}{route.provider_order.map(providerLabel).join(' → ')}
                 </div>
                 <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 2 }}>
-                    当前可用：{route.available_providers.length > 0
+                    {isZh ? '当前可用：' : 'Currently available: '}{route.available_providers.length > 0
                         ? route.available_providers.map(providerLabel).join('、')
-                        : '无'}
+                        : (isZh ? '无' : 'None')}
                 </div>
                 <div style={{ color: statusColor, fontSize: 11, fontWeight: 650, marginTop: 4 }}>
-                    {statusLabel} · 兼容策略基线 {route.primary_provider ? providerLabel(route.primary_provider) : '无'}
+                    {statusLabel} · {isZh ? '兼容策略基线 ' : 'Compatibility baseline '}{route.primary_provider ? providerLabel(route.primary_provider) : (isZh ? '无' : 'None')}
                 </div>
                 <div role="status" style={{ color: 'var(--text-secondary)', fontSize: 10, lineHeight: 1.5, marginTop: 3 }}>
-                    {readinessLabel}。此处仅表示账号 readiness，不代表任务实际执行；实际 provider/model 只以任务 receipt 为准。{route.recommended_action}
+                    {readinessLabel}. {isZh
+                        ? '此处仅表示账号 readiness，不代表任务实际执行；实际 provider/model 只以任务 receipt 为准。'
+                        : 'This reports account readiness only, not actual task execution. The task receipt is authoritative for the provider and model.'}{route.recommended_action ? ` ${route.recommended_action}` : ''}
                 </div>
                 <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>
                     {(route.execution_strategies ?? []).map((strategy) => (
                         <div key={strategy.strategy} style={{ color: 'var(--text-secondary)', fontSize: 10 }}>
                             {strategyLabel(strategy.strategy)}：{strategy.provider_order.map(providerLabel).join(' → ')}；
                             {strategy.preferred_ready
-                                ? `首选 ${providerLabel(strategy.preferred_provider)} 可执行`
+                                ? (isZh ? `首选 ${providerLabel(strategy.preferred_provider)} 可执行` : `Preferred ${providerLabel(strategy.preferred_provider)} is executable`)
                                 : strategy.alternate_provider
-                                    ? `首选不可用，改用 ${providerLabel(strategy.alternate_provider)}${strategy.alternate_confirmation_required ? '需确认' : '自动接续'}`
-                                    : '当前不可执行'}
+                                    ? (isZh
+                                        ? `首选不可用，改用 ${providerLabel(strategy.alternate_provider)}${strategy.alternate_confirmation_required ? '需确认' : '自动接续'}`
+                                        : `Preferred route unavailable; use ${providerLabel(strategy.alternate_provider)} ${strategy.alternate_confirmation_required ? 'after confirmation' : 'automatically'}`)
+                                    : (isZh ? '当前不可执行' : 'Not currently executable')}
                         </div>
                     ))}
                 </div>
                 {route.modality === 'video' && route.volcengine_profile && (
                     <div style={{ color: 'var(--text-secondary)', fontSize: 10, marginTop: 5 }}>
-                        火山接续档位：{route.volcengine_profile.model} / {route.volcengine_profile.resolution}
+                        {isZh ? '火山接续档位：' : 'Volcengine continuation tier: '}{route.volcengine_profile.model} / {route.volcengine_profile.resolution}
                     </div>
                 )}
                 {route.modality === 'video' && route.minimax_allowance && (
                     <div style={{ color: route.minimax_allowance.remaining > 0 ? 'var(--success)' : 'var(--warning)', fontSize: 10, marginTop: 3 }}>
-                        MiniMax 日额度：已用 {route.minimax_allowance.used}/{route.minimax_allowance.quota}，剩余 {route.minimax_allowance.remaining}（{route.minimax_allowance.allowance_date}）
-                        {route.minimax_allowance.excluded_accounts > 0 && `；${route.minimax_allowance.excluded_accounts} 个账号当前不可执行`}
+                        {isZh ? 'MiniMax 日额度：已用 ' : 'MiniMax daily allowance: used '}{route.minimax_allowance.used}/{route.minimax_allowance.quota}{isZh ? '，剩余 ' : ', remaining '}{route.minimax_allowance.remaining} ({route.minimax_allowance.allowance_date})
+                        {route.minimax_allowance.excluded_accounts > 0 && (isZh
+                            ? `；${route.minimax_allowance.excluded_accounts} 个账号当前不可执行`
+                            : `; ${route.minimax_allowance.excluded_accounts} account(s) currently unavailable`)}
                     </div>
                 )}
                 <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>
@@ -783,10 +834,10 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                         const generationTime = receiptTime(item.generation_receipt, 'completed_at');
                         return (
                             <div key={item.provider} style={{ color: 'var(--text-tertiary)', fontSize: 10 }}>
-                                {providerLabel(item.provider)}：{item.configured ? '已配置' : '未配置'} / {item.account_verified ? '账号已验证' : '账号未验证'} / {item.generation_observed ? '生成已观察' : '生成未验证'}
+                                {providerLabel(item.provider)}: {item.configured ? (isZh ? '已配置' : 'configured') : (isZh ? '未配置' : 'not configured')} / {item.account_verified ? (isZh ? '账号已验证' : 'account verified') : (isZh ? '账号未验证' : 'account unverified')} / {item.generation_observed ? (isZh ? '生成已观察' : 'generation observed') : (isZh ? '生成未验证' : 'generation unverified')}
                                 {item.plan_tiers.length > 0 && ` / plan=${item.plan_tiers.join(',')}`}
-                                {accountTime && ` / 鉴权 ${accountTime}`}
-                                {generationTime && ` / 生成 ${generationTime}`}
+                                {accountTime && ` / ${isZh ? '鉴权' : 'auth'} ${accountTime}`}
+                                {generationTime && ` / ${isZh ? '生成' : 'generation'} ${generationTime}`}
                             </div>
                         );
                     })}
@@ -799,7 +850,7 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                 </select>
             </td>
             <td style={{ minWidth: 230 }}>
-                <MediaQualityFields modality={route.modality} tier={route.tier} settings={settings} onChange={setSetting} />
+                <MediaQualityFields modality={route.modality} tier={route.tier} settings={settings} onChange={setSetting} isZh={isZh} />
             </td>
             <td style={{ whiteSpace: 'nowrap' }}>
                 {route.modality === 'video' && route.provider_quotes
@@ -808,26 +859,26 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                             {providerLabel(provider)}：{quote.credits} Credits/{quote.duration_seconds}s
                         </div>
                     ))
-                    : route.estimated_credits == null ? '按量' : `${route.estimated_credits} Credits/${route.billing_unit}`}
+                    : route.estimated_credits == null ? (isZh ? '按量' : 'Usage-based') : `${route.estimated_credits} Credits/${route.billing_unit}`}
             </td>
             <td style={{ minWidth: 130 }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                    <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> 路由启用
+                    <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> {isZh ? '路由启用' : 'Route enabled'}
                 </label>
                 <div style={{ color: statusColor, fontSize: 11 }}>
                     {route.available
-                        ? `${route.available_providers.length} 个账号验证路径 · ${readinessLabel}`
+                        ? `${route.available_providers.length} ${isZh ? '个账号验证路径' : 'verified account path(s)'} · ${readinessLabel}`
                         : !route.pool_available
                             ? readinessLabel
                             : !route.tool_enabled
-                                ? '工具已停用'
-                                : '路由已停用'}
+                                ? (isZh ? '工具已停用' : 'Tool disabled')
+                                : (isZh ? '路由已停用' : 'Route disabled')}
                 </div>
             </td>
-            <td>{route.source === 'override' ? '后台覆盖' : '系统默认'}</td>
+            <td>{route.source === 'override' ? (isZh ? '后台覆盖' : 'Admin override') : (isZh ? '系统默认' : 'System default')}</td>
             <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                <button className="btn btn-primary" disabled={update.isPending} onClick={() => update.mutate(payload)}>保存</button>
-                <button className="btn btn-ghost" disabled={update.isPending || route.source === 'default'} onClick={() => update.mutate({ reset_to_default: true })}>恢复默认</button>
+                <button className="btn btn-primary" disabled={update.isPending} onClick={() => update.mutate(payload)}>{isZh ? '保存' : 'Save'}</button>
+                <button className="btn btn-ghost" disabled={update.isPending || route.source === 'default'} onClick={() => update.mutate({ reset_to_default: true })}>{isZh ? '恢复默认' : 'Restore default'}</button>
             </td>
         </>
     );
@@ -838,13 +889,15 @@ function MediaQualityFields({
     tier,
     settings,
     onChange,
+    isZh,
 }: {
     modality: MediaRoute['modality'];
     tier: MediaRoute['tier'];
     settings: Record<string, string | number | boolean>;
     onChange: (key: string, value: string | number) => void;
+    isZh: boolean;
 }) {
-    if (modality === 'image') return <span style={{ color: 'var(--text-tertiary)' }}>由 image-01 输出规格决定</span>;
+    if (modality === 'image') return <span style={{ color: 'var(--text-tertiary)' }}>{isZh ? '由 image-01 输出规格决定' : 'Defined by the image-01 output contract'}</span>;
     if (modality === 'video') {
         const allowed = tier === 'lite'
             ? [{ duration: 6, resolution: '768P' }]
@@ -869,7 +922,7 @@ function MediaQualityFields({
                 >
                     {allowed.map((pair) => (
                         <option key={`${pair.duration}:${pair.resolution}`} value={`${pair.duration}:${pair.resolution}`}>
-                            {pair.duration} 秒 / {pair.resolution}
+                            {pair.duration} {isZh ? '秒' : 'seconds'} / {pair.resolution}
                         </option>
                     ))}
                 </select>
@@ -1093,6 +1146,9 @@ function TenantsTab() {
 function ManualOrdersTab() {
     const qc = useQueryClient();
     const [statusFilter, setStatusFilter] = useState<'pending' | 'all'>('pending');
+    const [retryRequest, setRetryRequest] = useState<ManualOrderDecisionRequest | null>(null);
+    const [decisionDraft, setDecisionDraft] = useState<ManualOrderDecisionDraft | null>(null);
+    const [lastDecisionResult, setLastDecisionResult] = useState<ManualOrderDecisionResult | null>(null);
     const orders = useQuery({
         queryKey: ['saas-orders', statusFilter],
         queryFn: () => fetchJson<PaymentOrder[]>(
@@ -1100,26 +1156,152 @@ function ManualOrdersTab() {
         ),
         refetchInterval: 30_000,
     });
-    const markPaid = useMutation({
-        mutationFn: (orderId: string) => fetchJson<PaymentOrder>(`/saas/orders/${orderId}/mark-paid`, { method: 'POST' }),
-        onSuccess: () => {
+    const decisions = useQuery({
+        queryKey: ['saas-order-decisions'],
+        queryFn: () => fetchJson<ManualOrderDecision[]>('/saas/order-decisions?limit=500'),
+        refetchInterval: 30_000,
+    });
+    const latestDecisionByOrder = useMemo(() => {
+        const latest = new Map<string, ManualOrderDecision>();
+        for (const decision of decisions.data ?? []) {
+            if (!latest.has(decision.order_id)) latest.set(decision.order_id, decision);
+        }
+        return latest;
+    }, [decisions.data]);
+    const decideOrder = useMutation({
+        mutationFn: (request: ManualOrderDecisionRequest) => {
+            const path = request.disposition === 'mark_paid'
+                ? `/saas/orders/${request.order.id}/mark-paid`
+                : `/saas/orders/${request.order.id}/operator-decisions`;
+            return fetchJson<ManualOrderDecisionResult>(path, {
+                method: 'POST',
+                headers: { 'Idempotency-Key': request.idempotencyKey },
+                body: JSON.stringify({
+                    expected_tenant_id: request.order.tenant_id,
+                    expected_status: request.disposition === 'restore_pending' ? 'canceled' : 'pending',
+                    disposition: request.disposition,
+                    evidence_ref: request.evidenceRef,
+                    reason: request.reason,
+                    rollback_of_decision_id: request.rollbackOfDecisionId ?? null,
+                }),
+            });
+        },
+        onSuccess: (result) => {
+            setRetryRequest(null);
+            setDecisionDraft(null);
+            setLastDecisionResult(result);
             qc.invalidateQueries({ queryKey: ['saas-orders'] });
+            qc.invalidateQueries({ queryKey: ['saas-order-decisions'] });
             qc.invalidateQueries({ queryKey: ['saas-tenants'] });
         },
+        onError: (_error, request) => setRetryRequest(request),
     });
 
-    const confirmManualPayment = (order: PaymentOrder) => {
-        const amount = `${order.currency} ${(order.amount_cents / 100).toFixed(2)}`;
-        if (window.confirm(`确认已核对订单 ${order.id} 的线下收款 ${amount}？确认后将立即发放套餐或 Credits；仅可用于已到账款项或明确标记的本地测试数据。`)) {
-            markPaid.mutate(order.id);
-        }
+    const openDecisionForm = (
+        order: PaymentOrder,
+        disposition: ManualOrderDisposition,
+        rollbackOfDecisionId?: string,
+    ) => {
+        setLastDecisionResult(null);
+        setDecisionDraft({
+            order,
+            disposition,
+            evidenceRef: '',
+            reason: '',
+            rollbackOfDecisionId,
+            confirmed: false,
+            idempotencyKey: `manual-order-${crypto.randomUUID()}`,
+        });
+    };
+
+    const decisionRequiresConfirmation = decisionDraft?.disposition !== 'keep_pending';
+    const decisionFormValid = Boolean(
+        decisionDraft
+        && decisionDraft.evidenceRef.trim().length >= 8
+        && decisionDraft.reason.trim().length >= 8
+        && (!decisionRequiresConfirmation || decisionDraft.confirmed),
+    );
+
+    const submitDecision = () => {
+        if (!decisionDraft || !decisionFormValid) return;
+        decideOrder.mutate({
+            order: decisionDraft.order,
+            disposition: decisionDraft.disposition,
+            evidenceRef: decisionDraft.evidenceRef.trim(),
+            reason: decisionDraft.reason.trim(),
+            rollbackOfDecisionId: decisionDraft.rollbackOfDecisionId,
+            idempotencyKey: decisionDraft.idempotencyKey,
+        });
     };
 
     return (
         <div>
             <div className="card" style={{ marginBottom: 16, padding: 14, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                这里只处理 provider=manual 的人工订单。平台运营人员必须先在线下核对收款，再确认发放；微信等供应商订单只能由已验证的支付回调或主动查单完成，不能在此人工置为已支付。
+                这里只处理 provider=manual 的人工订单。每次保留、确认收款、取消或恢复都必须填写凭证与原因，并以企业、预期状态和幂等键锁定。微信等供应商订单只能由已验证的支付回调或主动查单完成，不能在此人工置为已支付。
             </div>
+            {retryRequest && (
+                <div className="card" style={{ marginBottom: 12, padding: 14, color: 'var(--warning)' }}>
+                    上次操作结果未知。请使用同一个幂等键重试，避免重复发放。
+                    <button className="btn btn-secondary" style={{ marginLeft: 10 }} disabled={decideOrder.isPending} onClick={() => decideOrder.mutate(retryRequest)}>重试上次操作</button>
+                </div>
+            )}
+            {lastDecisionResult && (
+                <div className="card" role="status" style={{ marginBottom: 12, padding: 14, color: 'var(--success)' }}>
+                    处置已写入：订单状态 {lastDecisionResult.order.status}；审计凭证 {lastDecisionResult.decision.id}
+                    {lastDecisionResult.replayed ? '（幂等重放，未重复执行）' : '（首次执行）'}。
+                </div>
+            )}
+            {decisionDraft && (
+                <section className="card" aria-labelledby="manual-order-decision-title" style={{ marginBottom: 12, padding: 16 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 12, marginBottom: 14 }}>
+                        <div>
+                            <h2 id="manual-order-decision-title" style={{ margin: 0, fontSize: 16 }}>复核人工订单处置</h2>
+                            <div style={{ marginTop: 6, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.6 }}>
+                                订单 {decisionDraft.order.id} · 企业 {decisionDraft.order.tenant_id} · {decisionDraft.order.currency} {(decisionDraft.order.amount_cents / 100).toFixed(2)} · {decisionDraft.disposition}
+                            </div>
+                        </div>
+                        <button className="btn btn-secondary" disabled={decideOrder.isPending} onClick={() => setDecisionDraft(null)}>取消</button>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 }}>
+                        <Field label="凭证编号或工单引用">
+                            <input
+                                className="form-input"
+                                autoFocus
+                                value={decisionDraft.evidenceRef}
+                                minLength={8}
+                                placeholder="至少 8 个字符；不要填写密码或密钥"
+                                onChange={(event) => setDecisionDraft({ ...decisionDraft, evidenceRef: event.target.value })}
+                            />
+                        </Field>
+                        <Field label="处置原因">
+                            <textarea
+                                className="form-input"
+                                rows={3}
+                                value={decisionDraft.reason}
+                                minLength={8}
+                                placeholder="至少 8 个字符，说明业务依据"
+                                onChange={(event) => setDecisionDraft({ ...decisionDraft, reason: event.target.value })}
+                            />
+                        </Field>
+                    </div>
+                    {decisionRequiresConfirmation && (
+                        <label style={{ display: 'flex', alignItems: 'start', gap: 8, marginTop: 12, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.6 }}>
+                            <input
+                                type="checkbox"
+                                checked={decisionDraft.confirmed}
+                                onChange={(event) => setDecisionDraft({ ...decisionDraft, confirmed: event.target.checked })}
+                            />
+                            <span>我已核对企业、金额、当前状态和凭证；确认写入不可重复的审计记录并执行 {decisionDraft.disposition}。</span>
+                        </label>
+                    )}
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
+                        <button className="btn btn-secondary" disabled={decideOrder.isPending} onClick={() => setDecisionDraft(null)}>返回订单</button>
+                        <button className="btn btn-primary" disabled={!decisionFormValid || decideOrder.isPending} onClick={submitDecision}>
+                            {decideOrder.isPending ? '正在提交…' : '提交处置'}
+                        </button>
+                    </div>
+                </section>
+            )}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 10, marginBottom: 12 }}>
                 <Field label="状态">
                     <select className="form-input" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as 'pending' | 'all')}>
@@ -1129,17 +1311,22 @@ function ManualOrdersTab() {
                 </Field>
                 <button className="btn btn-secondary" disabled={orders.isFetching} onClick={() => void orders.refetch()}>立即刷新</button>
             </div>
-            {(orders.error || markPaid.error) && (
+            {(orders.error || decisions.error || decideOrder.error) && (
                 <div className="card" style={{ marginBottom: 12, padding: 14, color: 'var(--error)' }}>
-                    订单操作失败：{String(orders.error || markPaid.error)}
+                    订单操作失败：{String(orders.error || decisions.error || decideOrder.error)}
                 </div>
             )}
             <DataTable
                 rows={orders.data ?? []}
                 empty={orders.isLoading ? '正在读取订单…' : '当前没有订单'}
                 renderHeader={() => <><th>订单 / 企业</th><th>内容</th><th>金额</th><th>通道</th><th>状态</th><th>创建时间</th><th /></>}
-                renderRow={(order) => (
-                    <>
+                renderRow={(order) => {
+                    const latestDecision = latestDecisionByOrder.get(order.id);
+                    const restorable = Boolean(order.provider === 'manual'
+                        && order.status === 'canceled'
+                        && latestDecision
+                        && ['cancel_expired', 'cancel_test', 'cancel_invalid'].includes(latestDecision.disposition));
+                    return <>
                         <td style={{ minWidth: 230 }}>
                             <strong title={order.id}>{order.id}</strong>
                             <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 4 }} title={order.tenant_id}>企业 {order.tenant_id}</div>
@@ -1147,20 +1334,29 @@ function ManualOrdersTab() {
                         <td>{order.type === 'topup' ? `${(order.credits ?? 0).toLocaleString()} Credits` : order.type}</td>
                         <td>{order.currency} {(order.amount_cents / 100).toFixed(2)}</td>
                         <td>{order.provider}</td>
-                        <td>{order.status === 'pending' && order.provider === 'manual' ? '待人工处理' : order.status}</td>
+                        <td>
+                            {order.status === 'pending' && order.provider === 'manual' ? '待人工处理' : order.status}
+                            {latestDecision && <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 4 }}>最近处置：{latestDecision.disposition}</div>}
+                        </td>
                         <td style={{ whiteSpace: 'nowrap' }}>{new Date(order.created_at).toLocaleString()}</td>
                         <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                             {order.provider === 'manual' && order.status === 'pending' && (
-                                <button className="btn btn-primary" disabled={markPaid.isPending} onClick={() => confirmManualPayment(order)}>
-                                    {markPaid.isPending && markPaid.variables === order.id ? '处理中…' : '确认人工收款'}
-                                </button>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 6 }}>
+                                    <button className="btn btn-primary" disabled={decideOrder.isPending} onClick={() => openDecisionForm(order, 'mark_paid')}>确认人工收款</button>
+                                    <button className="btn btn-secondary" disabled={decideOrder.isPending} onClick={() => openDecisionForm(order, 'keep_pending')}>保留待处理</button>
+                                    <button className="btn btn-secondary" disabled={decideOrder.isPending} onClick={() => openDecisionForm(order, 'cancel_expired')}>取消过期</button>
+                                    <button className="btn btn-secondary" disabled={decideOrder.isPending} onClick={() => openDecisionForm(order, 'cancel_test')}>取消测试单</button>
+                                </div>
+                            )}
+                            {restorable && (
+                                <button className="btn btn-secondary" disabled={decideOrder.isPending} onClick={() => openDecisionForm(order, 'restore_pending', latestDecision!.id)}>撤销取消</button>
                             )}
                             {order.provider !== 'manual' && order.status === 'pending' && (
                                 <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>等待供应商凭证</span>
                             )}
                         </td>
-                    </>
-                )}
+                    </>;
+                }}
             />
         </div>
     );

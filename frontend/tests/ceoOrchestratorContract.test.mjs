@@ -56,10 +56,13 @@ test('CEO brief panel is invisible unless this Agent is the enabled CEO', () => 
   assert.doesNotMatch(briefPanel, /meeting_group_id/);
   assert.match(briefPanel, /ceoApi\.companyBrief/);
   assert.match(briefPanel, /ceoApi\.startMeeting/);
+  assert.match(briefPanel, /ceoStatus\.can_start_meeting && <button/);
 });
 
-test('CEO settings card renders nothing when the rollout gate is closed', () => {
-  assert.match(ceoCard, /if \(!settings\?\.feature_available\) return null/);
+test('CEO settings card keeps only the read-only migration preview when the rollout gate is closed', () => {
+  assert.match(ceoCard, /if \(!settings\.feature_available\)/);
+  assert.match(ceoCard, /<MigrationPreviewPanel preview=\{migrationPreview\}/);
+  assert.match(ceoCard, /cannot be enabled or created/);
   assert.match(ceoCard, /ceoApi\.enable/);
   assert.match(ceoCard, /ceoApi\.updateSettings/);
   assert.match(ceoCard, /daily_credit_cap/);

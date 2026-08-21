@@ -353,7 +353,12 @@ export default function Employees() {
         queryKey: ['workforce-topology', currentTenant, 24],
         queryFn: () => workforceApi.topology(24),
         retry: false,
-        refetchInterval: (query) => query.state.status === 'error' ? false : 5_000,
+        refetchInterval: (query) => (
+            query.state.status === 'error'
+            || (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+                ? false
+                : 15_000
+        ),
         refetchIntervalInBackground: false,
         refetchOnMount: 'always',
         refetchOnWindowFocus: 'always',
@@ -484,7 +489,9 @@ export default function Employees() {
         if (!topology) return undefined;
         const nodes = scope === 'managed'
             ? topology.nodes.filter((node) => node.can_manage)
-            : topology.nodes;
+            : scope === 'governance'
+                ? topology.nodes.filter((node) => node.visibility !== 'private')
+                : topology.nodes;
         const nodeIds = new Set(nodes.map((node) => node.id));
         return {
             ...topology,
@@ -540,7 +547,7 @@ export default function Employees() {
                 {canGovernAgents && (
                     <button type="button" role="tab" aria-selected={scope === 'governance'} className={scope === 'governance' ? 'is-active' : ''} onClick={() => setScope('governance')}>
                         {isChinese ? '公司治理范围' : 'Company governance'}
-                        <small>{topology?.nodes.length ?? 0}</small>
+                        <small>{topology?.nodes.filter((node) => node.visibility !== 'private').length ?? 0}</small>
                     </button>
                 )}
             </div>

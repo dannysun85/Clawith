@@ -688,7 +688,7 @@ async def _classify_plan_change(
         .where(
             PaymentOrder.tenant_id == tenant_id,
             PaymentOrder.type == "subscribe",
-            PaymentOrder.status == "paid",
+            PaymentOrder.status.in_(("paid", "partially_refunded")),
         )
         .order_by(PaymentOrder.paid_at.desc())
         .limit(1)

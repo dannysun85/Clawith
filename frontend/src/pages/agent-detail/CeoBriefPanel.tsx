@@ -40,7 +40,7 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
     } = useQuery({
         queryKey: ['ceo-company-brief', agentId],
         queryFn: () => ceoApi.companyBrief(agentId!),
-        enabled: visible,
+        enabled: visible && Boolean(ceoStatus?.can_read_brief),
         retry: false,
         refetchInterval: (query) => (query.state.status === 'error' ? false : 60_000),
     });
@@ -84,6 +84,7 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
                         {zh ? '来自员工拓扑与 OKR 读模型的只读组合，不写入任何业务数据。' : 'A read-only composition of the workforce topology and OKR read models.'}
                     </div>
                 </div>
+                {ceoStatus.can_read_brief && (
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                     <button
                         type="button"
@@ -93,24 +94,33 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
                     >
                         {isFetching ? (zh ? '刷新中…' : 'Refreshing…') : (zh ? '刷新' : 'Refresh')}
                     </button>
-                    <button
+                    {ceoStatus.can_start_meeting && <button
                         type="button"
                         className="btn btn-secondary"
                         disabled={meetingMutation.isPending}
                         onClick={() => meetingMutation.mutate('morning')}
                     >
                         {meetingMutation.isPending ? (zh ? '注册中…' : 'Starting…') : (zh ? '开始晨会' : 'Start morning meeting')}
-                    </button>
-                    <button
+                    </button>}
+                    {ceoStatus.can_start_meeting && <button
                         type="button"
                         className="btn btn-ghost"
                         disabled={meetingMutation.isPending}
                         onClick={() => meetingMutation.mutate('weekly')}
                     >
                         {zh ? '开始周会' : 'Start weekly meeting'}
-                    </button>
+                    </button>}
                 </div>
+                )}
             </div>
+
+            {!ceoStatus.can_read_brief && (
+                <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 8, background: 'var(--bg-secondary)', fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {zh
+                        ? '业务全景仅向公司管理员或最初启用 CEO 的管理员开放。你仍可与 CEO 对话，但这里不会发起无权限的数据请求。'
+                        : 'The panorama is available only to company governors or the administrator who enabled the CEO. You can still chat with the CEO; this panel will not make an unauthorized data request.'}
+                </div>
+            )}
 
             {meetingMessage && (
                 <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }} role="status">
@@ -118,7 +128,7 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
                 </div>
             )}
 
-            {isError ? (
+            {ceoStatus.can_read_brief && (isError ? (
                 <div style={{ marginTop: 12, fontSize: 12, color: 'var(--danger, #dc2626)' }}>
                     {zh ? '暂时无法加载业务全景。' : 'The business panorama could not be loaded.'}
                 </div>
@@ -150,9 +160,9 @@ export default function CeoBriefPanel({ agentId }: { agentId: string | undefined
                 <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-tertiary)' }}>
                     {zh ? '正在加载业务全景…' : 'Loading the business panorama…'}
                 </div>
-            )}
+            ))}
 
-            {snapshot && (snapshot.blocked_items.length > 0 || snapshot.in_progress_items.length > 0) && (
+            {ceoStatus.can_read_brief && snapshot && (snapshot.blocked_items.length > 0 || snapshot.in_progress_items.length > 0) && (
                 <div style={{ marginTop: 12, fontSize: 12, lineHeight: 1.7 }}>
                     {snapshot.blocked_items.length > 0 && (
                         <div>

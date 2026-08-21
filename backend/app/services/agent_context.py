@@ -4,13 +4,71 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from pathlib import Path
+import re
 import uuid
 
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 
 _INTERNAL_A2A_TRIGGER_NAMES = {"a2a_wake", "__a2a_wake__"}
-_MIDDLE_TRUNCATION_MARKER = "\n...(older middle content omitted; latest entries follow)...\n"
+_MIDDLE_TRUNCATION_MARKER = (
+    "\n...(older middle content omitted; preserved section index and latest entries follow)...\n"
+)
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$")
+_POLICY_SECTION_KEYWORDS = (
+    "policy",
+    "policies",
+    "rule",
+    "rules",
+    "constraint",
+    "permission",
+    "approval",
+    "security",
+    "governance",
+    "制度",
+    "规则",
+    "约束",
+    "权限",
+    "审批",
+    "安全",
+    "治理",
+)
+
+
+def _markdown_memory_index(content: str, max_chars: int) -> str:
+    """Keep compact policy excerpts and a heading index from long memory docs."""
+    matches = list(_MARKDOWN_HEADING_RE.finditer(content))
+    if len(matches) < 2 or max_chars <= 0:
+        return ""
+
+    policy_entries: list[str] = []
+    headings: list[str] = []
+    for index, match in enumerate(matches):
+        heading = f"{match.group(1)} {match.group(2).strip()}"
+        headings.append(heading)
+        normalized_title = match.group(2).casefold()
+        if not any(keyword in normalized_title for keyword in _POLICY_SECTION_KEYWORDS):
+            continue
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        body_lines = [
+            line.strip()
+            for line in content[match.end() : body_end].splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        excerpt = " ".join(body_lines)[:240]
+        policy_entries.append(f"{heading}\n  Preserved policy excerpt: {excerpt}" if excerpt else heading)
+
+    sections: list[str] = ["[Preserved memory sections]"]
+    if policy_entries:
+        sections.append("Authoritative policy/rule excerpts:")
+        sections.extend(policy_entries)
+    sections.append("Section index:")
+    sections.extend(headings)
+
+    rendered = "\n".join(sections)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[:max_chars].rstrip()
 
 
 def _render_active_trigger_lines(triggers) -> list[str]:
@@ -21,8 +79,7 @@ def _render_active_trigger_lines(triggers) -> list[str]:
         trigger
         for trigger in triggers
         if str(getattr(trigger, "type", "") or "").strip().lower() != "a2a"
-        and str(getattr(trigger, "name", "") or "").strip()
-        not in _INTERNAL_A2A_TRIGGER_NAMES
+        and str(getattr(trigger, "name", "") or "").strip() not in _INTERNAL_A2A_TRIGGER_NAMES
     ]
     if not visible_triggers:
         return []
@@ -35,8 +92,7 @@ def _render_active_trigger_lines(triggers) -> list[str]:
         focus_ref = getattr(trigger, "focus_ref", None)
         ref_str = f" (focus: {focus_ref})" if focus_ref else ""
         lines.append(
-            f"\n- **{trigger.name}** [{trigger.type}]{ref_str}"
-            f"\n  Config: `{config_str}`\n  Reason: {reason_str}"
+            f"\n- **{trigger.name}** [{trigger.type}]{ref_str}\n  Config: `{config_str}`\n  Reason: {reason_str}"
         )
     return lines
 
@@ -56,13 +112,20 @@ def _truncate_context_text(
         return content[-max_chars:]
 
     available = max_chars - len(_MIDDLE_TRUNCATION_MARKER)
-    head_chars = max(1, available // 3)
-    tail_chars = available - head_chars
-    return (
-        content[:head_chars]
-        + _MIDDLE_TRUNCATION_MARKER
-        + content[-tail_chars:]
-    )
+    prefix_chars = max(1, available // 6)
+    index_chars = available // 2
+    section_index = _markdown_memory_index(content, index_chars)
+    if not section_index:
+        head_chars = max(1, available // 3)
+        tail_chars = available - head_chars
+        return content[:head_chars] + _MIDDLE_TRUNCATION_MARKER + content[-tail_chars:]
+    separator = "\n"
+    tail_chars = available - prefix_chars - len(section_index) - len(separator)
+    if tail_chars < 1:
+        overflow = 1 - tail_chars
+        section_index = section_index[:-overflow].rstrip()
+        tail_chars = 1
+    return content[:prefix_chars] + separator + section_index + _MIDDLE_TRUNCATION_MARKER + content[-tail_chars:]
 
 
 async def _read_file_safe(
@@ -116,11 +179,7 @@ def _parse_skill_frontmatter(content: str, filename: str) -> tuple[str, str]:
 
     for raw_line in stripped.split("\n"):
         line = raw_line.strip()
-        if (
-            line in {"---"}
-            or line.startswith("name:")
-            or line.startswith("description:")
-        ):
+        if line in {"---"} or line.startswith("name:") or line.startswith("description:"):
             continue
         if line and not line.startswith("#"):
             description = line[:200]
@@ -191,10 +250,7 @@ async def _load_skills_index(agent_id: uuid.UUID) -> str:
         "| Skill | Description | File |",
         "|-------|-------------|------|",
     ]
-    lines.extend(
-        f"| {name} | {description} | skills/{relative_path} |"
-        for name, description, relative_path in unique
-    )
+    lines.extend(f"| {name} | {description} | skills/{relative_path} |" for name, description, relative_path in unique)
     return "\n".join(lines)
 
 
@@ -223,9 +279,7 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
         status = await evaluate_human_relationship_status(db, relationship)
         if status["access_status"] != "active" or relationship.member is None:
             continue
-        if (provider_type or "").lower() in {"web", "platform"} or (
-            provider_name or ""
-        ).lower() == "web":
+        if (provider_type or "").lower() in {"web", "platform"} or (provider_name or "").lower() == "web":
             provider_name = "Platform"
         rows.append((relationship, provider_name))
 
@@ -247,9 +301,7 @@ async def _load_company_information(db, agent_id: uuid.UUID) -> str:
     from app.models.system_settings import SystemSetting
 
     try:
-        tenant_id = (
-            await db.execute(select(Agent.tenant_id).where(Agent.id == agent_id))
-        ).scalar_one_or_none()
+        tenant_id = (await db.execute(select(Agent.tenant_id).where(Agent.id == agent_id))).scalar_one_or_none()
         company_intro = ""
         if tenant_id is not None:
             try:
@@ -270,20 +322,14 @@ async def _load_company_information(db, agent_id: uuid.UUID) -> str:
 
         if not company_intro and tenant_id is not None:
             setting = (
-                await db.execute(
-                    select(SystemSetting).where(
-                        SystemSetting.key == f"company_intro_{tenant_id}"
-                    )
-                )
+                await db.execute(select(SystemSetting).where(SystemSetting.key == f"company_intro_{tenant_id}"))
             ).scalar_one_or_none()
             if setting and isinstance(setting.value, dict):
                 company_intro = str(setting.value.get("content") or "").strip()
 
         if not company_intro:
             setting = (
-                await db.execute(
-                    select(SystemSetting).where(SystemSetting.key == "company_intro")
-                )
+                await db.execute(select(SystemSetting).where(SystemSetting.key == "company_intro"))
             ).scalar_one_or_none()
             if setting and isinstance(setting.value, dict):
                 company_intro = str(setting.value.get("content") or "").strip()
@@ -460,10 +506,7 @@ Before returning the final Assistant response, verify that:
 def _active_capability_policies(allowed_tool_names: frozenset[str]) -> str:
     """Describe only policies whose backing tools are in this model step."""
     policies: list[str] = []
-    focus_tools = sorted(
-        allowed_tool_names
-        & {"list_focus_items", "upsert_focus_item", "complete_focus_item"}
-    )
+    focus_tools = sorted(allowed_tool_names & {"list_focus_items", "upsert_focus_item", "complete_focus_item"})
     if focus_tools:
         policies.append(
             "- Focus operations are available through "
@@ -471,10 +514,7 @@ def _active_capability_policies(allowed_tool_names: frozenset[str]) -> str:
             + ". Do not read or write `focus.md`."
         )
 
-    trigger_tools = sorted(
-        allowed_tool_names
-        & {"set_trigger", "update_trigger", "cancel_trigger", "list_triggers"}
-    )
+    trigger_tools = sorted(allowed_tool_names & {"set_trigger", "update_trigger", "cancel_trigger", "list_triggers"})
     if trigger_tools:
         policies.append(
             "- Trigger operations are available through "
@@ -500,9 +540,7 @@ def _active_capability_policies(allowed_tool_names: frozenset[str]) -> str:
             + ". Resolve current stable IDs before routing."
         )
 
-    experience_reads = sorted(
-        allowed_tool_names & {"search_experience", "read_experience"}
-    )
+    experience_reads = sorted(allowed_tool_names & {"search_experience", "read_experience"})
     if experience_reads:
         policies.append(
             "- Internal Experience operations available in this step: "
@@ -532,11 +570,7 @@ async def build_agent_context(
     # model context assembly. Keeping the parameter avoids a broad call-site API
     # break while D-017 is rolled out.
     del role_description
-    allowed = frozenset(
-        name.strip()
-        for name in (allowed_tool_names or ())
-        if isinstance(name, str) and name.strip()
-    )
+    allowed = frozenset(name.strip() for name in (allowed_tool_names or ()) if isinstance(name, str) and name.strip())
 
     soul = await _read_file_safe(
         normalize_storage_key(f"{agent_id}/soul.md"),
@@ -593,9 +627,7 @@ async def build_agent_context(
                 from app.services.ceo_briefing import ceo_operating_mode
 
                 ceo_result = await db.execute(
-                    select(CeoOrchestratorSettings).where(
-                        CeoOrchestratorSettings.ceo_agent_id == agent_id
-                    )
+                    select(CeoOrchestratorSettings).where(CeoOrchestratorSettings.ceo_agent_id == agent_id)
                 )
                 ceo_settings = ceo_result.scalar_one_or_none()
                 if ceo_settings is not None:
@@ -618,8 +650,7 @@ async def build_agent_context(
                             "Directory and route from its capability/readiness evidence. A "
                             "requires_preflight capability must be preflighted, not treated as "
                             "absent. Use task_delegate for work and wait for its correlated "
-                            "receipt; an Agent path or narrative claim is not an Artifact receipt. "
-                            + automation
+                            "receipt; an Agent path or narrative claim is not an Artifact receipt. " + automation
                         )
                     else:
                         ceo_mode_instruction = (
@@ -668,13 +699,8 @@ async def build_agent_context(
                 "the loaded instructions and do not infer them from the Skill name."
             )
             if "list_files" in allowed:
-                skill_policy += (
-                    " Use `list_files` on its folder when the loaded Skill points "
-                    "to auxiliary files."
-                )
-            static_parts.append(
-                f"# Available Skills\n\n{skills_catalog}\n\n{skill_policy}"
-            )
+                skill_policy += " Use `list_files` on its folder when the loaded Skill points to auxiliary files."
+            static_parts.append(f"# Available Skills\n\n{skills_catalog}\n\n{skill_policy}")
     static_parts.append(_BASE_PROMPT_OUTPUT)
 
     dynamic_parts = [
@@ -686,9 +712,7 @@ async def build_agent_context(
         ),
     ]
     if memory:
-        dynamic_parts.extend(
-            ["", "## Memory Snapshot", "<memory_context>", memory, "</memory_context>"]
-        )
+        dynamic_parts.extend(["", "## Memory Snapshot", "<memory_context>", memory, "</memory_context>"])
     if company_information:
         dynamic_parts.extend(
             [

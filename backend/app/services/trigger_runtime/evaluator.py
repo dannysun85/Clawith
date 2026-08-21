@@ -95,7 +95,11 @@ async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> boo
     }:
         return False
     if not runtime_settings.OKR_AUTOMATION_ENABLED:
-        return True
+        logger.warning(
+            "[Trigger] Refusing disabled OKR report automation trigger {}",
+            trigger.id,
+        )
+        return False
 
     from zoneinfo import ZoneInfo
     from app.models.okr import OKRSettings
@@ -143,7 +147,11 @@ async def handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) ->
     if not trigger.is_system or trigger.name != "daily_okr_collection":
         return False
     if not runtime_settings.OKR_AUTOMATION_ENABLED:
-        return True
+        logger.warning(
+            "[Trigger] Refusing disabled OKR collection automation trigger {}",
+            trigger.id,
+        )
+        return False
 
     from app.models.okr import OKRSettings
     from app.services.okr_daily_collection import trigger_daily_collection_for_tenant

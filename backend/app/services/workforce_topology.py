@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import (
@@ -84,12 +84,8 @@ RUNTIME_LIFECYCLE_EVENT_TYPES = (
     "run_cancelled",
 )
 TERMINAL_EXECUTION_STATUSES = frozenset({"completed", "failed", "cancelled"})
-ACTIVE_EXECUTION_STATUSES = frozenset(
-    {"queued", "running", "waiting_user", "waiting_agent", "waiting_external"}
-)
-TERMINAL_MEDIA_STATUSES = frozenset(
-    {"succeeded", "failed", "compensated", "closed_nonrefundable"}
-)
+ACTIVE_EXECUTION_STATUSES = frozenset({"queued", "running", "waiting_user", "waiting_agent", "waiting_external"})
+TERMINAL_MEDIA_STATUSES = frozenset({"succeeded", "failed", "compensated", "closed_nonrefundable"})
 EXECUTION_STATUS_PRIORITY = {
     "waiting_user": 0,
     "waiting_agent": 1,
@@ -110,6 +106,9 @@ SAFE_EXECUTION_TITLES = {
     "deliverable": "Formal deliverable",
     "media": "Media generation",
 }
+TOPOLOGY_PER_AGENT_SOURCE_ROWS = 24
+TOPOLOGY_MAX_SOURCE_ROWS = 2_000
+TOPOLOGY_MAX_RELATIONSHIP_EDGES = 2_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +135,43 @@ class _ExecutionCandidate:
     details_visible: bool
     deep_link: str
     updated_at: datetime
+
+
+def _bounded_ids_by_partition(
+    model,
+    *,
+    partition_column,
+    freshness_column,
+    predicates: tuple,
+    priority_order: tuple = (),
+    per_partition: int = TOPOLOGY_PER_AGENT_SOURCE_ROWS,
+):
+    """Select recent IDs fairly across employees/runs with one hard tenant cap."""
+
+    ranked = (
+        select(
+            model.id.label("source_id"),
+            freshness_column.label("source_freshness"),
+            func.row_number()
+            .over(
+                partition_by=partition_column,
+                order_by=(*priority_order, freshness_column.desc(), model.id.desc()),
+            )
+            .label("source_rank"),
+        )
+        .where(*predicates)
+        .subquery()
+    )
+    return (
+        select(ranked.c.source_id)
+        .where(ranked.c.source_rank <= per_partition)
+        .order_by(
+            ranked.c.source_rank.asc(),
+            ranked.c.source_freshness.desc(),
+            ranked.c.source_id.desc(),
+        )
+        .limit(TOPOLOGY_MAX_SOURCE_ROWS)
+    )
 
 
 def _topology_work_stage(user_stage: str) -> str | None:
@@ -195,25 +231,27 @@ async def _load_topology_work_summaries(
     employee_ids: set[uuid.UUID],
     since: datetime,
 ) -> dict[uuid.UUID, WorkforceTopologyWorkOut]:
-    """Project all active and window-recent viewer-owned work without a global cap."""
+    """Project active/recent viewer-owned work from bounded per-agent sources."""
 
     if not employee_ids:
         return {}
 
+    bounded_task_ids = _bounded_ids_by_partition(
+        Task,
+        partition_column=Task.agent_id,
+        freshness_column=Task.updated_at,
+        predicates=(
+            Task.tenant_id == tenant_id,
+            Task.created_by == user_id,
+            Task.agent_id.in_(employee_ids),
+            or_(Task.status != "done", Task.updated_at >= since),
+        ),
+        priority_order=(case((Task.status == "done", 1), else_=0).asc(),),
+    )
     tasks = list(
         (
             await db.execute(
-                select(Task)
-                .where(
-                    Task.tenant_id == tenant_id,
-                    Task.created_by == user_id,
-                    Task.agent_id.in_(employee_ids),
-                    or_(
-                        Task.status != "done",
-                        Task.updated_at >= since,
-                    ),
-                )
-                .order_by(Task.updated_at.desc(), Task.id.desc())
+                select(Task).where(Task.id.in_(bounded_task_ids)).order_by(Task.updated_at.desc(), Task.id.desc())
             )
         )
         .scalars()
@@ -229,16 +267,28 @@ async def _load_topology_work_summaries(
             deliverable_recency,
             DeliverableRequest.task_id.in_(task_ids),
         )
+    bounded_deliverable_ids = _bounded_ids_by_partition(
+        DeliverableRequest,
+        partition_column=DeliverableRequest.agent_id,
+        freshness_column=DeliverableRequest.updated_at,
+        predicates=(
+            DeliverableRequest.tenant_id == tenant_id,
+            DeliverableRequest.created_by_user_id == user_id,
+            DeliverableRequest.agent_id.in_(employee_ids),
+            deliverable_recency,
+        ),
+        priority_order=(
+            case(
+                (DeliverableRequest.status.in_(TERMINAL_DELIVERABLE_STATUSES), 1),
+                else_=0,
+            ).asc(),
+        ),
+    )
     deliverables = list(
         (
             await db.execute(
                 select(DeliverableRequest)
-                .where(
-                    DeliverableRequest.tenant_id == tenant_id,
-                    DeliverableRequest.created_by_user_id == user_id,
-                    DeliverableRequest.agent_id.in_(employee_ids),
-                    deliverable_recency,
-                )
+                .where(DeliverableRequest.id.in_(bounded_deliverable_ids))
                 .order_by(
                     DeliverableRequest.updated_at.desc(),
                     DeliverableRequest.id.desc(),
@@ -256,12 +306,14 @@ async def _load_topology_work_summaries(
             list(
                 (
                     await db.execute(
-                        select(Task).where(
+                        select(Task)
+                        .where(
                             Task.tenant_id == tenant_id,
                             Task.created_by == user_id,
                             Task.agent_id.in_(employee_ids),
                             Task.id.in_(missing_task_ids),
                         )
+                        .limit(TOPOLOGY_MAX_SOURCE_ROWS)
                     )
                 )
                 .scalars()
@@ -289,6 +341,7 @@ async def _load_topology_work_summaries(
                         ),
                     )
                     .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                    .limit(TOPOLOGY_MAX_SOURCE_ROWS)
                 )
             )
             .scalars()
@@ -308,15 +361,22 @@ async def _load_topology_work_summaries(
     terminal_event_by_run: dict[uuid.UUID, str] = {}
     run_ids = [run.id for run in run_by_task.values()]
     if run_ids:
+        bounded_terminal_event_ids = _bounded_ids_by_partition(
+            AgentRunEvent,
+            partition_column=AgentRunEvent.run_id,
+            freshness_column=AgentRunEvent.created_at,
+            predicates=(
+                AgentRunEvent.tenant_id == tenant_id,
+                AgentRunEvent.run_id.in_(run_ids),
+                AgentRunEvent.event_type.in_(tuple(TERMINAL_RUN_EVENTS)),
+            ),
+            per_partition=1,
+        )
         events = list(
             (
                 await db.execute(
                     select(AgentRunEvent)
-                    .where(
-                        AgentRunEvent.tenant_id == tenant_id,
-                        AgentRunEvent.run_id.in_(run_ids),
-                        AgentRunEvent.event_type.in_(tuple(TERMINAL_RUN_EVENTS)),
-                    )
+                    .where(AgentRunEvent.id.in_(bounded_terminal_event_ids))
                     .order_by(
                         AgentRunEvent.created_at.desc(),
                         AgentRunEvent.id.desc(),
@@ -333,14 +393,21 @@ async def _load_topology_work_summaries(
     artifact_status_by_request: dict[uuid.UUID, str] = {}
     review_status_by_request: dict[uuid.UUID, str] = {}
     if request_ids:
+        bounded_artifact_ids = _bounded_ids_by_partition(
+            DeliverableArtifactRevision,
+            partition_column=DeliverableArtifactRevision.request_id,
+            freshness_column=DeliverableArtifactRevision.created_at,
+            predicates=(
+                DeliverableArtifactRevision.tenant_id == tenant_id,
+                DeliverableArtifactRevision.request_id.in_(request_ids),
+            ),
+            per_partition=1,
+        )
         artifacts = list(
             (
                 await db.execute(
                     select(DeliverableArtifactRevision)
-                    .where(
-                        DeliverableArtifactRevision.tenant_id == tenant_id,
-                        DeliverableArtifactRevision.request_id.in_(request_ids),
-                    )
+                    .where(DeliverableArtifactRevision.id.in_(bounded_artifact_ids))
                     .order_by(
                         DeliverableArtifactRevision.created_at.desc(),
                         DeliverableArtifactRevision.id.desc(),
@@ -355,14 +422,21 @@ async def _load_topology_work_summaries(
                 artifact.request_id,
                 artifact.status,
             )
+        bounded_review_ids = _bounded_ids_by_partition(
+            DeliverableQualityReview,
+            partition_column=DeliverableQualityReview.request_id,
+            freshness_column=DeliverableQualityReview.created_at,
+            predicates=(
+                DeliverableQualityReview.tenant_id == tenant_id,
+                DeliverableQualityReview.request_id.in_(request_ids),
+            ),
+            per_partition=1,
+        )
         reviews = list(
             (
                 await db.execute(
                     select(DeliverableQualityReview)
-                    .where(
-                        DeliverableQualityReview.tenant_id == tenant_id,
-                        DeliverableQualityReview.request_id.in_(request_ids),
-                    )
+                    .where(DeliverableQualityReview.id.in_(bounded_review_ids))
                     .order_by(
                         DeliverableQualityReview.created_at.desc(),
                         DeliverableQualityReview.id.desc(),
@@ -584,11 +658,7 @@ def _project_topology_execution_summaries(
         items.sort(
             key=lambda item: (
                 0 if item.status in ACTIVE_EXECUTION_STATUSES else 1,
-                (
-                    EXECUTION_STATUS_PRIORITY.get(item.status, 99)
-                    if item.status in ACTIVE_EXECUTION_STATUSES
-                    else 0
-                ),
+                (EXECUTION_STATUS_PRIORITY.get(item.status, 99) if item.status in ACTIVE_EXECUTION_STATUSES else 0),
                 -item.updated_at.timestamp(),
                 EXECUTION_STATUS_PRIORITY.get(item.status, 99),
                 item.id.int,
@@ -649,15 +719,22 @@ async def _load_topology_execution_summaries(
         .correlate(AgentRun)
         .exists()
     )
+    bounded_run_ids = _bounded_ids_by_partition(
+        AgentRun,
+        partition_column=AgentRun.agent_id,
+        freshness_column=AgentRun.created_at,
+        predicates=(
+            AgentRun.tenant_id == tenant_id,
+            AgentRun.agent_id.in_(employee_ids),
+            or_(AgentRun.created_at >= since, ~terminal_event_exists),
+        ),
+        priority_order=(case((terminal_event_exists, 1), else_=0).asc(),),
+    )
     runs = list(
         (
             await db.execute(
                 select(AgentRun)
-                .where(
-                    AgentRun.tenant_id == tenant_id,
-                    AgentRun.agent_id.in_(employee_ids),
-                    or_(AgentRun.created_at >= since, ~terminal_event_exists),
-                )
+                .where(AgentRun.id.in_(bounded_run_ids))
                 .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
             )
         )
@@ -667,15 +744,22 @@ async def _load_topology_execution_summaries(
     run_ids = [run.id for run in runs]
     events: list[AgentRunEvent] = []
     if run_ids:
+        bounded_event_ids = _bounded_ids_by_partition(
+            AgentRunEvent,
+            partition_column=AgentRunEvent.run_id,
+            freshness_column=AgentRunEvent.created_at,
+            predicates=(
+                AgentRunEvent.tenant_id == tenant_id,
+                AgentRunEvent.run_id.in_(run_ids),
+                AgentRunEvent.event_type.in_(RUNTIME_LIFECYCLE_EVENT_TYPES),
+            ),
+            per_partition=1,
+        )
         events = list(
             (
                 await db.execute(
                     select(AgentRunEvent)
-                    .where(
-                        AgentRunEvent.tenant_id == tenant_id,
-                        AgentRunEvent.run_id.in_(run_ids),
-                        AgentRunEvent.event_type.in_(RUNTIME_LIFECYCLE_EVENT_TYPES),
-                    )
+                    .where(AgentRunEvent.id.in_(bounded_event_ids))
                     .order_by(AgentRunEvent.created_at.desc(), AgentRunEvent.id.desc())
                 )
             )
@@ -684,6 +768,28 @@ async def _load_topology_execution_summaries(
         )
     latest_event_by_run = latest_runtime_lifecycle_event_by_run(events)
 
+    bounded_execution_deliverable_ids = _bounded_ids_by_partition(
+        DeliverableRequest,
+        partition_column=DeliverableRequest.agent_id,
+        freshness_column=DeliverableRequest.updated_at,
+        predicates=(
+            DeliverableRequest.tenant_id == tenant_id,
+            DeliverableRequest.agent_id.in_(employee_ids),
+            or_(
+                ~DeliverableRequest.status.in_(TERMINAL_DELIVERABLE_EXECUTION_STATUSES),
+                DeliverableRequest.updated_at >= since,
+            ),
+        ),
+        priority_order=(
+            case(
+                (
+                    DeliverableRequest.status.in_(TERMINAL_DELIVERABLE_EXECUTION_STATUSES),
+                    1,
+                ),
+                else_=0,
+            ).asc(),
+        ),
+    )
     deliverable_rows = list(
         (
             await db.execute(
@@ -695,30 +801,35 @@ async def _load_topology_execution_summaries(
                         DeliverableExecution.id == DeliverableRequest.current_execution_id,
                     ),
                 )
-                .where(
-                    DeliverableRequest.tenant_id == tenant_id,
-                    DeliverableRequest.agent_id.in_(employee_ids),
-                    or_(
-                        ~DeliverableRequest.status.in_(TERMINAL_DELIVERABLE_EXECUTION_STATUSES),
-                        DeliverableRequest.updated_at >= since,
-                    ),
-                )
+                .where(DeliverableRequest.id.in_(bounded_execution_deliverable_ids))
                 .order_by(DeliverableRequest.updated_at.desc(), DeliverableRequest.id.desc())
             )
         ).all()
+    )
+    bounded_media_ids = _bounded_ids_by_partition(
+        MediaGenerationTask,
+        partition_column=MediaGenerationTask.agent_id,
+        freshness_column=MediaGenerationTask.updated_at,
+        predicates=(
+            MediaGenerationTask.tenant_id == tenant_id,
+            MediaGenerationTask.agent_id.in_(employee_ids),
+            or_(
+                ~MediaGenerationTask.status.in_(TERMINAL_MEDIA_STATUSES),
+                MediaGenerationTask.updated_at >= since,
+            ),
+        ),
+        priority_order=(
+            case(
+                (MediaGenerationTask.status.in_(TERMINAL_MEDIA_STATUSES), 1),
+                else_=0,
+            ).asc(),
+        ),
     )
     media_tasks = list(
         (
             await db.execute(
                 select(MediaGenerationTask)
-                .where(
-                    MediaGenerationTask.tenant_id == tenant_id,
-                    MediaGenerationTask.agent_id.in_(employee_ids),
-                    or_(
-                        ~MediaGenerationTask.status.in_(TERMINAL_MEDIA_STATUSES),
-                        MediaGenerationTask.updated_at >= since,
-                    ),
-                )
+                .where(MediaGenerationTask.id.in_(bounded_media_ids))
                 .order_by(MediaGenerationTask.updated_at.desc(), MediaGenerationTask.id.desc())
             )
         )
@@ -733,9 +844,7 @@ async def _load_topology_execution_summaries(
 
     candidates: list[_ExecutionCandidate] = []
     deliverable_run_ids = {
-        request.agent_run_id
-        for request, _execution in deliverable_rows
-        if request.agent_run_id is not None
+        request.agent_run_id for request, _execution in deliverable_rows if request.agent_run_id is not None
     }
     for run in runs:
         if run.agent_id is None or run.id in deliverable_run_ids:
@@ -758,15 +867,9 @@ async def _load_topology_execution_summaries(
                 status=status,
                 phase=_run_execution_phase(event),
                 title=(
-                    _bounded_execution_text(run.goal, limit=160) or generic_title
-                    if details_visible
-                    else generic_title
+                    _bounded_execution_text(run.goal, limit=160) or generic_title if details_visible else generic_title
                 ),
-                summary=(
-                    detail or generic_title
-                    if details_visible
-                    else f"{generic_title} status: {status}"
-                ),
+                summary=(detail or generic_title if details_visible else f"{generic_title} status: {status}"),
                 details_visible=details_visible,
                 deep_link=_run_execution_deep_link(
                     run,
@@ -811,11 +914,7 @@ async def _load_topology_execution_summaries(
                     if details_visible
                     else generic_title
                 ),
-                summary=(
-                    detail or generic_title
-                    if details_visible
-                    else f"{generic_title} status: {status}"
-                ),
+                summary=(detail or generic_title if details_visible else f"{generic_title} status: {status}"),
                 details_visible=details_visible,
                 deep_link=(
                     f"/agents/{request.agent_id}/chat?session_id={request.session_id}"
@@ -1050,7 +1149,7 @@ async def build_workforce_topology(
                         AgentAgentRelationship.created_at,
                     ).desc(),
                     AgentAgentRelationship.id.asc(),
-                )
+                ).limit(TOPOLOGY_MAX_RELATIONSHIP_EDGES)
             )
         )
         .scalars()
@@ -1094,6 +1193,8 @@ async def build_workforce_topology(
                     ChatSession.agent_id,
                     ChatSession.peer_agent_id,
                 )
+                .order_by(func.max(ChatMessage.created_at).desc())
+                .limit(TOPOLOGY_MAX_RELATIONSHIP_EDGES)
             )
         ).all()
     )
@@ -1127,6 +1228,8 @@ async def build_workforce_topology(
                     GatewayMessage.sender_agent_id,
                     GatewayMessage.agent_id,
                 )
+                .order_by(func.max(GatewayMessage.created_at).desc())
+                .limit(TOPOLOGY_MAX_RELATIONSHIP_EDGES)
             )
         ).all()
     )

@@ -81,22 +81,22 @@ const formatTokens = (n: number) => {
  * OKRSummaryCard — a compact overview widget for the Dashboard.
  * Fetches the latest OKR settings + current period objectives, shows a
  * mini donut chart and KR status breakdown, links to OKR page.
- * Renders nothing when OKR is disabled or loading.
+ * Keeps an explicit entry point when OKR is disabled or has no objectives.
  */
-function OKRSummaryCard({ accessSignature }: { accessSignature: string }) {
+function OKRSummaryCard({ accessSignature, canManageOkr }: { accessSignature: string; canManageOkr: boolean }) {
     const { i18n } = useTranslation();
     const navigate = useNavigate();
     const isChinese = i18n.language?.startsWith('zh');
 
     // Load settings first
-    const { data: settings } = useQuery({
+    const { data: settings, isLoading: settingsLoading } = useQuery({
         queryKey: ['okr-settings-dash', accessSignature],
         queryFn: () => fetchJson<{ enabled: boolean }>('/okr/settings'),
         staleTime: 60000,
     });
 
     // Load current-period objectives (only when OKR enabled)
-    const { data: objectives = [] } = useQuery<any[]>({
+    const { data: objectives = [], isLoading: objectivesLoading } = useQuery<any[]>({
         queryKey: ['okr-objectives-dash', accessSignature],
         queryFn: async () => {
             // Fetch periods first to get the current period
@@ -109,8 +109,35 @@ function OKRSummaryCard({ accessSignature }: { accessSignature: string }) {
         staleTime: 60000,
     });
 
-    // Nothing to show if OKR is off or still loading
-    if (!settings?.enabled || objectives.length === 0) return null;
+    if (settingsLoading || (settings?.enabled && objectivesLoading)) return null;
+
+    if (!settings?.enabled || objectives.length === 0) {
+        const setupPath = canManageOkr ? '/company-admin/settings/okr' : '/okr';
+        const disabled = !settings?.enabled;
+        return (
+            <div style={{ border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-lg)', padding: '14px 18px', marginBottom: '20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '20px', background: 'var(--bg-secondary)' }}>
+                <div>
+                    <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '4px' }}>
+                        {disabled
+                            ? (isChinese ? 'OKR 尚未启用' : 'OKR is not enabled')
+                            : (isChinese ? '本周期还没有 OKR' : 'No OKRs in this period')}
+                    </div>
+                    <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                        {disabled
+                            ? (canManageOkr
+                                ? (isChinese ? '在公司设置中启用后，可手动管理目标与关键结果。' : 'Enable it in Company Settings to manage objectives and key results manually.')
+                                : (isChinese ? '请联系公司管理员启用；你仍可打开 OKR 页面查看状态。' : 'Ask a company administrator to enable it; you can still open the OKR page to view its status.'))
+                            : (isChinese ? '创建本周期的第一个目标，Dashboard 会在这里展示进度。' : 'Create the first objective for this period and its progress will appear here.')}
+                    </div>
+                </div>
+                <button type="button" className="btn btn-secondary" onClick={() => navigate(setupPath)}>
+                    {canManageOkr && disabled
+                        ? (isChinese ? '前往设置' : 'Open settings')
+                        : (isChinese ? '打开 OKR' : 'Open OKR')}
+                </button>
+            </div>
+        );
+    }
 
     // Flatten all KRs and count statuses
     const allKRs: any[] = objectives.flatMap((o: any) => o.key_results ?? []);
@@ -349,6 +376,7 @@ export default function Dashboard() {
     const currentTenant = user?.tenant_id || localStorage.getItem('current_tenant_id') || '';
     const accessSignature = productAccessSignature(user);
     const canViewCompanyAnalytics = hasEffectiveCapability(user, 'company.analytics.view');
+    const canManageOkr = hasEffectiveCapability(user, 'company.okr.manage');
 
     const {
         data: topology,
@@ -445,7 +473,7 @@ export default function Dashboard() {
                     />
 
                     {/* OKR Summary (P3) — only shown when OKR is enabled */}
-                    <OKRSummaryCard accessSignature={accessSignature} />
+                    <OKRSummaryCard accessSignature={accessSignature} canManageOkr={canManageOkr} />
 
                     {/* Recent Activity */}
                     <div style={{

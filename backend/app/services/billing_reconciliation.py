@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import func, select, union
+from sqlalchemy import func, or_, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -51,6 +51,13 @@ class PaymentReconciliationIssue:
 class PaymentReconciliationReport:
     checked_orders: int = 0
     issues: list[PaymentReconciliationIssue] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PaidEffectsReconciliationReport:
+    checked_orders: int = 0
+    applied_orders: int = 0
+    failed_orders: int = 0
 
 
 async def check_credit_ledger_integrity(
@@ -337,6 +344,20 @@ async def reconcile_pending_payment_orders(
                         order.id,
                         order.provider,
                     )
+            if (
+                not changed
+                and order.provider_close_status in {"retry_wait", "operator_review"}
+            ):
+                report.issues.append(
+                    PaymentReconciliationIssue(
+                        code="provider_close_retry_required",
+                        order_id=order.id,
+                        tenant_id=order.tenant_id,
+                        provider=order.provider,
+                        status=order.provider_close_status,
+                        message="expired provider order remains pending with a durable retry receipt",
+                    )
+                )
         if changed:
             await db.commit()
             from app.services.subscription_lifecycle import apply_paid_subscribe_effects
@@ -375,6 +396,63 @@ async def reconcile_pending_payment_orders(
     return report
 
 
+async def reconcile_paid_subscribe_effects(
+    db: AsyncSession | None = None,
+    *,
+    limit: int = 100,
+) -> PaidEffectsReconciliationReport:
+    """Retry paid subscription effects whose durable receipt is incomplete."""
+    own_session = db is None
+    if own_session:
+        async with async_session() as session:
+            return await reconcile_paid_subscribe_effects(session, limit=limit)
+
+    from app.services.subscription_lifecycle import (
+        PAID_EFFECTS_LEASE_TIMEOUT,
+        apply_paid_subscribe_effects,
+    )
+
+    now = datetime.now(timezone.utc)
+    stale_processing = now - PAID_EFFECTS_LEASE_TIMEOUT
+    result = await db.execute(
+        select(PaymentOrder.id)
+        .where(
+            PaymentOrder.type == "subscribe",
+            PaymentOrder.status.in_(("paid", "partially_refunded")),
+            or_(
+                PaymentOrder.paid_effects_status.in_(("pending", "failed")),
+                (
+                    (PaymentOrder.paid_effects_status == "processing")
+                    & (
+                        (PaymentOrder.paid_effects_started_at.is_(None))
+                        | (PaymentOrder.paid_effects_started_at <= stale_processing)
+                    )
+                ),
+            ),
+        )
+        .order_by(PaymentOrder.paid_at.asc(), PaymentOrder.id.asc())
+        .limit(max(1, min(int(limit), 500)))
+    )
+    order_ids = list(result.scalars().all())
+    report = PaidEffectsReconciliationReport(checked_orders=len(order_ids))
+    for order_id in order_ids:
+        order = await db.get(PaymentOrder, order_id)
+        if order is None:
+            continue
+        try:
+            applied = await apply_paid_subscribe_effects(order)
+        except Exception:
+            report.failed_orders += 1
+            logger.exception(
+                "[billing] paid subscription effects reconciliation failed order_id={}",
+                order_id,
+            )
+            continue
+        if applied:
+            report.applied_orders += 1
+    return report
+
+
 async def start_billing_reconciliation_daemon() -> None:
     """Run periodic billing integrity checks and stale reservation expiry."""
     settings = get_settings()
@@ -397,12 +475,16 @@ async def start_billing_reconciliation_daemon() -> None:
             if loop_time >= next_ledger_check:
                 ledger_report = await check_credit_ledger_integrity()
                 payment_report = await reconcile_pending_payment_orders()
+                effects_report = await reconcile_paid_subscribe_effects()
                 logger.info(
-                    "[billing] reconciliation complete checked_tenants={} ledger_issues={} checked_orders={} payment_issues={}",
+                    "[billing] reconciliation complete checked_tenants={} ledger_issues={} checked_orders={} payment_issues={} paid_effects_checked={} paid_effects_applied={} paid_effects_failed={}",
                     ledger_report.checked_tenants,
                     len(ledger_report.issues),
                     payment_report.checked_orders,
                     len(payment_report.issues),
+                    effects_report.checked_orders,
+                    effects_report.applied_orders,
+                    effects_report.failed_orders,
                 )
                 next_ledger_check = loop_time + ledger_interval
         except asyncio.CancelledError:

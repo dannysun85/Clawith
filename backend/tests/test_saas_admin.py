@@ -121,7 +121,7 @@ def _verified_credential(
 
 
 @pytest.mark.asyncio
-async def test_saas_admin_owner_email_is_allowed():
+async def test_saas_admin_platform_operator_is_allowed():
     user = _admin_user(email="ADMIN@REEFTOTEM.AI")
 
     result = await saas_api.get_saas_admin(user)
@@ -130,13 +130,12 @@ async def test_saas_admin_owner_email_is_allowed():
 
 
 @pytest.mark.asyncio
-async def test_saas_admin_rejects_other_platform_admin_email():
+async def test_saas_admin_does_not_reintroduce_an_email_authority_axis():
     user = _admin_user(email="other@example.com")
 
-    with pytest.raises(HTTPException) as exc:
-        await saas_api.get_saas_admin(user)
+    result = await saas_api.get_saas_admin(user)
 
-    assert exc.value.status_code == 403
+    assert result is user
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,11 @@ import {
     resolveProductEntry,
     type ProductSurface,
 } from './utils/productAccess';
+import {
+    isDefinitiveAuthRejection,
+    isTransientAuthBootstrapFailure,
+    withAuthBootstrapTimeout,
+} from './utils/authBootstrapRecovery';
 
 // React StrictMode remounts the auth bootstrap in development.  Keep a
 // consumed cross-origin candidate in memory until one non-cancelled pass has
@@ -342,10 +347,16 @@ function NotificationBar() {
 export default function App() {
     const { token, setAuth } = useAuthStore();
     const [loading, setLoading] = useState(true);
+    const [bootstrapUnavailable, setBootstrapUnavailable] = useState(false);
+    const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
+    const { i18n } = useTranslation();
+    const isChinese = i18n.language.startsWith('zh');
 
     useEffect(() => {
         let cancelled = false;
         const initializeAuth = async () => {
+            setLoading(true);
+            setBootstrapUnavailable(false);
             // Initialize theme on app mount (ensures login page gets correct theme)
             const savedTheme = localStorage.getItem('theme') || 'light';
             document.documentElement.setAttribute('data-theme', savedTheme);
@@ -382,11 +393,15 @@ export default function App() {
                         ? await validateCrossOriginTenantSwitch({
                             tenantId: pendingCrossOriginSession?.targetTenantId,
                             accessToken: effectiveToken,
-                            validateToken: authApi.me,
+                            validateToken: (candidateToken) => withAuthBootstrapTimeout(
+                                (signal) => authApi.me(candidateToken, signal),
+                            ),
                             resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
                             resolveCurrentOriginTenant: () => tenantApi.resolveByDomain(window.location.host),
                         })
-                        : await authApi.me(effectiveToken);
+                        : await withAuthBootstrapTimeout(
+                            (signal) => authApi.me(effectiveToken, signal),
+                        );
                     if (!cancelled) {
                         await setAuth(authenticatedUser, effectiveToken);
                         if (authenticatedUser.tenant_id) {
@@ -396,10 +411,11 @@ export default function App() {
                             pendingCrossOriginSession = null;
                         }
                     }
-                } catch {
+                } catch (error) {
                     if (!cancelled) {
                         const rejectedCrossOriginCandidate =
-                            effectiveToken === pendingCrossOriginToken;
+                            effectiveToken === pendingCrossOriginToken
+                            && !isTransientAuthBootstrapFailure(error);
                         if (rejectedCrossOriginCandidate) {
                             pendingCrossOriginSession = null;
                         }
@@ -410,13 +426,26 @@ export default function App() {
                             && priorToken !== effectiveToken
                         ) {
                             try {
-                                const priorUser = await authApi.me(priorToken);
+                                const priorUser = await withAuthBootstrapTimeout(
+                                    (signal) => authApi.me(priorToken, signal),
+                                );
                                 if (!cancelled) await setAuth(priorUser, priorToken);
-                            } catch {
-                                if (!cancelled) useAuthStore.getState().logout();
+                            } catch (priorError) {
+                                if (!cancelled) {
+                                    if (isDefinitiveAuthRejection(priorError)) {
+                                        useAuthStore.getState().logout();
+                                    } else {
+                                        setBootstrapUnavailable(true);
+                                    }
+                                }
                             }
-                        } else {
+                        } else if (isDefinitiveAuthRejection(error)) {
                             useAuthStore.getState().logout();
+                        } else {
+                            // A network outage or upstream 5xx must not erase a
+                            // valid local session. Keep the token and let the
+                            // user retry the same identity after service recovery.
+                            setBootstrapUnavailable(true);
                         }
                     }
                 }
@@ -428,7 +457,7 @@ export default function App() {
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [bootstrapAttempt]);
 
 
     if (loading) {
@@ -436,6 +465,34 @@ export default function App() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-tertiary)' }}>
                 加载中...
             </div>
+        );
+    }
+
+    if (bootstrapUnavailable) {
+        return (
+            <main
+                role="alert"
+                data-testid="auth-bootstrap-recovery"
+                style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, background: 'var(--bg-primary)' }}
+            >
+                <section style={{ width: 'min(100%, 460px)', padding: 28, border: '1px solid var(--border-subtle)', borderRadius: 16, background: 'var(--bg-secondary)', boxShadow: 'var(--shadow-lg)' }}>
+                    <h1 style={{ margin: 0, fontSize: 24 }}>
+                        {isChinese ? '暂时无法连接服务' : 'Service is temporarily unavailable'}
+                    </h1>
+                    <p style={{ margin: '12px 0 20px', color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+                        {isChinese
+                            ? '登录状态和本地工作不会被清除。服务恢复后，请重新检查连接。'
+                            : 'Your sign-in state and local work were preserved. Retry after the service recovers.'}
+                    </p>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={() => setBootstrapAttempt((value) => value + 1)}
+                    >
+                        {isChinese ? '重新检查连接' : 'Retry connection'}
+                    </button>
+                </section>
+            </main>
         );
     }
 

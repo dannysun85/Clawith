@@ -8,7 +8,7 @@ partial_db_name="${db_name}_partial"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_deliv_audit_tenant}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-manual_order_decisions}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -2091,7 +2091,9 @@ PYTHONPATH=. .venv/bin/python ../scripts/mcp-import-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-remediation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/billing-reconciliation-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/billing-paid-effects-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/wechat-payment-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/workforce-topology-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/agentbay-identity-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/plaza-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
@@ -2588,6 +2590,7 @@ PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/approval-execution-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/chat-tier-preference-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/manual-order-governance-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO users (

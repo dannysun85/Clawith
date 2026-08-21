@@ -1249,6 +1249,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             if always_added:
                 logger.debug(f"[Tools] agent={agent_id} added protocol tools: {always_added}")
             result = _patch_computer_tool_descriptions(result, computer_os_type)
+            result = _apply_release_a2a_schema_contract(result)
+            if is_system_agent:
+                result = await _apply_ceo_a2a_schema_contract(agent_id, result)
             logger.info(
                 "[Tools] agent={} final_tools={} assignments={} disabled={} default_fallback={}",
                 agent_id,
@@ -1264,7 +1267,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     # If DB loading fails, do not expose the full hardcoded tool catalog: that
     # can leak disabled tools (for example search tools) into the LLM. Keep only
     # the minimal protocol control tools.
-    fallback = _patch_computer_tool_descriptions(_always_tools, computer_os_type)
+    fallback = _apply_release_a2a_schema_contract(
+        _patch_computer_tool_descriptions(_always_tools, computer_os_type)
+    )
+    if is_system_agent:
+        fallback = await _apply_ceo_a2a_schema_contract(agent_id, fallback)
     return fallback
 
 
@@ -9745,6 +9752,7 @@ async def _query_directory_payload(agent_id: uuid.UUID, args: dict) -> dict:
                 limit=limit,
                 offset=offset,
                 max_limit=50,
+                capability_projection="auto",
             )
         return result
     except agent_directory.DirectoryQueryError as e:
@@ -26183,6 +26191,107 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
                 params["required"] = [r for r in req if r != "msg_type"]
         result.append(t)
     return result
+
+
+def _restrict_a2a_msg_types(
+    tools: list[dict],
+    *,
+    allowed_modes: tuple[str, ...],
+    description: str,
+) -> list[dict]:
+    """Return a fresh A2A model schema that exposes only authorized modes."""
+    import copy
+
+    result: list[dict] = []
+    for tool in tools:
+        fn = tool.get("function", {})
+        if fn.get("name") != "send_message_to_agent":
+            result.append(tool)
+            continue
+        projected = copy.deepcopy(tool)
+        projected_fn = projected["function"]
+        projected_fn["description"] = description
+        parameters = projected_fn.setdefault(
+            "parameters",
+            {"type": "object", "properties": {}},
+        )
+        properties = parameters.setdefault("properties", {})
+        properties["msg_type"] = {
+            "type": "string",
+            "enum": list(allowed_modes),
+            "description": "Authorized A2A mode for this Agent's current operating authority.",
+        }
+        required = list(parameters.get("required", []))
+        if "msg_type" not in required:
+            required.append("msg_type")
+        parameters["required"] = required
+        if "task_delegate" not in allowed_modes:
+            properties.pop("delegation_contract", None)
+        result.append(projected)
+    return result
+
+
+def _apply_release_a2a_schema_contract(tools: list[dict]) -> list[dict]:
+    """Hide asynchronous A2A modes while the release-wide worker is closed."""
+    if _a2a_global_async_enabled():
+        return tools
+    return _strip_a2a_msg_type(tools)
+
+
+async def _apply_ceo_a2a_schema_contract(
+    agent_id: uuid.UUID,
+    tools: list[dict],
+) -> list[dict]:
+    """Align the CEO's model-facing A2A schema with server-owned authority."""
+    from app.models.ceo import CeoOrchestratorSettings
+    from app.services.ceo_briefing import ceo_operating_mode
+
+    try:
+        async with async_session() as db:
+            result = await db.execute(
+                select(CeoOrchestratorSettings).where(
+                    CeoOrchestratorSettings.ceo_agent_id == agent_id
+                )
+            )
+            settings_row = result.scalar_one_or_none()
+    except Exception as exc:
+        logger.warning(
+            "[Tools] CEO A2A schema projection failed closed at Runtime enforcement: {}",
+            type(exc).__name__,
+        )
+        return tools
+
+    if settings_row is None:
+        return tools
+    mode = ceo_operating_mode(settings_row)
+    if mode == "observer":
+        return _restrict_a2a_msg_types(
+            tools,
+            allowed_modes=("consult",),
+            description=(
+                "Ask one digital employee a bounded private question and wait for the "
+                "correlated reply. Observer CEO authority cannot notify or delegate work."
+            ),
+        )
+    if mode in {"coordinator", "coordinator_auto"}:
+        if not _a2a_global_async_enabled():
+            return _strip_a2a_msg_type(tools)
+        return _restrict_a2a_msg_types(
+            tools,
+            allowed_modes=("consult", "notify", "task_delegate"),
+            description=(
+                "Consult for a bounded question, notify for one-way information, or use "
+                "task_delegate only for governed work with a delegation_contract and "
+                "correlated Runtime receipts."
+            ),
+        )
+    # A configured but disabled/rollout-closed CEO must not see a private A2A
+    # operation at all. Runtime enforcement remains the second line of defense.
+    return [
+        tool
+        for tool in tools
+        if tool.get("function", {}).get("name") != "send_message_to_agent"
+    ]
 
 
 def _apply_trigger_execution_contract(tools: list[dict]) -> list[dict]:

@@ -13,6 +13,14 @@ const COMPOSER_LAUNCHABLE_WORKFLOWS = new Set([
     'builtin.presentation.v2@2.0.0',
 ]);
 
+// V1 requests can come from pre-preflight servers during a rolling upgrade.
+// Every newer protocol must carry an explicit, persisted launch decision.
+const LEGACY_PREFLIGHT_OPTIONAL_WORKFLOWS = new Set([
+    'builtin.poster.v1@1.0.0',
+    'builtin.presentation.v1@1.0.0',
+    'builtin.video.v1@1.0.0',
+]);
+
 const WORK_TASK_TO_DELIVERABLE_TYPE: Partial<Record<string, DeliverableWorkType>> = {
     image: 'poster',
     video: 'video',
@@ -159,9 +167,10 @@ export function requestCanLaunchFromComposer(request: DeliverableRequest): boole
     if (!baseLaunchable || request.current_stage === 'brief_clarifying') return false;
     if (request.current_stage !== 'brief_confirmed') return true;
     const launchable = request.latest_preflight?.launchable;
-    // Older servers did not persist the Provider-free snapshot. Preserve their
-    // behavior during rolling upgrades; new servers make this an explicit fact.
-    return typeof launchable === 'boolean' ? launchable : true;
+    if (typeof launchable === 'boolean') return launchable;
+    return LEGACY_PREFLIGHT_OPTIONAL_WORKFLOWS.has(
+        `${request.workflow_id}@${request.workflow_version}`,
+    );
 }
 
 export function deliverableNextAction(

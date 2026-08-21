@@ -23,12 +23,14 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["backfill_deliv_audit_tenant"]
+    assert _script_directory().get_heads() == ["manual_order_decisions"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("backfill_deliv_audit_tenant")
+    release_head = script.get_revision("manual_order_decisions")
+    billing_effect_receipts_revision = script.get_revision("billing_effect_receipts")
+    deliverable_audit_revision = script.get_revision("backfill_deliv_audit_tenant")
     widen_creative_brief_revision = script.get_revision("widen_creative_brief_schema")
     ceo_coordination_revision = script.get_revision("ceo_coordination_mode")
     ceo_orchestrator_revision = script.get_revision("ceo_orchestrator_settings")
@@ -74,7 +76,13 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("widen_creative_brief_schema",)
+    assert release_head._normalized_down_revisions == ("billing_effect_receipts",)
+    assert billing_effect_receipts_revision._normalized_down_revisions == (
+        "backfill_deliv_audit_tenant",
+    )
+    assert deliverable_audit_revision._normalized_down_revisions == (
+        "widen_creative_brief_schema",
+    )
     assert widen_creative_brief_revision._normalized_down_revisions == (
         "ceo_coordination_mode",
     )
@@ -160,8 +168,8 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         BACKEND_ROOT.parent / "scripts/tenant-purge-postgres-smoke.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_deliv_audit_tenant' in smoke
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_deliv_audit_tenant' in purge_smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-manual_order_decisions' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-manual_order_decisions' in purge_smoke
     assert 'grep -F "${release_head} (head)"' in purge_smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke

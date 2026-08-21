@@ -266,7 +266,7 @@ def test_topology_agent_status_projects_live_execution_without_hiding_health_fai
 
 
 @pytest.mark.asyncio
-async def test_work_summary_queries_are_viewer_scoped_and_not_globally_capped():
+async def test_work_summary_queries_are_viewer_scoped_and_bounded_per_agent():
     tenant_id = uuid.uuid4()
     user_id = uuid.uuid4()
     employee_id = uuid.uuid4()
@@ -288,8 +288,12 @@ async def test_work_summary_queries_are_viewer_scoped_and_not_globally_capped():
     assert "deliverable_requests.updated_at" in deliverable_query
     assert "tasks.created_by" in task_query
     assert "tasks.updated_at" in task_query
-    assert "LIMIT" not in deliverable_query
-    assert "LIMIT" not in task_query
+    assert "LIMIT" in deliverable_query
+    assert "LIMIT" in task_query
+    assert "row_number() OVER" in deliverable_query
+    assert "PARTITION BY deliverable_requests.agent_id" in deliverable_query
+    assert "row_number() OVER" in task_query
+    assert "PARTITION BY tasks.agent_id" in task_query
 
 
 @pytest.mark.asyncio
@@ -397,7 +401,11 @@ async def test_execution_summary_covers_company_runs_deliverables_and_media_with
     assert len(db.statements) == 4
     assert "agent_runs.origin_user_id =" not in str(db.statements[0])
     assert "NOT (EXISTS" in str(db.statements[0])
-    assert all("LIMIT" not in str(statement) for statement in db.statements)
+    assert all("LIMIT" in str(statement) for statement in db.statements)
+    assert "PARTITION BY agent_runs.agent_id" in str(db.statements[0])
+    assert "PARTITION BY agent_run_events.run_id" in str(db.statements[1])
+    assert "PARTITION BY deliverable_requests.agent_id" in str(db.statements[2])
+    assert "PARTITION BY media_generation_tasks.agent_id" in str(db.statements[3])
 
 
 @pytest.mark.asyncio

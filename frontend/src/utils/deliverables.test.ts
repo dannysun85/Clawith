@@ -262,11 +262,30 @@ describe('deliverable composer selection', () => {
         }))).toBe(true);
     });
 
+    it('requires an explicit persisted preflight decision for every v2 brief', () => {
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.presentation.v1',
+            workflow_version: '1.0.0',
+            latest_preflight: undefined,
+        }))).toBe(true);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.presentation.v2',
+            workflow_version: '2.0.0',
+            latest_preflight: undefined,
+        }))).toBe(false);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.presentation.v2',
+            workflow_version: '2.0.0',
+            latest_preflight: { launchable: true },
+        }))).toBe(true);
+    });
+
     it('launches the v2 poster pipeline only with its exact version pair', () => {
         expect(requestCanLaunchFromComposer(request({
             workflow_id: 'builtin.poster.v2',
             workflow_version: '2.0.0',
             work_type: 'poster',
+            latest_preflight: { launchable: true },
         }))).toBe(true);
         expect(requestCanLaunchFromComposer(request({
             workflow_id: 'builtin.poster.v2',
@@ -287,6 +306,7 @@ describe('deliverable composer selection', () => {
             workflow_version: '2.0.0',
             work_type: 'video',
             output_contract: ['mp4'],
+            latest_preflight: { launchable: true },
         }))).toBe(true);
         expect(requestCanLaunchFromComposer(request({
             workflow_id: 'builtin.video.v2',
@@ -302,6 +322,7 @@ describe('deliverable composer selection', () => {
             workflow_version: '2.0.0',
             work_type: 'video',
             output_contract: ['mp4'],
+            latest_preflight: { launchable: true },
         }))).toBe(true);
         expect(requestCanLaunchFromComposer(request({
             workflow_id: 'builtin.video.v2',

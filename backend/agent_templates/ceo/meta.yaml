@@ -63,4 +63,5 @@ source_provenance:
     - "docs/product-line/22-ceo-p2-coordinator-architecture-2026-08-20.md"
   license: "Astra internal design"
   adaptation: "Astra-native single CEO role with P1/P2 server-owned authority; no third-party source material."
-lifecycle_status: "enabled"
+lifecycle_status: "not_recruitable"
+activation_gate: "ceo_orchestrator_governor_enable_only"

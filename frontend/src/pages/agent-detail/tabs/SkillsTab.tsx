@@ -90,6 +90,11 @@ export default function SkillsTab(props: Props) {
 
     return (
         <div>
+            {!canManage && (
+                <div role="note" style={{ marginBottom: 16, padding: '10px 12px', borderRadius: 8, background: 'var(--bg-secondary)', fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                    {t('agent.permissions.manageRequiredForSkills', 'You have use access. Installing, importing, editing, or deleting Skills requires manage access.')}
+                </div>
+            )}
             <div style={{ marginBottom: '16px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>

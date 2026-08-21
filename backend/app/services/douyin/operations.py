@@ -145,6 +145,10 @@ class DouyinOperationsService:
         configured = is_configured()
         return {
             "configured": configured,
+            # OAuth/account connectivity and background direct publishing are
+            # separate release gates. Expose the latter explicitly so the UI
+            # never infers it from credentials or granted scopes.
+            "direct_publish_available": bool(direct_publish_enabled()),
             "status": "ready" if configured else "not_configured",
             "message": (
                 "Douyin OpenAPI app is configured."

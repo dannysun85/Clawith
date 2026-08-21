@@ -496,6 +496,7 @@ export default function Layout() {
     const [langSubmenuPos, setLangSubmenuPos] = useState({ top: 0, left: 0 });
     const accountMenuRef = useRef<HTMLDivElement>(null);
     const accountDropdownRef = useRef<HTMLDivElement>(null);
+    const langMenuTriggerRef = useRef<HTMLButtonElement>(null);
     const langSubmenuPortalRef = useRef<HTMLDivElement>(null);
     const langHoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [showNotifications, setShowNotifications] = useState(false);
@@ -796,10 +797,30 @@ export default function Layout() {
     }, []);
 
     const updateLangSubmenuPosition = useCallback(() => {
-        const el = accountDropdownRef.current;
+        const el = langMenuTriggerRef.current ?? accountDropdownRef.current;
         if (!el) return;
-        const r = el.getBoundingClientRect();
-        setLangSubmenuPos({ top: r.top, left: r.right + 2 });
+        const rect = el.getBoundingClientRect();
+        const viewportPadding = 12;
+        const menuWidth = 148;
+        const menuHeight = 84;
+        const right = rect.right + 6;
+        const left = rect.left - menuWidth - 6;
+        const opensBeside = right + menuWidth <= window.innerWidth - viewportPadding
+            || left >= viewportPadding;
+        const resolvedLeft = right + menuWidth <= window.innerWidth - viewportPadding
+            ? right
+            : left >= viewportPadding
+                ? left
+                : Math.min(
+                    Math.max(viewportPadding, rect.left),
+                    Math.max(viewportPadding, window.innerWidth - menuWidth - viewportPadding),
+                );
+        const preferredTop = opensBeside ? rect.top : rect.bottom + 4;
+        const resolvedTop = Math.min(
+            Math.max(viewportPadding, preferredTop),
+            Math.max(viewportPadding, window.innerHeight - menuHeight - viewportPadding),
+        );
+        setLangSubmenuPos({ top: resolvedTop, left: resolvedLeft });
     }, []);
 
     const updateTenantMenuPosition = useCallback(() => {
@@ -1247,10 +1268,12 @@ export default function Layout() {
                                         onMouseLeave={scheduleCloseLangSubmenu}
                                     >
                                         <button
+                                            ref={langMenuTriggerRef}
                                             type="button"
                                             className="account-dropdown-item language-menu-trigger"
                                             aria-haspopup="menu"
                                             aria-expanded={showLanguageSubmenu}
+                                            onClick={() => setShowLanguageSubmenu(true)}
                                         >
                                             <IconWorld size={15} stroke={1.5} />
                                             <span className="language-menu-label">
@@ -1310,9 +1333,13 @@ export default function Layout() {
                                 </div>
                             )}
                             {typeof document !== 'undefined' && langSubmenuContent && createPortal(langSubmenuContent, document.body)}
-                            <div
+                            <button
+                                type="button"
                                 className="sidebar-account-row"
                                 onClick={() => setShowAccountMenu(v => !v)}
+                                aria-haspopup="menu"
+                                aria-expanded={showAccountMenu}
+                                aria-label={isChinese ? '打开账户菜单' : 'Open account menu'}
                             >
                                 <div style={{
                                     width: '28px', height: '28px', borderRadius: 'var(--radius-md)',
@@ -1337,7 +1364,7 @@ export default function Layout() {
                                     transform: showAccountMenu ? 'rotate(0deg)' : 'rotate(180deg)',
                                     transition: 'transform 0.2s ease',
                                 }} />
-                            </div>
+                            </button>
                         </div>
                         <VersionDisplay />
                     </div>

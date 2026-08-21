@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
+from functools import lru_cache
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -35,6 +36,33 @@ MAX_WINDOW_HOURS = 168
 _ACTIVITY_PREVIEW_LIMIT = 10
 
 
+@lru_cache(maxsize=32)
+def _parse_exact_uuid_allowlist(raw: str, field_name: str) -> frozenset[str]:
+    """Parse a rollout allowlist as canonical UUIDs and fail closed otherwise.
+
+    Wildcards, labels, and malformed values are intentionally ignored.  The
+    warning reports only a count so rollout configuration cannot leak through
+    logs while still giving operators a deterministic diagnostic.
+    """
+    parsed: set[str] = set()
+    invalid_count = 0
+    for item in str(raw or "").split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            parsed.add(str(uuid.UUID(value)))
+        except (AttributeError, TypeError, ValueError):
+            invalid_count += 1
+    if invalid_count:
+        logger.warning(
+            "[CEO] Ignored {} non-UUID value(s) in {}; wildcard rollout is not supported",
+            invalid_count,
+            field_name,
+        )
+    return frozenset(parsed)
+
+
 def ceo_orchestrator_allowed(
     *,
     tenant_id: uuid.UUID | str | None,
@@ -50,12 +78,17 @@ def ceo_orchestrator_allowed(
     if not s.CEO_ORCHESTRATOR_ENABLED:
         return False
 
-    def parse(raw: str) -> set[str]:
-        return {item.strip() for item in str(raw or "").split(",") if item.strip()}
-
-    if str(tenant_id) in parse(s.CEO_ORCHESTRATOR_TENANT_IDS):
+    tenant_allowlist = _parse_exact_uuid_allowlist(
+        s.CEO_ORCHESTRATOR_TENANT_IDS,
+        "CEO_ORCHESTRATOR_TENANT_IDS",
+    )
+    agent_allowlist = _parse_exact_uuid_allowlist(
+        s.CEO_ORCHESTRATOR_AGENT_IDS,
+        "CEO_ORCHESTRATOR_AGENT_IDS",
+    )
+    if str(tenant_id) in tenant_allowlist:
         return True
-    return agent_id is not None and str(agent_id) in parse(s.CEO_ORCHESTRATOR_AGENT_IDS)
+    return agent_id is not None and str(agent_id) in agent_allowlist
 
 
 def ceo_coordination_rollout_allowed(
@@ -79,12 +112,17 @@ def ceo_coordination_rollout_allowed(
     if not s.CEO_COORDINATION_ENABLED:
         return False
 
-    def parse(raw: str) -> set[str]:
-        return {item.strip() for item in str(raw or "").split(",") if item.strip()}
-
-    if str(tenant_id) in parse(s.CEO_COORDINATION_TENANT_IDS):
+    tenant_allowlist = _parse_exact_uuid_allowlist(
+        s.CEO_COORDINATION_TENANT_IDS,
+        "CEO_COORDINATION_TENANT_IDS",
+    )
+    agent_allowlist = _parse_exact_uuid_allowlist(
+        s.CEO_COORDINATION_AGENT_IDS,
+        "CEO_COORDINATION_AGENT_IDS",
+    )
+    if str(tenant_id) in tenant_allowlist:
         return True
-    return agent_id is not None and str(agent_id) in parse(s.CEO_COORDINATION_AGENT_IDS)
+    return agent_id is not None and str(agent_id) in agent_allowlist
 
 
 def ceo_coordination_allowed(

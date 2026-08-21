@@ -102,7 +102,17 @@ export default function ProductConsoleShell({
                         <span>{kind === 'company' ? '公司治理范围' : '全局平台范围'}</span>
                         <strong>{title}</strong>
                     </div>
-                    <div className="product-console__actions">{headerActions}</div>
+                    <div className="product-console__actions">
+                        {headerActions}
+                        <div className="product-console__mobile-account" aria-label="移动端账号操作">
+                            <button type="button" onClick={() => navigate('/account/security')} aria-label="登录安全" title="登录安全">
+                                <IconShieldLock size={17} />
+                            </button>
+                            <button type="button" onClick={handleLogout} aria-label="退出登录" title="退出登录">
+                                <IconLogout size={17} />
+                            </button>
+                        </div>
+                    </div>
                 </header>
                 {banner}
                 <MfaRecommendationBanner />

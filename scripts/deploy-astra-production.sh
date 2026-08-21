@@ -956,6 +956,60 @@ sys.stdout.write(f"{release_id}\n{release_commit}\n{actor_id.lower()}\n{process_
 '
 }
 
+inspect_candidate_closed_feature_contract() {
+    local backend_id="$1"
+
+    # Filter only non-secret rollout policy keys in Docker's Go template. No
+    # credential-bearing environment value is allowed to reach the shell.
+    docker inspect -f \
+        '{{range .Config.Env}}{{if or (eq (index (split . "=") 0) "CEO_ORCHESTRATOR_ENABLED") (eq (index (split . "=") 0) "CEO_ORCHESTRATOR_TENANT_IDS") (eq (index (split . "=") 0) "CEO_ORCHESTRATOR_AGENT_IDS") (eq (index (split . "=") 0) "CEO_COORDINATION_ENABLED") (eq (index (split . "=") 0) "CEO_COORDINATION_TENANT_IDS") (eq (index (split . "=") 0) "CEO_COORDINATION_AGENT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_POSTER_V2_ENABLED") (eq (index (split . "=") 0) "DELIVERABLE_POSTER_V2_TENANT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_POSTER_V2_AGENT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_VIDEO_V2_ENABLED") (eq (index (split . "=") 0) "DELIVERABLE_VIDEO_V2_TENANT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_VIDEO_V2_AGENT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_PRESENTATION_V2_ENABLED") (eq (index (split . "=") 0) "DELIVERABLE_PRESENTATION_V2_TENANT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_PRESENTATION_V2_AGENT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED") (eq (index (split . "=") 0) "DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS") (eq (index (split . "=") 0) "DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS")}}{{println .}}{{end}}{{end}}' \
+        "$backend_id" | python3 -c '
+import sys
+
+expected = {
+    "CEO_ORCHESTRATOR_ENABLED": "false",
+    "CEO_ORCHESTRATOR_TENANT_IDS": "",
+    "CEO_ORCHESTRATOR_AGENT_IDS": "",
+    "CEO_COORDINATION_ENABLED": "false",
+    "CEO_COORDINATION_TENANT_IDS": "",
+    "CEO_COORDINATION_AGENT_IDS": "",
+    "DELIVERABLE_POSTER_V2_ENABLED": "false",
+    "DELIVERABLE_POSTER_V2_TENANT_IDS": "",
+    "DELIVERABLE_POSTER_V2_AGENT_IDS": "",
+    "DELIVERABLE_VIDEO_V2_ENABLED": "false",
+    "DELIVERABLE_VIDEO_V2_TENANT_IDS": "",
+    "DELIVERABLE_VIDEO_V2_AGENT_IDS": "",
+    "DELIVERABLE_PRESENTATION_V2_ENABLED": "false",
+    "DELIVERABLE_PRESENTATION_V2_TENANT_IDS": "",
+    "DELIVERABLE_PRESENTATION_V2_AGENT_IDS": "",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED": "false",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS": "",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS": "",
+}
+raw = sys.stdin.read(16_385)
+if len(raw) > 16_384:
+    raise SystemExit("candidate closed-feature contract output is too large")
+actual = {key: [] for key in expected}
+for line in raw.splitlines():
+    key, separator, value = line.partition("=")
+    if separator and key in actual:
+        actual[key].append(value)
+if any(len(values) != 1 for values in actual.values()):
+    raise SystemExit("candidate closed-feature contract is missing or duplicated")
+drift = {
+    key: values[0]
+    for key, values in actual.items()
+    if values[0] != expected[key]
+}
+if drift:
+    raise SystemExit(
+        "candidate closed-feature contract drifted: "
+        + ",".join(sorted(drift))
+    )
+print("candidate_closed_feature_contract=ok")
+'
+}
+
 inspect_rollback_worker_runtime_identity() {
     local worker_id="$1"
 
@@ -4614,7 +4668,7 @@ if [ ! -d "$RELEASE/sidecars" ] && [ -d "$PREVIOUS/sidecars" ]; then
     cp -a "$PREVIOUS/sidecars" "$RELEASE/sidecars"
 fi
 
-python3 - "$RELEASE/.env" "$VERSION" "$COMMIT" "$RELEASE_ID" "$CANDIDATE_PORT" "$CANDIDATE_BACKEND_ALIAS" "$COMPOSE_PROJECT" "$ROTATE_JWT" <<'PY'
+python3 - "$RELEASE/.env" "$VERSION" "$COMMIT" "$RELEASE_ID" "$CANDIDATE_PORT" "$CANDIDATE_BACKEND_ALIAS" "$ROTATE_JWT" <<'PY'
 from pathlib import Path
 import secrets
 import sys
@@ -4636,6 +4690,24 @@ updates = {
     "AGENT_RUNTIME_V2_AGENT_IDS": "",
     "AGENT_RUNTIME_V2_SOURCE_TYPES": "",
     "AGENT_RUNTIME_COMMAND_CONCURRENCY": "10",
+    "CEO_ORCHESTRATOR_ENABLED": "false",
+    "CEO_ORCHESTRATOR_TENANT_IDS": "",
+    "CEO_ORCHESTRATOR_AGENT_IDS": "",
+    "CEO_COORDINATION_ENABLED": "false",
+    "CEO_COORDINATION_TENANT_IDS": "",
+    "CEO_COORDINATION_AGENT_IDS": "",
+    "DELIVERABLE_POSTER_V2_ENABLED": "false",
+    "DELIVERABLE_POSTER_V2_TENANT_IDS": "",
+    "DELIVERABLE_POSTER_V2_AGENT_IDS": "",
+    "DELIVERABLE_VIDEO_V2_ENABLED": "false",
+    "DELIVERABLE_VIDEO_V2_TENANT_IDS": "",
+    "DELIVERABLE_VIDEO_V2_AGENT_IDS": "",
+    "DELIVERABLE_PRESENTATION_V2_ENABLED": "false",
+    "DELIVERABLE_PRESENTATION_V2_TENANT_IDS": "",
+    "DELIVERABLE_PRESENTATION_V2_AGENT_IDS": "",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED": "false",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS": "",
+    "DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS": "",
     "HEARTBEAT_ENABLED": "false",
     "TRIGGER_DAEMON_ENABLED": "true",
     "USER_AUTOMATION_EXECUTION_ENABLED": "true",
@@ -4666,11 +4738,8 @@ updates = {
     "FRONTEND_PORT": sys.argv[5],
     "BACKEND_NETWORK_ALIAS": sys.argv[6],
     "API_UPSTREAM": f"{sys.argv[6]}:8000",
-    "POSTGRES_VOLUME": f"{sys.argv[7]}_pgdata",
-    "REDIS_VOLUME": f"{sys.argv[7]}_redisdata",
-    "AGENT_DATA_VOLUME": f"{sys.argv[7]}_agentdata",
 }
-if sys.argv[8] == "1":
+if sys.argv[7] == "1":
     updates["JWT_SECRET_KEY"] = secrets.token_urlsafe(64)
 lines = path.read_text(encoding="utf-8").splitlines()
 seen = set()
@@ -4691,37 +4760,68 @@ for key, value in updates.items():
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
 
-# IdentityProvider and ChannelConfig envelopes are tied to SECRET_KEY.  A
-# normal release must preserve it byte-for-byte; rotation requires a separate
-# decrypt/re-encrypt workflow and may never happen implicitly during cutover.
+# IdentityProvider and ChannelConfig envelopes are tied to SECRET_KEY. The
+# shared data-plane identity is likewise outside an application release. A
+# normal release must preserve both contracts byte-for-byte; rotation or a
+# volume/network move requires a separate authorized workflow.
 python3 - "$PREVIOUS/.env" "$RELEASE/.env" <<'PY'
 from hmac import compare_digest
 from pathlib import Path
 import sys
 
 
-def read_secret(path: str) -> str:
+def read_env(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         if line.lstrip().startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key.strip() != "SECRET_KEY":
-            continue
+        key = key.strip()
+        if key in values:
+            raise SystemExit(f"release environment contains duplicate key: {key}")
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
-        return value
-    return ""
+        values[key] = value
+    return values
 
 
-previous = read_secret(sys.argv[1])
-candidate = read_secret(sys.argv[2])
-if not previous or not candidate or not compare_digest(previous, candidate):
+previous = read_env(sys.argv[1])
+candidate = read_env(sys.argv[2])
+previous_secret = previous.get("SECRET_KEY", "")
+candidate_secret = candidate.get("SECRET_KEY", "")
+if (
+    not previous_secret
+    or not candidate_secret
+    or not compare_digest(previous_secret, candidate_secret)
+):
     raise SystemExit(
         "SECRET_KEY continuity check failed; use the explicit envelope-key "
         "rotation workflow instead of a version deployment"
     )
 print("SECRET_KEY continuity verified")
+
+data_plane_keys = (
+    "DOCKER_NETWORK",
+    "POSTGRES_VOLUME",
+    "REDIS_VOLUME",
+    "AGENT_DATA_VOLUME",
+    "POSTGRES_USER",
+    "POSTGRES_DB",
+    "POSTGRES_PASSWORD",
+)
+drifted = [
+    key
+    for key in data_plane_keys
+    if not compare_digest(previous.get(key, ""), candidate.get(key, ""))
+]
+if drifted:
+    raise SystemExit(
+        "data-plane identity continuity check failed: "
+        + ",".join(drifted)
+        + "; use a separate authorized data-plane change"
+    )
+print("data-plane identity continuity verified")
 PY
 
 cp "$PREVIOUS/VERSION" "$BACKUP/VERSION.previous" 2>/dev/null || true
@@ -5139,6 +5239,25 @@ done
 CANDIDATE_BACKEND_ID="$(compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" ps -q backend)"
 test -n "$CANDIDATE_BACKEND_ID"
 test "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CANDIDATE_BACKEND_ID")" = "healthy"
+echo "[remote] verifying candidate closed-feature contract"
+if ! inspect_candidate_closed_feature_contract "$CANDIDATE_BACKEND_ID"; then
+    abort_release "candidate CEO or Creative V2 rollout contract is not closed"
+fi
+echo "[remote] recording identity-free production governance inventory"
+GOVERNANCE_INVENTORY_TEMP="$(
+    mktemp "$BACKUP/.production-governance-inventory.XXXXXX"
+)" || abort_release "cannot allocate production governance inventory evidence"
+if ! timeout 180s docker exec -i "$CANDIDATE_BACKEND_ID" \
+    python -m app.scripts.inventory_production_governance \
+    --fail-on-ledger-drift \
+    > "$GOVERNANCE_INVENTORY_TEMP" < /dev/null; then
+    chmod 0600 "$GOVERNANCE_INVENTORY_TEMP" 2>/dev/null || true
+    abort_release "identity-free governance inventory failed or detected Credits ledger drift"
+fi
+mv "$GOVERNANCE_INVENTORY_TEMP" \
+    "$BACKUP/production-governance-inventory.candidate.json"
+chmod 0600 "$BACKUP/production-governance-inventory.candidate.json"
+test -s "$BACKUP/production-governance-inventory.candidate.json"
 
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps frontend
 echo "[remote] verifying candidate release identity"

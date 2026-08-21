@@ -16,13 +16,16 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -217,9 +220,120 @@ class PaymentOrder(Base):
     provider_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_payment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
-    # pending / paid / failed / canceled / refunded
+    # pending / paid / partially_refunded / failed / canceled / refunded
+    refunded_amount_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    refunded_credits: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    paid_effects_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="not_applicable", server_default="not_applicable"
+    )
+    # not_applicable / pending / processing / applied / failed
+    paid_effects_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    paid_effects_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    paid_effects_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    paid_effects_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_close_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="not_requested", server_default="not_requested"
+    )
+    # not_requested / retry_wait / operator_review / closed
+    provider_close_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    provider_close_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_close_last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_close_next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PaymentOrderOperatorDecision(Base):
+    """Durable receipt for one explicit manual-order operator decision.
+
+    The raw idempotency key is never stored.  Every status transition is
+    tenant-fenced and can be traced to its actor, evidence, before/after state,
+    and (for a restored cancellation) the exact decision being rolled back.
+    """
+
+    __tablename__ = "payment_order_operator_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id",
+            "idempotency_key_hash",
+            name="uq_payment_order_operator_decision_idempotency",
+        ),
+        UniqueConstraint(
+            "rollback_of_decision_id",
+            name="uq_payment_order_operator_decision_rollback",
+        ),
+        CheckConstraint(
+            "disposition IN ('keep_pending', 'mark_paid', 'cancel_expired', "
+            "'cancel_test', 'cancel_invalid', 'restore_pending')",
+            name="ck_payment_order_operator_decision_disposition",
+        ),
+        CheckConstraint(
+            "previous_status IN ('pending', 'canceled') AND "
+            "resulting_status IN ('pending', 'paid', 'canceled')",
+            name="ck_payment_order_operator_decision_statuses",
+        ),
+        CheckConstraint(
+            "(disposition = 'restore_pending' AND rollback_of_decision_id IS NOT NULL) OR "
+            "(disposition != 'restore_pending' AND rollback_of_decision_id IS NULL)",
+            name="ck_payment_order_operator_decision_rollback_shape",
+        ),
+        Index(
+            "ix_payment_order_operator_decisions_order_created",
+            "order_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("payment_orders.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    disposition: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_ref: Mapped[str] = mapped_column(String(500), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    previous_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    resulting_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    rollback_of_decision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("payment_order_operator_decisions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class BillingWebhookEvent(Base):
@@ -231,6 +345,9 @@ class BillingWebhookEvent(Base):
     provider: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     event_id: Mapped[str] = mapped_column(String(255), nullable=False)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("payment_orders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="processing")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
