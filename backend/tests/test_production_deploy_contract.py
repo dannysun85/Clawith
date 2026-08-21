@@ -797,6 +797,7 @@ def test_dedicated_smoke_principal_lifecycle_is_explicit_bounded_and_pre_cutover
     assert "export -n SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" in script
     assert "export -n SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" in script
     assert "manage_production_smoke_principals.py" in script
+    assert 'env PYTHONPATH=/app python "$manager_path"' in script
     assert '--confirm-environment production' in script
     assert '--confirm-tenant-id "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID"' in script
     assert 'manager_args+=(--operation-id "$operation_id" --apply)' in script
@@ -1782,6 +1783,18 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
     )
     assert missing_network.returncode != 0
     assert "invalid Docker network name" in missing_network.stderr
+
+
+def test_production_database_backup_is_created_owner_only():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    start = script.index('echo "[remote] backing up database to $BACKUP/db.sql.gz"')
+    end = script.index('echo "[remote] validating persisted MCP endpoint policy"', start)
+    backup = script[start:end]
+
+    assert "(\n    umask 077" in backup
+    assert 'gzip > "$BACKUP/db.sql.gz"' in backup
+    assert 'chmod 0600 "$BACKUP/db.sql.gz"' in backup
+    assert 'test -s "$BACKUP/db.sql.gz"' in backup
 
 
 def test_mcp_host_egress_guard_installation_uses_the_live_network():

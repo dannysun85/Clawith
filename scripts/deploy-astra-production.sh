@@ -1585,7 +1585,7 @@ run_smoke_principal_manager() {
     fi
 
     manager_args=(
-        python "$manager_path"
+        env PYTHONPATH=/app python "$manager_path"
         --action "$action"
         --credentials-file "$SMOKE_PRINCIPAL_CONTAINER_FILE"
         --confirm-environment production
@@ -5159,8 +5159,14 @@ read_env() {
 POSTGRES_USER="$(read_env POSTGRES_USER astra)"
 POSTGRES_DB="$(read_env POSTGRES_DB astra)"
 echo "[remote] backing up database to $BACKUP/db.sql.gz"
-compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
-    exec -T postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" < /dev/null | gzip > "$BACKUP/db.sql.gz"
+(
+    umask 077
+    compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
+        exec -T postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" < /dev/null | \
+        gzip > "$BACKUP/db.sql.gz"
+)
+chmod 0600 "$BACKUP/db.sql.gz"
+test -s "$BACKUP/db.sql.gz"
 
 echo "[remote] validating persisted MCP endpoint policy"
 mcp_endpoint_preflight "$PREVIOUS"
