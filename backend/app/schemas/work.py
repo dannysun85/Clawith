@@ -9,6 +9,82 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class WorkResultLengthContract(BaseModel):
+    """A deterministic result-size boundary confirmed before execution."""
+
+    unit: Literal["characters", "cjk_characters", "words"] = "characters"
+    minimum: int | None = Field(default=None, ge=1, le=6000)
+    maximum: int | None = Field(default=None, ge=1, le=6000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "WorkResultLengthContract":
+        if self.minimum is None and self.maximum is None:
+            raise ValueError("at least one result length boundary is required")
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and self.minimum > self.maximum
+        ):
+            raise ValueError("minimum result length cannot exceed maximum")
+        safe_inline_limits = {
+            "characters": 6000,
+            "cjk_characters": 1200,
+            "words": 1200,
+        }
+        requested_limit = max(
+            value for value in (self.minimum, self.maximum) if value is not None
+        )
+        if requested_limit > safe_inline_limits[self.unit]:
+            raise ValueError(
+                "inline result length exceeds the safe model boundary; use a formal Deliverable"
+            )
+        return self
+
+
+class WorkAcceptanceContract(BaseModel):
+    """Human-confirmed criteria plus deterministic Runtime checks."""
+
+    version: Literal[1] = 1
+    criteria: list[str] = Field(
+        default_factory=lambda: [
+            "The result directly addresses the confirmed objective and is usable for the next business action."
+        ],
+        min_length=1,
+        max_length=12,
+    )
+    required_sections: list[str] = Field(default_factory=list, max_length=12)
+    forbidden_terms: list[str] = Field(default_factory=list, max_length=20)
+    result_language: Literal["auto", "zh-CN", "en"] = "auto"
+    length: WorkResultLengthContract | None = None
+    evidence_required: bool = False
+    owner_review_required: bool = True
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def normalize_contract(self) -> "WorkAcceptanceContract":
+        def normalized(values: list[str], *, field_name: str) -> list[str]:
+            clean = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+            if field_name == "criteria" and not clean:
+                raise ValueError("at least one acceptance criterion is required")
+            if any(len(value) > 300 for value in clean):
+                raise ValueError(f"{field_name} entries cannot exceed 300 characters")
+            return clean
+
+        self.criteria = normalized(self.criteria, field_name="criteria")
+        self.required_sections = normalized(
+            self.required_sections,
+            field_name="required_sections",
+        )
+        self.forbidden_terms = normalized(
+            self.forbidden_terms,
+            field_name="forbidden_terms",
+        )
+        return self
+
+
 class WorkTaskDraft(BaseModel):
     title: str = Field(min_length=1, max_length=500)
     intent: str = Field(min_length=3, max_length=4000)
@@ -32,6 +108,9 @@ class WorkTaskDraft(BaseModel):
     source_session_id: uuid.UUID | None = None
     source_message_id: uuid.UUID | None = None
     source_message_cursor: str | None = Field(default=None, max_length=500)
+    acceptance_contract: WorkAcceptanceContract = Field(
+        default_factory=WorkAcceptanceContract
+    )
 
     model_config = ConfigDict(extra="forbid")
 
@@ -178,6 +257,9 @@ class WorkItemOut(BaseModel):
     deliverable_status: str | None = None
     artifact_status: str | None = None
     review_status: str | None = None
+    result_review_status: Literal[
+        "not_required", "pending", "approved", "request_changes"
+    ] = "not_required"
     approval_status: str | None = None
     delivery_status: str
     delivery_mode: Literal["task_only", "formal_deliverable"]
@@ -222,8 +304,10 @@ class WorkNextActionOut(BaseModel):
     task_id: uuid.UUID | None = None
     kind: Literal[
         "quality_review",
+        "task_result_review",
         "runtime_approval",
         "delivery_approval",
+        "tool_reconciliation",
         "task_recovery",
         "delivery_recovery",
     ]
@@ -236,6 +320,22 @@ class WorkNextActionOut(BaseModel):
     created_at: datetime
     due_at: datetime | None = None
     version: str | None = None
+
+
+class WorkToolReconciliation(BaseModel):
+    client_request_id: uuid.UUID
+    outcome: Literal["applied", "not_applied"]
+    note: str = Field(min_length=1, max_length=2_000)
+
+
+class WorkToolReconciliationOut(BaseModel):
+    task_id: uuid.UUID
+    run_id: uuid.UUID
+    execution_id: uuid.UUID
+    execution_status: Literal["succeeded", "failed"]
+    command_id: uuid.UUID
+    created: bool
+    result_summary: str
 
 
 class GroupTaskParticipantOut(BaseModel):
@@ -322,6 +422,18 @@ class WorkRunSummaryOut(BaseModel):
     updated_at: datetime
 
 
+class WorkTaskResultReviewReceiptOut(BaseModel):
+    id: uuid.UUID
+    task_id: uuid.UUID
+    run_id: uuid.UUID
+    actor_user_id: uuid.UUID
+    action: Literal["approve", "request_changes"]
+    comment: str | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class WorkDeliverableSummaryOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -375,6 +487,9 @@ class WorkTaskDetailOut(BaseModel):
     timeline: list[WorkTimelineEventOut] = Field(default_factory=list)
     next_actions: list[WorkNextActionOut] = Field(default_factory=list)
     runs: list[WorkRunSummaryOut] = Field(default_factory=list)
+    task_result_reviews: list[WorkTaskResultReviewReceiptOut] = Field(
+        default_factory=list
+    )
     deliverables: list[WorkDeliverableSummaryOut] = Field(default_factory=list)
     artifacts: list[WorkArtifactDetailOut] = Field(default_factory=list)
     reviews: list[WorkReviewSummaryOut] = Field(default_factory=list)
@@ -398,6 +513,25 @@ class WorkTaskRetry(BaseModel):
 class WorkTaskRetryOut(BaseModel):
     item: WorkItemOut
     run_id: uuid.UUID
+    created: bool
+
+
+class WorkTaskResultReview(BaseModel):
+    run_id: uuid.UUID
+    action: Literal["approve", "request_changes"]
+    comment: str | None = Field(default=None, max_length=2000)
+    client_request_id: uuid.UUID
+
+    @model_validator(mode="after")
+    def require_change_reason(self) -> "WorkTaskResultReview":
+        self.comment = self.comment.strip() if self.comment else None
+        if self.action == "request_changes" and not self.comment:
+            raise ValueError("a change request must explain what needs to change")
+        return self
+
+
+class WorkTaskResultReviewOut(BaseModel):
+    receipt: WorkTaskResultReviewReceiptOut
     created: bool
 
 
@@ -437,5 +571,7 @@ __all__ = [
     "WorkTaskPreflightOut",
     "WorkTaskRetry",
     "WorkTaskRetryOut",
+    "WorkToolReconciliation",
+    "WorkToolReconciliationOut",
     "WorkTimelineEventOut",
 ]

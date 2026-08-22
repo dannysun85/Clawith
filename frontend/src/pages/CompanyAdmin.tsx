@@ -50,6 +50,10 @@ type IssuedCredential = {
     token: string;
 };
 
+type IntegrationView = 'tools' | 'skills' | 'org' | 'douyin';
+
+const INTEGRATION_VIEWS: IntegrationView[] = ['tools', 'skills', 'org', 'douyin'];
+
 const messageFrom = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 const deliveryLabel = (status: string, isChinese: boolean) => {
@@ -644,6 +648,9 @@ export default function CompanyAdmin() {
     const tenantId = user?.tenant_id || '';
     const section = location.pathname.split('/')[2] || 'overview';
     const settingsView = location.pathname.split('/')[3] || '';
+    const integrationView = INTEGRATION_VIEWS.includes(settingsView as IntegrationView)
+        ? settingsView as IntegrationView
+        : 'tools';
     const tenantQuery = useQuery({ queryKey: ['company-console-tenant', tenantId], queryFn: () => tenantApi.me(), enabled: !!tenantId });
     const membersQuery = useQuery({ queryKey: ['company-governance-members', tenantId], queryFn: () => membershipApi.list() as Promise<CompanyMember[]>, enabled: !!tenantId && hasEffectiveCapability(user, 'company.members.view') });
     const companyName = tenantQuery.data?.name || (isChinese ? '当前公司' : 'Current company');
@@ -667,6 +674,12 @@ export default function CompanyAdmin() {
         if (!validSections.has(section)) navigate('/company-admin', { replace: true });
     }, [navigate, section, validSections]);
 
+    useEffect(() => {
+        if (section === 'integrations' && settingsView && !INTEGRATION_VIEWS.includes(settingsView as IntegrationView)) {
+            navigate('/company-admin/integrations/tools', { replace: true });
+        }
+    }, [navigate, section, settingsView]);
+
     const content = useMemo(() => {
         if (section === 'members') return <CompanyMembers tenantId={tenantId} />;
         if (section === 'agents') return <AgentGovernance />;
@@ -683,12 +696,43 @@ export default function CompanyAdmin() {
         }
         if (section === 'settings') return <CompanyPolicySettings tenantId={tenantId} tenant={tenantQuery.data} />;
         if (section === 'billing') return <><PageHeader title={isChinese ? '套餐、账单与用量' : 'Plan, billing and usage'} description={isChinese ? '公司管理员查看聚合用量；支付主体、订单与续费仍按 company.billing.manage 单独守卫。' : 'Company admins see aggregate usage; payer, order, and renewal actions remain gated by company.billing.manage.'} /><SubscriptionDetail /></>;
-        if (section === 'market') return <><PageHeader title={isChinese ? '购买套餐与额度' : 'Buy plans and credits'} description={isChinese ? '选择适合团队的套餐或补充额度包，支付仅允许在官方支付域名上发起。' : 'Pick a plan or top up credits; payment is only accepted on the official payment domain.'} /><SubscriptionTab /></>;
+        if (section === 'market') return <><PageHeader title={isChinese ? '购买套餐与额度' : 'Buy plans and credits'} description={isChinese ? '选择适合团队的套餐或补充额度包；页面会根据当前支付配置显示在线支付或人工订单流程。' : 'Pick a plan or top up credits; the page shows either online checkout or an offline order based on the active billing configuration.'} /><SubscriptionTab /></>;
         if (section === 'ownership') return <CompanyOwnership tenantId={tenantId} companyName={companyName} members={membersQuery.data || []} />;
-        const legacyTabs: Record<string, 'approvals' | 'tools' | 'audit'> = { approvals: 'approvals', integrations: 'tools', audit: 'audit' };
+        if (section === 'integrations') {
+            const integrationTabs: Array<{ key: IntegrationView; label: string }> = [
+                { key: 'tools', label: isChinese ? '工具与 MCP' : 'Tools & MCP' },
+                { key: 'skills', label: isChinese ? '技能库' : 'Skills' },
+                { key: 'org', label: isChinese ? '组织同步' : 'Organization sync' },
+                { key: 'douyin', label: isChinese ? '外部账号' : 'External accounts' },
+            ];
+            return <>
+                <PageHeader
+                    title={isChinese ? '企业知识与集成' : 'Knowledge & integrations'}
+                    description={isChinese
+                        ? '管理公司级工具、技能、组织目录同步和外部账号；未开通的 Provider 会保留可解释的关闭态。'
+                        : 'Manage company tools, skills, directory synchronization, and external accounts. Unavailable providers remain visible with an explicit closed state.'}
+                />
+                <nav className="tabs" role="tablist" aria-label={isChinese ? '企业知识与集成二级功能' : 'Knowledge and integrations sections'}>
+                    {integrationTabs.map((tab) => (
+                        <button
+                            key={tab.key}
+                            type="button"
+                            role="tab"
+                            aria-selected={integrationView === tab.key}
+                            className={`tab ${integrationView === tab.key ? 'active' : ''}`}
+                            onClick={() => navigate(`/company-admin/integrations/${tab.key}`)}
+                        >
+                            {tab.label}
+                        </button>
+                    ))}
+                </nav>
+                <EnterpriseSettings key={integrationView} initialTab={integrationView} embedded />
+            </>;
+        }
+        const legacyTabs: Record<string, 'approvals' | 'audit'> = { approvals: 'approvals', audit: 'audit' };
         if (legacyTabs[section]) return <><PageHeader title={items.find((item) => item.to.endsWith(section))?.label || section} description={isChinese ? '该能力继续复用已验证的企业设置数据源，并置于新的公司治理边界内。' : 'This capability reuses the existing enterprise data source inside the new company-governance boundary.'} /><EnterpriseSettings key={section} initialTab={legacyTabs[section]} embedded /></>;
         return <CompanyOverview companyName={companyName} />;
-    }, [companyName, isChinese, items, membersQuery.data, section, settingsView, tenantId, tenantQuery.data]);
+    }, [companyName, integrationView, isChinese, items, membersQuery.data, navigate, section, settingsView, tenantId, tenantQuery.data]);
 
     return (
         <ProductConsoleShell

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SAFE_DIAGNOSTIC_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
 SAFE_DIAGNOSTIC_ROUTE = r"^/[A-Za-z0-9_./:{}@%+-]*$"
+SAFE_RELEASE_VERSION = r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$"
 
 
 class ClientIssueMetadata(BaseModel):
@@ -36,8 +37,23 @@ class ClientIssueMetadata(BaseModel):
         default=None,
         min_length=1,
         max_length=50,
+        pattern=SAFE_RELEASE_VERSION,
+    )
+    origin_host: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
         pattern=SAFE_DIAGNOSTIC_IDENTIFIER,
     )
+    visibility_state: Literal["visible", "hidden", "prerender", "unknown"] | None = None
+    lifecycle_state: Literal["active", "ending"] | None = None
+    online: bool | None = None
+    signal_kind: Literal[
+        "fetch_rejected",
+        "http_response",
+        "runtime_exception",
+        "websocket_close",
+    ] | None = None
 
     model_config = ConfigDict(extra="forbid")
 

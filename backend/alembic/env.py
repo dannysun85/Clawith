@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
-from app.models.task import Task, TaskLog  # noqa: F401
+from app.models.task import Task, TaskLog, TaskResultReviewReceipt  # noqa: F401
 from app.models.channel_config import ChannelConfig  # noqa: F401
 from app.models.llm import LLMCredential, LLMModel  # noqa: F401
 from app.models.audit import AuditLog, ApprovalRequest, ChatMessage, EnterpriseInfo  # noqa: F401

@@ -170,6 +170,8 @@ async def _execute_node(
     lifecycle.pop("run_compact_error", None)
     lifecycle.pop("compact_forced", None)
     lifecycle.pop("compact_return_route", None)
+    if lifecycle.get("status") in _TERMINAL_STATUSES:
+        lifecycle.pop("incomplete_output_buffer", None)
     if node == "terminal":
         if lifecycle.get("status") not in _TERMINAL_STATUSES or lifecycle.get("next_route") != "terminal":
             raise RuntimeGraphContractError("terminal node must preserve a terminal lifecycle")

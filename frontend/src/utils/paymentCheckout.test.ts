@@ -3,6 +3,7 @@ import {
     buildPaymentDomainRedirectUrl,
     needsPaymentDomainRedirect,
     normalizeHostname,
+    shouldRedirectToPaymentDomain,
 } from './paymentCheckout';
 
 describe('payment domain checkout redirect', () => {
@@ -11,6 +12,19 @@ describe('payment domain checkout redirect', () => {
         expect(needsPaymentDomainRedirect('opc.rama-server.com', 'opc.reeftotem.ai')).toBe(true);
         expect(needsPaymentDomainRedirect('opc.rama-server.com', 'opc.rama-server.com')).toBe(false);
         expect(needsPaymentDomainRedirect(null, 'opc.reeftotem.ai')).toBe(false);
+    });
+
+    it('keeps manual orders on the current product host', () => {
+        expect(shouldRedirectToPaymentDomain(
+            false,
+            'opc.rama-server.com',
+            'opc.reeftotem.ai',
+        )).toBe(false);
+        expect(shouldRedirectToPaymentDomain(
+            true,
+            'opc.rama-server.com',
+            'opc.reeftotem.ai',
+        )).toBe(true);
     });
 
     it('moves the market page onto the payment origin with a session fragment', () => {

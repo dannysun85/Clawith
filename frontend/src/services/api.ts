@@ -784,6 +784,7 @@ export type WorkItem = {
     deliverable_status?: string | null;
     artifact_status?: string | null;
     review_status?: string | null;
+    result_review_status?: 'not_required' | 'pending' | 'approved' | 'request_changes';
     approval_status?: string | null;
     delivery_status: string;
     delivery_mode: 'task_only' | 'formal_deliverable';
@@ -798,6 +799,21 @@ export type WorkItem = {
 };
 
 export type WorkExecutorKind = 'personal_assistant' | 'agent_employee' | 'temporary_expert' | 'group';
+
+export type WorkAcceptanceContract = {
+    version: 1;
+    criteria: string[];
+    required_sections?: string[];
+    forbidden_terms?: string[];
+    result_language?: 'auto' | 'zh-CN' | 'en';
+    length?: {
+        unit: 'characters' | 'cjk_characters' | 'words';
+        minimum?: number;
+        maximum?: number;
+    } | null;
+    evidence_required?: boolean;
+    owner_review_required?: boolean;
+};
 
 export type WorkTaskDraft = {
     title: string;
@@ -816,6 +832,7 @@ export type WorkTaskDraft = {
     source_session_id?: string;
     source_message_id?: string;
     source_message_cursor?: string;
+    acceptance_contract?: WorkAcceptanceContract;
 };
 
 export type WorkTaskPreflight = {
@@ -876,6 +893,7 @@ export type WorkTaskPreflight = {
             runtime_actions_checked_separately: boolean;
         };
         completion_criteria: string[];
+        acceptance_contract: WorkAcceptanceContract;
     };
 };
 
@@ -897,7 +915,7 @@ export type WorkStatusAxes = {
 export type WorkNextAction = {
     id: string;
     task_id?: string | null;
-    kind: 'quality_review' | 'runtime_approval' | 'delivery_approval' | 'task_recovery' | 'delivery_recovery';
+    kind: 'quality_review' | 'task_result_review' | 'runtime_approval' | 'delivery_approval' | 'tool_reconciliation' | 'task_recovery' | 'delivery_recovery';
     status: 'open';
     title: string;
     reason_code: string;
@@ -939,6 +957,15 @@ export type WorkTaskDetail = {
         delivery_status: string;
         created_at: string;
         updated_at: string;
+    }>;
+    task_result_reviews: Array<{
+        id: string;
+        task_id: string;
+        run_id: string;
+        actor_user_id: string;
+        action: 'approve' | 'request_changes';
+        comment?: string | null;
+        created_at: string;
     }>;
     deliverables: Array<{
         id: string;
@@ -1045,6 +1072,36 @@ export const workApi = {
     }>(`/work/tasks/${taskId}/retry`, {
         method: 'POST',
         body: JSON.stringify({ client_request_id: clientRequestId }),
+    }),
+
+    reviewTaskResult: (taskId: string, data: {
+        run_id: string;
+        action: 'approve' | 'request_changes';
+        comment?: string;
+        client_request_id: string;
+    }) => request<{
+        receipt: WorkTaskDetail['task_result_reviews'][number];
+        created: boolean;
+    }>(`/work/tasks/${taskId}/result-review`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+
+    reconcileToolExecution: (taskId: string, executionId: string, data: {
+        outcome: 'applied' | 'not_applied';
+        note: string;
+        client_request_id: string;
+    }) => request<{
+        task_id: string;
+        run_id: string;
+        execution_id: string;
+        execution_status: 'succeeded' | 'failed';
+        command_id: string;
+        created: boolean;
+        result_summary: string;
+    }>(`/work/tasks/${taskId}/tool-executions/${executionId}/reconcile`, {
+        method: 'POST',
+        body: JSON.stringify(data),
     }),
 };
 

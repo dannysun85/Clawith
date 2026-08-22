@@ -21,6 +21,14 @@ const work = readFileSync(new URL('../src/pages/Work.tsx', import.meta.url), 'ut
 const plaza = readFileSync(new URL('../src/pages/Plaza.tsx', import.meta.url), 'utf8');
 const editor = readFileSync(new URL('../src/components/ExperienceDraftEditor.tsx', import.meta.url), 'utf8');
 const agentDetail = readFileSync(new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url), 'utf8');
+const deliverableWorkbench = readFileSync(new URL('../src/components/deliverables/DeliverableWorkbench.tsx', import.meta.url), 'utf8');
+const douyinTab = readFileSync(new URL('../src/pages/agent-detail/tabs/DouyinTab.tsx', import.meta.url), 'utf8');
+const enterpriseSettings = readFileSync(new URL('../src/pages/EnterpriseSettings.tsx', import.meta.url), 'utf8');
+const productIa = JSON.parse(readFileSync(
+  new URL('../../backend/app/data/product_information_architecture.v1.json', import.meta.url),
+  'utf8',
+));
+const backendVersion = readFileSync(new URL('../../backend/VERSION', import.meta.url), 'utf8').trim();
 
 test('the task workbench is the default entry while legacy routes remain available', () => {
   assert.match(app, /resolveProductEntry\(user, preferredSurface\)/);
@@ -164,6 +172,57 @@ test('company administration routes stay behind the company-admin boundary', () 
     companyAdmin,
     /createOrganizationInvitation[\s\S]{0,500}result\.token/,
   );
+});
+
+test('knowledge and integrations keeps every governed secondary capability reachable', () => {
+  assert.match(companyAdmin, /type IntegrationView = 'tools' \| 'skills' \| 'org' \| 'douyin'/);
+  assert.match(companyAdmin, /企业知识与集成二级功能/);
+  assert.match(companyAdmin, /\/company-admin\/integrations\/\$\{tab\.key\}/);
+  assert.match(companyAdmin, /initialTab=\{integrationView\}/);
+  assert.match(app, /tools: 'integrations\/tools'/);
+  assert.match(app, /skills: 'integrations\/skills'/);
+  assert.match(app, /org: 'integrations\/org'/);
+  assert.match(app, /douyin: 'integrations\/douyin'/);
+  assert.match(deliverableWorkbench, /href="\/company-admin\/integrations\/org"/);
+  assert.match(douyinTab, /window\.location\.href = '\/company-admin\/integrations\/douyin'/);
+  assert.match(enterpriseSettings, /redirect_after: '\/company-admin\/integrations\/douyin'/);
+  assert.doesNotMatch(deliverableWorkbench, /\/enterprise#org/);
+  assert.doesNotMatch(douyinTab, /\/enterprise#douyin/);
+  assert.doesNotMatch(enterpriseSettings, /redirect_after: '\/enterprise#douyin'/);
+});
+
+test('the runtime product catalog stays aligned with public navigation and has no invented report center', () => {
+  assert.equal(productIa.version, 1);
+  assert.equal(productIa.catalog_id, 'astra-product-ia-1.12.0-r1');
+  assert.match(productIa.catalog_id, new RegExp(`-${backendVersion.replaceAll('.', '\\.')}-`));
+  const entries = new Map(productIa.entries.map((entry) => [entry.id, entry]));
+  const expected = {
+    work: ['/work', '工作台'],
+    groups: ['/groups', '协作群组'],
+    employees: ['/employees', '数字员工'],
+    dashboard: ['/dashboard', '公司概览'],
+    okr: ['/okr', '目标与复盘'],
+    team_knowledge: ['/plaza', '团队知识'],
+    company_admin: ['/company-admin', '公司管理'],
+  };
+  for (const [id, [route, label]] of Object.entries(expected)) {
+    assert.equal(entries.get(id)?.route, route);
+    assert.equal(entries.get(id)?.breadcrumbs?.['zh-CN']?.[0], label);
+    assert.match(`${app}\n${layout}`, new RegExp(route.replaceAll('/', '\\/')));
+    assert.match(layout, new RegExp(label));
+  }
+  for (const id of [
+    'company_integration_tools',
+    'company_integration_skills',
+    'company_integration_org',
+    'company_integration_accounts',
+  ]) {
+    const entry = entries.get(id);
+    assert.ok(entry);
+    assert.match(companyAdmin, new RegExp(entry.breadcrumbs['zh-CN'].at(-1)));
+  }
+  assert.match(companyAdmin, /\/company-admin\/integrations\/\$\{tab\.key\}/);
+  assert.doesNotMatch(JSON.stringify(productIa), /报告中心|Report center/i);
 });
 
 test('platform operations use an independent shell and separated registration grants', () => {

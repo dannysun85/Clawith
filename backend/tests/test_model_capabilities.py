@@ -6,12 +6,13 @@ from datetime import UTC, datetime
 import pytest
 
 from app.config import Settings
-from app.models.llm import LLMModel
+from app.models.llm import LLMCredential, LLMModel
 from app.models.system_settings import SystemSetting
 from app.services.agent_runtime.model_capabilities import (
     ModelCapabilityError,
     ModelCapabilityResolver,
     PlatformModelConfigurationError,
+    ensure_current_platform_credential_route,
     resolve_multi_agent_compact_model,
     resolve_multi_agent_planning_model,
     resolve_platform_model,
@@ -61,6 +62,53 @@ class _Session:
         if "system_settings" in str(statement):
             return _Result(self.runtime_setting)
         return _Result(self.model)
+
+
+class _CredentialResult:
+    def __init__(self, credentials: list[LLMCredential]) -> None:
+        self.credentials = credentials
+
+    def scalars(self) -> "_CredentialResult":
+        return self
+
+    def all(self) -> list[LLMCredential]:
+        return self.credentials
+
+
+class _CredentialSession:
+    def __init__(self, credentials: list[LLMCredential]) -> None:
+        self.credentials = credentials
+
+    async def execute(self, _statement: object) -> _CredentialResult:
+        return _CredentialResult(self.credentials)
+
+
+def _credential(**overrides: object) -> LLMCredential:
+    credential_id = uuid.uuid4()
+    checked_at = datetime.now(UTC)
+    values: dict[str, object] = {
+        "id": credential_id,
+        "provider": "test",
+        "label": "Verified test credential",
+        "api_key_encrypted": "secret",
+        "tenant_id": None,
+        "capabilities": ["text"],
+        "modality_status": {},
+        "daily_quota": None,
+        "used_today": 0,
+        "status": "healthy",
+        "enabled": True,
+        "last_verification_at": checked_at,
+        "verification_receipt": {
+            "kind": "credential_auth_probe",
+            "ok": True,
+            "credential_id": str(credential_id),
+            "provider": "test",
+            "checked_at": checked_at.isoformat(),
+        },
+    }
+    values.update(overrides)
+    return LLMCredential(**values)
 
 
 def test_llm_capability_columns_and_checks_are_declared() -> None:
@@ -352,3 +400,64 @@ async def test_group_runtime_model_resolvers_reject_cross_tenant_models() -> Non
             Settings(_env_file=None),
             tenant_id=tenant_id,
         )
+
+
+@pytest.mark.asyncio
+async def test_platform_credential_route_accepts_only_current_verified_healthy_account() -> None:
+    model = _model(provider="test", tenant_id=None)
+    session = _CredentialSession([_credential()])
+
+    await ensure_current_platform_credential_route(
+        session,  # type: ignore[arg-type]
+        model,
+        setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        [],
+        [_credential(verification_receipt=None)],
+        [_credential(status="degraded")],
+        [_credential(daily_quota=10, used_today=10)],
+        [_credential(capabilities=["video"])],
+    ],
+)
+async def test_platform_credential_route_fails_closed_for_unusable_pool(
+    credentials: list[LLMCredential],
+) -> None:
+    model = _model(provider="test", tenant_id=None)
+
+    with pytest.raises(
+        PlatformModelConfigurationError,
+        match="no currently verified healthy platform credential route",
+    ):
+        await ensure_current_platform_credential_route(
+            _CredentialSession(credentials),  # type: ignore[arg-type]
+            model,
+            setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
+        )
+
+
+@pytest.mark.asyncio
+async def test_tenant_model_credential_route_uses_its_verified_model_key() -> None:
+    model = _model(provider="test", tenant_id=uuid.uuid4())
+
+    await ensure_current_platform_credential_route(
+        _CredentialSession([]),  # type: ignore[arg-type]
+        model,
+        setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
+    )
+
+
+@pytest.mark.asyncio
+async def test_platform_no_key_provider_does_not_require_credential_pool() -> None:
+    model = _model(provider="ollama", tenant_id=None)
+
+    await ensure_current_platform_credential_route(
+        _CredentialSession([]),  # type: ignore[arg-type]
+        model,
+        setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
+    )

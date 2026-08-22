@@ -12,7 +12,13 @@ describe('production issue reporter', () => {
     beforeEach(() => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date('2026-07-13T06:00:00Z'));
+        Object.defineProperty(windowEvents, 'location', {
+            configurable: true,
+            value: { host: 'localhost:3008', pathname: '/' },
+        });
         vi.stubGlobal('window', windowEvents);
+        vi.stubGlobal('document', { visibilityState: 'visible' });
+        vi.stubGlobal('navigator', { onLine: true });
         const values = new Map<string, string>();
         vi.stubGlobal('localStorage', {
             getItem: (key: string) => values.get(key) ?? null,
@@ -53,6 +59,15 @@ describe('production issue reporter', () => {
         expect(JSON.parse(String(request[1]?.body))).toEqual({
             ...report,
             route: '/api/agents/123',
+            metadata: {
+                ...report.metadata,
+                origin_host: 'localhost:3008',
+                visibility_state: 'visible',
+                lifecycle_state: 'active',
+                online: true,
+                signal_kind: 'http_response',
+                release_version: __APP_VERSION__,
+            },
         });
 
         vi.advanceTimersByTime(30_000);
@@ -137,5 +152,14 @@ describe('production issue reporter', () => {
         window.dispatchEvent(new Event('pageshow'));
         reportClientIssue(report);
         expect(fetchMock).toHaveBeenCalledTimes(4);
+        expect(JSON.parse(String(fetchMock.mock.calls[3][1]?.body)).metadata).toEqual({
+            component: 'fetch',
+            origin_host: 'localhost:3008',
+            visibility_state: 'visible',
+            lifecycle_state: 'active',
+            online: true,
+            signal_kind: 'fetch_rejected',
+            release_version: __APP_VERSION__,
+        });
     });
 });

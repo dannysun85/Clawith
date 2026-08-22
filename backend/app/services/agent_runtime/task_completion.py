@@ -18,6 +18,7 @@ from app.services.agent_runtime.command_worker import (
     RuntimeRunRecord,
     RuntimeSessionFactory,
 )
+from app.services.work_projection import work_requires_owner_review
 
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -134,16 +135,20 @@ class TaskRuntimeCompletionHandler:
         checkpoint: CheckpointObservation,
     ) -> None:
         group_task_id = _group_task_id(run.correlation_id)
-        if run.source_type != "task" and group_task_id is None:
-            return
         status = checkpoint.state["lifecycle"]["status"]
         if status not in _TERMINAL_STATUSES:
             return
-        if group_task_id is not None:
+        # ``work-task:`` is also a read-side correlation convention.  Only
+        # Group Runtime roots are chat Runs; a normal Task Run must keep using
+        # its authoritative ``source_type=task`` / ``source_id`` identity even
+        # when a compatible correlation is present.
+        if run.source_type == "chat" and group_task_id is not None:
             await self._handle_group_task(
                 run=run,
                 task_id=group_task_id,
             )
+            return
+        if run.source_type != "task":
             return
         try:
             agent_id = uuid.UUID(run.agent_id or "")
@@ -206,7 +211,11 @@ class TaskRuntimeCompletionHandler:
                 if status == "completed" and not is_supervision:
                     task.status = "done"
                     task.completed_at = self._clock()
-                    content = f"✅ 任务完成\n\n{detail}"
+                    content = (
+                        f"✅ 执行完成，等待业务验收\n\n{detail}"
+                        if work_requires_owner_review(task.work_statement)
+                        else f"✅ 任务完成\n\n{detail}"
+                    )
                 elif status == "completed":
                     task.status = "pending"
                     task.completed_at = None
@@ -345,7 +354,11 @@ class TaskRuntimeCompletionHandler:
                 else:
                     task.status = "done"
                     task.completed_at = self._clock()
-                    headline = "✅ Group 协作任务完成"
+                    headline = (
+                        "✅ Group 协作执行完成，等待业务验收"
+                        if work_requires_owner_review(task.work_statement)
+                        else "✅ Group 协作任务完成"
+                    )
 
                 participant_snapshot = list(
                     dict(task.executor_snapshot or {}).get("participants") or []

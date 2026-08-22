@@ -105,6 +105,7 @@ class RuntimeLifecycle(TypedDict):
     reason: NotRequired[str | None]
     model_step_count: NotRequired[int]
     model_protocol_repairs: NotRequired[JsonObject]
+    incomplete_output_buffer: NotRequired[str]
     verification_attempt_count: NotRequired[int]
     pending_tool_calls: NotRequired[list[JsonObject]]
     pending_group_at: NotRequired[JsonObject | None]

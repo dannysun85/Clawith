@@ -126,6 +126,68 @@ class TaskLog(Base):
     task: Mapped["Task"] = relationship(back_populates="logs")
 
 
+class TaskResultReviewReceipt(Base):
+    """Immutable owner decision for one exact Work Runtime attempt."""
+
+    __tablename__ = "task_result_review_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('approve', 'request_changes')",
+            name="ck_task_result_review_receipts_action",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "task_id",
+            "run_id",
+            name="uq_task_result_review_receipts_attempt",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "task_id",
+            "client_request_id",
+            name="uq_task_result_review_receipts_request",
+        ),
+        Index(
+            "ix_task_result_review_receipts_task_created",
+            "task_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    client_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(24), nullable=False)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 # Resolve forward refs
 from app.models.agent import Agent  # noqa: E402, F401
 from app.models.user import User  # noqa: E402, F401

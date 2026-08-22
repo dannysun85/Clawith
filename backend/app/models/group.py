@@ -27,6 +27,7 @@ class Group(Base):
     __tablename__ = "groups"
     __table_args__ = (
         PrimaryKeyConstraint("id", name="pk_groups"),
+        UniqueConstraint("tenant_id", "id", name="uq_groups_tenant_id_id"),
         Index("ix_groups_tenant_id_deleted_at", "tenant_id", "deleted_at"),
     )
 

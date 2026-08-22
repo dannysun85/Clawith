@@ -265,6 +265,45 @@ def test_wechat_pay_env_is_propagated_on_backend_compose_paths():
         assert "WECHAT_PAY_PLATFORM_SERIAL_NO=" in example
 
 
+def test_planning_system_cost_caps_are_release_pinned_and_candidate_verified():
+    expected = {
+        "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN": "3000",
+        "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_TENANT_DAY": "20000",
+        "PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN": "5",
+        "PLANNING_SYSTEM_COST_MAX_CALLS_PER_TENANT_DAY": "100",
+        "PLANNING_SYSTEM_COST_UNPRICED_RESERVATION_CREDITS": "1000",
+        "PLANNING_SYSTEM_COST_INFLIGHT_STALE_SECONDS": "600",
+        "PLANNING_SYSTEM_COST_RECONCILIATION_SCAN_SECONDS": "60",
+        "PLANNING_SYSTEM_COST_RECONCILIATION_BATCH_SIZE": "100",
+    }
+    compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
+        encoding="utf-8"
+    )
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    for key, value in expected.items():
+        assert compose.count(f"{key}: ${{{key}:-{value}}}") == 1, key
+        assert f'"{key}": "{value}"' in script
+        assert f"{key}={value}" in env_example
+
+    verifier = script.index("inspect_candidate_planning_cost_contract() {")
+    candidate_healthy = script.index(
+        'test "$(docker inspect -f \'{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}\' "$CANDIDATE_BACKEND_ID")" = "healthy"'
+    )
+    candidate_verify = script.index(
+        'inspect_candidate_planning_cost_contract "$CANDIDATE_BACKEND_ID"',
+        candidate_healthy,
+    )
+    frontend_start = script.index(
+        'compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps frontend',
+        candidate_verify,
+    )
+    assert verifier < candidate_healthy < candidate_verify < frontend_start
+
+
 def test_production_code_execution_defaults_fail_closed():
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 

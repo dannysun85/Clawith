@@ -8,7 +8,9 @@ partial_db_name="${db_name}_partial"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-manual_order_decisions}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-planning_cost_controls}"
+browser_fixture_dir=""
+browser_fixture_state=""
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -175,6 +177,12 @@ SQL
 }
 
 cleanup() {
+  if [[ -n "$browser_fixture_dir" && -d "$browser_fixture_dir" ]]; then
+    if [[ "$browser_fixture_state" == "$browser_fixture_dir/state.json" ]]; then
+      rm -f -- "$browser_fixture_state"
+    fi
+    rmdir "$browser_fixture_dir" 2>/dev/null || true
+  fi
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$partial_db_name"
@@ -366,6 +374,37 @@ DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_n
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
+# The current metadata bootstrap contains the newest table before Alembic
+# reaches its owning revision.  Rewind that one revision, reproduce a partial
+# failed rollout, and prove the head fails closed instead of serving an
+# ORM-incompatible cost ledger.
+DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
+  .venv/bin/alembic downgrade task_result_reviews
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$fresh_db_name" --set ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE llm_system_cost_receipts (
+  id uuid PRIMARY KEY
+);
+SQL
+set +e
+planning_partial_upgrade_output="$({
+  DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
+    .venv/bin/alembic upgrade head
+} 2>&1)"
+planning_partial_upgrade_status=$?
+set -e
+if [[ "$planning_partial_upgrade_status" -eq 0 ]]; then
+  echo "partial Planning cost table unexpectedly passed migration" >&2
+  exit 1
+fi
+grep -F "Incompatible pre-existing llm_system_cost_receipts" \
+  <<<"$planning_partial_upgrade_output"
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$fresh_db_name" --set ON_ERROR_STOP=1 \
+  --command 'DROP TABLE llm_system_cost_receipts'
+DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
+  .venv/bin/alembic upgrade head
+
 # A failed historical rollout may leave the allowance table only partially
 # created. The release must fail before serving traffic instead of silently
 # adding indexes to an ORM-incompatible shape.
@@ -550,6 +589,12 @@ psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_nam
 -- key exists before the historical chat fixture is reconstructed. Remove only
 -- that dependency here; restore_runtime_chat_foreign_key recreates it after
 -- the unified-chat migration has restored the referenced unique constraint.
+-- The Planning system-cost table is also future schema at this historical
+-- point and owns tenant-composite foreign keys to chat_sessions/groups/runs.
+-- Drop the whole future table so the real head migration must recreate and
+-- validate it after the historical schema reconstruction.
+DROP TABLE IF EXISTS llm_system_cost_resolutions;
+DROP TABLE IF EXISTS llm_system_cost_receipts;
 ALTER TABLE agent_runs
 DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions;
 ALTER TABLE chat_sessions
@@ -2591,7 +2636,41 @@ PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/approval-execution-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/chat-tier-preference-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/manual-order-governance-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/planning-system-cost-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/production-smoke-principals-postgres-smoke.py
+
+# The reversible browser fixture initializes real Free subscription/Credits
+# rows. Prove its cleanup follows the complete tenant ownership graph rather
+# than leaving subscriptions, Groups, identities, or test tenants behind.
+browser_fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/astra-browser-fixture.XXXXXX")"
+browser_fixture_state="${browser_fixture_dir}/state.json"
+PYTHONPATH=. .venv/bin/python scripts/browser_acceptance_fixture.py \
+  seed --state-file "$browser_fixture_state"
+PYTHONPATH=. .venv/bin/python scripts/browser_acceptance_fixture.py \
+  cleanup --state-file "$browser_fixture_state"
+test ! -e "$browser_fixture_state"
+rmdir "$browser_fixture_dir"
+browser_fixture_dir=""
+browser_fixture_state=""
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM identities WHERE email LIKE 'browser-%@local.clawith.test'
+  ) OR EXISTS (
+    SELECT 1 FROM tenants
+    WHERE slug LIKE 'browser-primary-%'
+       OR slug LIKE 'browser-secondary-%'
+       OR slug LIKE 'g11-purge-browser-%'
+  ) OR EXISTS (
+    SELECT 1 FROM agent_templates
+    WHERE name LIKE 'Browser Private Assistant %'
+  ) THEN
+    RAISE EXCEPTION 'browser acceptance fixture cleanup left durable test data';
+  END IF;
+END $$;
+SQL
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO users (

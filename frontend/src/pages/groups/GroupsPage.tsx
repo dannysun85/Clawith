@@ -142,6 +142,15 @@ export default function GroupsPage() {
         enabled: Boolean(activeGroup),
     });
 
+    const planningReadinessQuery = useQuery({
+        queryKey: ['group-planning-readiness', groupId],
+        queryFn: () => groupApi.planningReadiness(groupId!),
+        enabled: Boolean(activeGroup),
+        retry: false,
+        staleTime: 15_000,
+        refetchOnWindowFocus: true,
+    });
+
     // The tree shows every group's sessions and a per-group unread + last-activity roll-up, but the
     // list endpoint carries neither — so pull each group's sessions and aggregate on the client. The
     // active group's entry shares the ['group-sessions', groupId] key with the query above, so it is
@@ -887,6 +896,9 @@ export default function GroupsPage() {
 
                         <MessageComposer
                             members={members}
+                            planningAvailable={planningReadinessQuery.data?.available}
+                            planningReadinessLoading={planningReadinessQuery.isLoading}
+                            planningUnavailableMessage={planningReadinessQuery.data?.message}
                             canCancel={activeRunIds.length > 0}
                             cancelling={cancellingRuns}
                             onCancel={() => void cancelActiveRuns()}

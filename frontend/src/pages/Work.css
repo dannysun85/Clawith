@@ -97,6 +97,71 @@
     color: var(--text-primary);
 }
 
+.work-acceptance-contract {
+    display: grid;
+    gap: 12px;
+    padding: 18px 20px;
+    border-top: 1px solid var(--border-subtle);
+    background: color-mix(in srgb, var(--bg-secondary) 72%, transparent);
+}
+
+.work-acceptance-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.work-acceptance-heading > div { display: grid; gap: 4px; }
+.work-acceptance-heading strong { color: var(--text-primary); font-size: 13px; }
+.work-acceptance-heading span,
+.work-acceptance-contract > small {
+    color: var(--text-tertiary);
+    font-size: 10px;
+    line-height: 1.55;
+}
+
+.work-acceptance-contract label { display: grid; gap: 6px; }
+.work-acceptance-contract label > span {
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 650;
+}
+
+.work-acceptance-contract textarea,
+.work-acceptance-contract select,
+.work-acceptance-contract input[type="number"] {
+    box-sizing: border-box;
+    width: 100%;
+    border: 1px solid var(--border-subtle);
+    border-radius: 9px;
+    outline: 0;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    padding: 9px 10px;
+    font: inherit;
+    font-size: 11px;
+}
+
+.work-acceptance-contract textarea { min-height: 0; resize: vertical; }
+.work-acceptance-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.work-acceptance-length { display: grid; grid-template-columns: 1.2fr .7fr .7fr 1.4fr; gap: 10px; align-items: end; }
+.work-acceptance-length select,
+.work-acceptance-length input[type="number"] { height: 36px; }
+.work-acceptance-evidence { display: flex !important; align-items: center; min-height: 36px; }
+.work-acceptance-evidence input { margin: 0; }
+
+.work-confirmation-acceptance {
+    margin-top: 14px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 11px;
+    padding: 13px 15px;
+}
+.work-confirmation-acceptance strong { color: var(--text-primary); font-size: 12px; }
+.work-confirmation-acceptance ul { margin: 8px 0 0; padding-left: 18px; }
+.work-confirmation-acceptance li,
+.work-confirmation-acceptance small { color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
+
 .work-composer > input {
     padding: 18px 20px 4px;
     font-size: 15px;
@@ -643,6 +708,38 @@
 .work-action-list strong { color: var(--text-primary); font-size: 12px; }
 .work-action-list span { color: var(--text-tertiary); font-size: 10px; }
 .work-action-list button:disabled { opacity: .45; cursor: wait; }
+.work-result-review {
+    display: grid;
+    gap: 12px;
+    border: 1px solid rgba(164, 112, 24, .35);
+    border-radius: 12px;
+    background: var(--bg-secondary);
+    padding: 14px;
+}
+.work-result-review > div:first-child { display: grid; gap: 5px; }
+.work-result-review textarea {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    border: 1px solid var(--border-subtle);
+    border-radius: 9px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    padding: 10px;
+    font: inherit;
+    font-size: 11px;
+}
+.work-result-review-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.work-action-list .work-result-review-actions button {
+    width: auto;
+    justify-content: center;
+    padding: 9px 13px;
+}
+.work-action-list .work-result-review-actions button.is-primary {
+    border-color: var(--text-primary);
+    background: var(--text-primary);
+    color: var(--bg-primary);
+}
 
 .work-detail-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .work-fact-list { display: grid; gap: 8px; margin-top: 14px; }
@@ -701,6 +798,7 @@
     .work-submit { width: 100%; margin-left: 0; }
     .work-confirmation-heading, .work-confirmation-actions { align-items: stretch; flex-direction: column; }
     .work-confirmation-grid { grid-template-columns: 1fr; }
+    .work-acceptance-grid, .work-acceptance-length { grid-template-columns: 1fr; }
     .work-confirmation-actions button { width: 100%; justify-content: center; }
     .work-card-meta, .work-list-header { align-items: flex-start; flex-direction: column; }
     .work-inbox-card { align-items: stretch; flex-direction: column; }

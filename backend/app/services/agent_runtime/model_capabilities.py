@@ -14,8 +14,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.models.llm import LLMModel
+from app.models.llm import LLMCredential, LLMModel
+from app.services.credential_readiness import current_credential_verification_receipt
 from app.services.agent_runtime.runtime_model_settings import resolve_runtime_model_settings
+from app.services.llm.client import get_provider_spec
+from app.services.llm.load_balancer import credential_quota_is_blocked
+from app.services.modalities import modality_match_values
 
 
 class ModelCapabilityError(RuntimeError):
@@ -76,6 +80,77 @@ def model_connection_verification(
     ):
         return "legacy_tool_probe", model.tool_calling_checked_at
     return None
+
+
+async def ensure_current_platform_credential_route(
+    db: AsyncSession,
+    model: LLMModel,
+    *,
+    setting_name: str,
+    modality: str = "text",
+) -> None:
+    """Require a verified, healthy base credential route without provider I/O.
+
+    Tenant-owned models carry their own credential and are already protected by
+    the model connection receipt. Platform models are executed through the
+    shared credential pool, so a verified model row alone is insufficient: the
+    account may have been disabled, exhausted, or replaced since that probe.
+    Transient Redis rate limits are intentionally excluded from this control-
+    plane readiness check and remain an execution-time concern.
+    """
+
+    if model.tenant_id is not None:
+        return
+
+    provider = str(model.provider or "").strip().lower()
+    provider_spec = get_provider_spec(provider)
+    if provider_spec is not None and not provider_spec.requires_api_key:
+        return
+    result = await db.execute(
+        select(LLMCredential).where(
+            LLMCredential.provider == provider,
+            LLMCredential.tenant_id.is_(None),
+        )
+    )
+    requested_modalities = {
+        str(value).strip().lower()
+        for value in modality_match_values(modality)
+        if str(value).strip()
+    }
+    quota_modality = "plan" if provider == "minimax" else modality
+
+    for credential in result.scalars().all():
+        raw_capabilities = credential.capabilities
+        if raw_capabilities is None:
+            supports_modality = True
+        elif isinstance(raw_capabilities, (list, tuple, set)):
+            supported = {
+                str(value).strip().lower()
+                for value in raw_capabilities
+                if str(value).strip()
+            }
+            supports_modality = bool(supported.intersection(requested_modalities))
+        else:
+            supports_modality = False
+
+        daily_quota_available = (
+            credential.daily_quota is None
+            or int(credential.used_today or 0) < int(credential.daily_quota)
+        )
+        if (
+            credential.enabled
+            and credential.status == "healthy"
+            and current_credential_verification_receipt(credential) is not None
+            and supports_modality
+            and daily_quota_available
+            and not credential_quota_is_blocked(credential, quota_modality)
+        ):
+            return
+
+    raise PlatformModelConfigurationError(
+        setting_name,
+        "has no currently verified healthy platform credential route",
+    )
 
 
 def _positive_optional(value: int | None, field_name: str) -> int | None:

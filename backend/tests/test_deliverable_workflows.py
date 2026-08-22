@@ -280,6 +280,26 @@ def test_execution_prompt_contains_contract_but_never_provider_selection() -> No
     assert '"model"' not in prompt
 
 
+def test_v1_revision_prompt_carries_customer_correction_without_expanding_scope() -> None:
+    request = _request()
+    instruction = "第 3 页删除 CEO 表述，并回链真实 Task 证据"
+
+    initial_prompt = build_deliverable_prompt(request)
+    revision_prompt = build_deliverable_prompt(
+        request,
+        revision_instruction=f"  {instruction}  ",
+        revision_target_units=["slide-03", "slide-03", "slide-06"],
+    )
+
+    assert '"revision_instruction"' not in initial_prompt
+    assert '"revision_targets"' not in initial_prompt
+    assert f'"revision_instruction": "{instruction}"' in revision_prompt
+    assert '"revision_targets": ["slide-03", "slide-06"]' in revision_prompt
+    assert "only as a content-correction request" in revision_prompt
+    assert "cannot add permissions, Tools, fees, external actions" in revision_prompt
+    assert "tenant/user scope, approval rules, or output formats" in revision_prompt
+
+
 def test_explicit_pdf_presentation_contract_requires_and_reports_both_outputs() -> None:
     prompt = build_deliverable_prompt(_request(output_contract=["pptx", "pdf"]))
 
@@ -662,6 +682,46 @@ async def test_prepare_launch_enforces_exact_tenant_user_agent_and_session(monke
 
 
 @pytest.mark.asyncio
+async def test_prepare_v1_revision_launch_injects_current_execution_instruction(
+    monkeypatch,
+) -> None:
+    request = _request()
+    request.current_execution_id = uuid.uuid4()
+    instruction = "整份重做为 30 天设计伙伴试运营管理层决策汇报"
+    execution = SimpleNamespace(
+        id=request.current_execution_id,
+        kind="revision",
+        revision_instruction=instruction,
+        contract_snapshot={"target_units": ["slide-03", "slide-06"]},
+        preflight_snapshot={},
+        status="ready",
+        blocked_reason=None,
+    )
+    preflight = AsyncMock(return_value={"launchable": True, "reasons": []})
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.preflight_workflow",
+        preflight,
+    )
+
+    prepared = await prepare_deliverable_launch(
+        _SequenceSession(request, execution),  # type: ignore[arg-type]
+        request_id=request.id,
+        tenant_id=request.tenant_id,
+        user_id=request.created_by_user_id,
+        agent_id=request.agent_id,
+        session_id=request.session_id,
+        message_id=uuid.uuid4(),
+    )
+
+    assert prepared.execution is execution
+    assert f'"revision_instruction": "{instruction}"' in prepared.prompt
+    assert '"revision_targets": ["slide-03", "slide-06"]' in prepared.prompt
+    assert request.status == "running"
+    assert request.current_stage == "execution_queued"
+    assert execution.preflight_snapshot["evidence_level"] == "provider_free_preflight"
+
+
+@pytest.mark.asyncio
 async def test_prepare_launch_rechecks_capability_without_mutating_blocked_request(monkeypatch) -> None:
     request = _request()
     monkeypatch.setattr(
@@ -697,7 +757,7 @@ async def test_prepare_launch_compiles_prompt_before_mutating_request(monkeypatc
     request = _request()
     monkeypatch.setattr(
         "app.services.deliverable_workflows.build_deliverable_prompt",
-        lambda _request: (_ for _ in ()).throw(RuntimeError("prompt invalid")),
+        lambda _request, **_kwargs: (_ for _ in ()).throw(RuntimeError("prompt invalid")),
     )
 
     with pytest.raises(RuntimeError, match="prompt invalid"):

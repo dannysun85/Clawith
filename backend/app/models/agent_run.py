@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -192,3 +193,276 @@ Index(
     AgentRun.id,
     postgresql_where=AgentRun.scheduling_lane_key.is_not(None),
 )
+
+
+class LLMSystemCostReceipt(Base):
+    """Durable platform-cost and replay receipt for a system-owned LLM call.
+
+    Group Planning has no employee ``agent_id`` and therefore must not be
+    forced through the customer/Agent Credits ledger.  This receipt records
+    provider debt separately while retaining enough normalized response state
+    to replay a finalized call after a worker interruption without calling the
+    Provider again.
+    """
+
+    __tablename__ = "llm_system_cost_receipts"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_llm_system_cost_receipts"),
+        CheckConstraint(
+            "operation IN ('group_planning')",
+            name="ck_llm_system_cost_receipts_operation",
+        ),
+        CheckConstraint(
+            "status IN ('provider_inflight', 'reconciling', 'finalized', "
+            "'reconciled', 'voided')",
+            name="ck_llm_system_cost_receipts_status",
+        ),
+        CheckConstraint(
+            "provider_outcome IN ('pending', 'acceptance_unknown', 'accepted', "
+            "'not_accepted')",
+            name="ck_llm_system_cost_receipts_provider_outcome",
+        ),
+        CheckConstraint(
+            "usage_source IN ('pending', 'provider_reported', 'estimated', "
+            "'operator_reported', 'unknown')",
+            name="ck_llm_system_cost_receipts_usage_source",
+        ),
+        CheckConstraint(
+            "cost_status IN ('pending', 'priced', 'unpriced', 'not_applicable')",
+            name="ck_llm_system_cost_receipts_cost_status",
+        ),
+        CheckConstraint(
+            "call_index > 0",
+            name="ck_llm_system_cost_receipts_call_index_positive",
+        ),
+        CheckConstraint(
+            "input_tokens >= 0 AND output_tokens >= 0 AND total_tokens >= 0 "
+            "AND cache_read_tokens >= 0 AND cache_creation_tokens >= 0 "
+            "AND estimated_tokens >= 0",
+            name="ck_llm_system_cost_receipts_tokens_nonnegative",
+        ),
+        CheckConstraint(
+            "system_cost_credits IS NULL OR system_cost_credits >= 0",
+            name="ck_llm_system_cost_receipts_cost_nonnegative",
+        ),
+        CheckConstraint(
+            "budget_reservation_credits > 0 AND request_input_token_upper_bound > 0 "
+            "AND request_max_output_tokens > 0",
+            name="ck_llm_system_cost_receipts_budget_positive",
+        ),
+        CheckConstraint(
+            "status <> 'finalized' OR (provider_outcome = 'accepted' "
+            "AND usage_source <> 'pending' AND cost_status <> 'pending' "
+            "AND finalized_at IS NOT NULL)",
+            name="ck_llm_system_cost_receipts_finalized_shape",
+        ),
+        CheckConstraint(
+            "status <> 'reconciled' OR (provider_outcome = 'accepted' "
+            "AND usage_source = 'operator_reported' AND cost_status = 'priced' "
+            "AND system_cost_credits IS NOT NULL AND finalized_at IS NOT NULL)",
+            name="ck_llm_system_cost_receipts_reconciled_shape",
+        ),
+        CheckConstraint(
+            "status <> 'voided' OR (provider_outcome = 'not_accepted' "
+            "AND usage_source = 'unknown' AND cost_status = 'not_applicable' "
+            "AND system_cost_credits = 0 AND finalized_at IS NOT NULL)",
+            name="ck_llm_system_cost_receipts_voided_shape",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "run_id"],
+            ["agent_runs.tenant_id", "agent_runs.id"],
+            name="fk_llm_system_cost_receipts_tenant_run_agent_runs",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "session_id"],
+            ["chat_sessions.tenant_id", "chat_sessions.id"],
+            name="fk_llm_system_cost_receipts_tenant_session_chat_sessions",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "group_id"],
+            ["groups.tenant_id", "groups.id"],
+            name="fk_llm_system_cost_receipts_tenant_group_groups",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "run_id",
+            "call_index",
+            name="uq_llm_system_cost_receipts_run_call",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            name="uq_llm_system_cost_receipts_tenant_id_id",
+        ),
+        Index(
+            "ix_llm_system_cost_receipts_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+        Index(
+            "ix_llm_system_cost_receipts_group_created",
+            "group_id",
+            "created_at",
+        ),
+        Index(
+            "ix_llm_system_cost_receipts_status_updated",
+            "status",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    group_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    call_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="group_planning", server_default="group_planning"
+    )
+    model_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "llm_models.id",
+            name="fk_llm_system_cost_receipts_model_id_llm_models",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    # Keep the immutable UUID snapshot even if an administrator later rotates
+    # or deletes the credential row; no key material or label is stored here.
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    provider_service_tier: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="standard", server_default="standard"
+    )
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="provider_inflight", server_default="provider_inflight"
+    )
+    provider_outcome: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    usage_source: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    cache_read_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    cache_creation_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    estimated_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    budget_reservation_credits: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    request_input_token_upper_bound: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=1, server_default="1"
+    )
+    request_max_output_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=1, server_default="1"
+    )
+    system_cost_credits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    response_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    response_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reconciliation_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    provider_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class LLMSystemCostResolution(Base):
+    """Append-only operator or daemon receipt for one cost-state transition."""
+
+    __tablename__ = "llm_system_cost_resolutions"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_llm_system_cost_resolutions"),
+        CheckConstraint(
+            "action IN ('mark_stale_unknown', 'confirm_not_accepted', "
+            "'settle_accepted')",
+            name="ck_llm_system_cost_resolutions_action",
+        ),
+        CheckConstraint(
+            "source IN ('operator', 'daemon')",
+            name="ck_llm_system_cost_resolutions_source",
+        ),
+        CheckConstraint(
+            "previous_status IN ('provider_inflight', 'reconciling') AND "
+            "resulting_status IN ('reconciling', 'reconciled', 'voided')",
+            name="ck_llm_system_cost_resolutions_statuses",
+        ),
+        CheckConstraint(
+            "previous_provider_outcome IN ('pending', 'acceptance_unknown') AND "
+            "resulting_provider_outcome IN ('acceptance_unknown', 'accepted', "
+            "'not_accepted')",
+            name="ck_llm_system_cost_resolutions_outcomes",
+        ),
+        CheckConstraint(
+            "reported_system_cost_credits IS NULL OR "
+            "reported_system_cost_credits >= 0",
+            name="ck_llm_system_cost_resolutions_cost_nonnegative",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "receipt_id"],
+            ["llm_system_cost_receipts.tenant_id", "llm_system_cost_receipts.id"],
+            name="fk_llm_system_cost_resolutions_tenant_receipt",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "receipt_id",
+            "idempotency_key_hash",
+            name="uq_llm_system_cost_resolutions_idempotency",
+        ),
+        Index(
+            "ix_llm_system_cost_resolutions_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+        Index(
+            "ix_llm_system_cost_resolutions_receipt_created",
+            "receipt_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    receipt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            name="fk_llm_system_cost_resolutions_actor_user_id_users",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    evidence_ref: Mapped[str] = mapped_column(String(500), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    previous_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    resulting_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    previous_provider_outcome: Mapped[str] = mapped_column(String(24), nullable=False)
+    resulting_provider_outcome: Mapped[str] = mapped_column(String(24), nullable=False)
+    reported_system_cost_credits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

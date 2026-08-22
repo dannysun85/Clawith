@@ -661,6 +661,41 @@ def _waiting_request(
     }
 
 
+def _unknown_outcome_step_result(
+    *,
+    source_type: str,
+    run_id: uuid.UUID,
+    call_id: str,
+    error_code: str | None,
+    messages: Sequence[JsonObject],
+    pending_tool_calls: tuple[JsonObject, ...],
+) -> ToolStepResult:
+    """Route an unknown side effect only to products with a human action surface."""
+
+    if source_type not in {"chat", "task"}:
+        return ToolStepResult(
+            messages=tuple(messages),
+            error={
+                "code": "tool_outcome_reconciliation_required",
+                "message": (
+                    "A tool outcome is unknown and this background source has no "
+                    "human reconciliation surface. The run failed safely for "
+                    "operator review."
+                ),
+            },
+        )
+    return ToolStepResult(
+        messages=tuple(messages),
+        waiting_request=_waiting_request(
+            run_id=run_id,
+            call_id=call_id,
+            requires_confirmation=True,
+            error_code=error_code,
+        ),
+        pending_tool_calls=pending_tool_calls,
+    )
+
+
 def _async_poll_schedule_metadata(
     *,
     run_id: uuid.UUID,
@@ -1491,6 +1526,7 @@ class RuntimeToolStepService:
         tenant_id: uuid.UUID,
         run_id: uuid.UUID,
         command_id: str,
+        source_type: str,
         call_id: str,
         tool_name: str,
         arguments: dict,
@@ -1552,7 +1588,11 @@ class RuntimeToolStepService:
                 messages=messages,
                 pending_tool_calls=tail_tool_calls,
             )
-        return ToolStepResult(
+        return _unknown_outcome_step_result(
+            source_type=source_type,
+            run_id=run_id,
+            call_id=call_id,
+            error_code="tool_ledger_row_missing",
             messages=(
                 *messages,
                 _result_message(
@@ -1561,12 +1601,6 @@ class RuntimeToolStepService:
                     tool_name=tool_name,
                     outcome=outcome,
                 ),
-            ),
-            waiting_request=_waiting_request(
-                run_id=run_id,
-                call_id=call_id,
-                requires_confirmation=True,
-                error_code="tool_ledger_row_missing",
             ),
             pending_tool_calls=tuple(pending_tool_calls),
         )
@@ -2268,12 +2302,21 @@ class RuntimeToolStepService:
                             messages=messages,
                             pending_tool_calls=tool_calls[index + 1 :],
                         )
+                    if reservation.requires_confirmation:
+                        return _unknown_outcome_step_result(
+                            source_type=context.source_type,
+                            run_id=run_id,
+                            call_id=call_id,
+                            error_code=reservation.error_code,
+                            messages=messages,
+                            pending_tool_calls=tool_calls[index:],
+                        )
                     return ToolStepResult(
                         messages=tuple(messages),
                         waiting_request=_waiting_request(
                             run_id=run_id,
                             call_id=call_id,
-                            requires_confirmation=reservation.requires_confirmation,
+                            requires_confirmation=False,
                             error_code=reservation.error_code,
                         ),
                         pending_tool_calls=tool_calls[index:],
@@ -2417,6 +2460,7 @@ class RuntimeToolStepService:
                                 tenant_id=tenant_id,
                                 run_id=run_id,
                                 command_id=context.command_id,
+                                source_type=context.source_type,
                                 call_id=call_id,
                                 tool_name=tool_name,
                                 arguments=arguments,
@@ -2439,14 +2483,12 @@ class RuntimeToolStepService:
                                     messages=messages,
                                     pending_tool_calls=tool_calls[index + 1 :],
                                 )
-                            return ToolStepResult(
-                                messages=tuple(messages),
-                                waiting_request=_waiting_request(
-                                    run_id=run_id,
-                                    call_id=call_id,
-                                    requires_confirmation=True,
-                                    error_code="tool_outcome_unknown",
-                                ),
+                            return _unknown_outcome_step_result(
+                                source_type=context.source_type,
+                                run_id=run_id,
+                                call_id=call_id,
+                                error_code="tool_outcome_unknown",
+                                messages=messages,
                                 pending_tool_calls=tool_calls[index:],
                             )
                     else:
@@ -2704,6 +2746,7 @@ class RuntimeToolStepService:
                             tenant_id=tenant_id,
                             run_id=run_id,
                             command_id=context.command_id,
+                            source_type=context.source_type,
                             call_id=call_id,
                             tool_name=tool_name,
                             arguments=arguments,
@@ -2726,14 +2769,12 @@ class RuntimeToolStepService:
                                 messages=messages,
                                 pending_tool_calls=tool_calls[index + 1 :],
                             )
-                        return ToolStepResult(
-                            messages=tuple(messages),
-                            waiting_request=_waiting_request(
-                                run_id=run_id,
-                                call_id=call_id,
-                                requires_confirmation=True,
-                                error_code="tool_outcome_unknown",
-                            ),
+                        return _unknown_outcome_step_result(
+                            source_type=context.source_type,
+                            run_id=run_id,
+                            call_id=call_id,
+                            error_code="tool_outcome_unknown",
+                            messages=messages,
                             pending_tool_calls=tool_calls[index:],
                         )
                 else:
@@ -2782,6 +2823,7 @@ class RuntimeToolStepService:
                                 tenant_id=tenant_id,
                                 run_id=run_id,
                                 command_id=context.command_id,
+                                source_type=context.source_type,
                                 call_id=call_id,
                                 tool_name=tool_name,
                                 arguments=arguments,
@@ -2823,14 +2865,12 @@ class RuntimeToolStepService:
                             messages=messages,
                             pending_tool_calls=tool_calls[index + 1 :],
                         )
-                    return ToolStepResult(
-                        messages=tuple(messages),
-                        waiting_request=_waiting_request(
-                            run_id=run_id,
-                            call_id=call_id,
-                            requires_confirmation=True,
-                            error_code=outcome.error_code or "tool_outcome_unknown",
-                        ),
+                    return _unknown_outcome_step_result(
+                        source_type=context.source_type,
+                        run_id=run_id,
+                        call_id=call_id,
+                        error_code=outcome.error_code or "tool_outcome_unknown",
+                        messages=messages,
                         pending_tool_calls=tool_calls[index:],
                     )
                 messages.append(

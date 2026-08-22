@@ -29,7 +29,8 @@ test('agent message owns the compact result summary and the full workflow stays 
   assert.match(workbench, /title=\{isZh \? 'PPT 逐页预览'/);
   assert.match(workbench, /alt=\{isZh \? '交付图片预览'/);
   assert.match(workbench, /'下载 PPTX'/);
-  assert.match(workbench, /'管理企业成员'/);
+  assert.match(workbench, /'管理组织同步'/);
+  assert.match(workbench, /href="\/company-admin\/integrations\/org"/);
   assert.doesNotMatch(workbench, /artifact\.status/);
 });
 

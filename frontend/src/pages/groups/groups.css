@@ -565,6 +565,11 @@
     color: var(--text-tertiary);
 }
 
+.group-composer-hint.is-warning {
+    color: var(--warning);
+    white-space: normal;
+}
+
 /* ─── Mention autocomplete ────────────────────────────── */
 
 .group-mention-popup {

@@ -153,6 +153,259 @@ def test_local_presentation_qa_uses_real_workspace_and_conversion_tools() -> Non
     assert f"workspace/deliverables/{request_id}/result.pptx" in response[1]
 
 
+def test_local_presentation_revision_rebuilds_from_the_business_evidence_contract() -> None:
+    stub = _load_stub()
+    request_id = "3685a7db-24a0-4d83-bebb-a9f058fc115d"
+    task_ids = (
+        "73649f8b-beca-4678-9084-b4ad9b6653ca",
+        "114ad3c0-da6d-47c0-a868-06fbf929978a",
+    )
+    contract = {
+        "request_id": request_id,
+        "work_type": "presentation",
+        "workflow_id": "builtin.presentation.v1",
+        "spec": {"page_count": 8},
+        "revision_instruction": (
+            "整份重做为 30 天设计伙伴试运营管理层决策汇报；"
+            f"每页回链 Task {task_ids[0]} 或 Task {task_ids[1]}"
+        ),
+        "revision_targets": [],
+    }
+
+    outline_raw, slide_spec_raw, rendered_html = stub._local_presentation_files(
+        request_id,
+        contract,
+    )
+    outline = json.loads(outline_raw)
+    slide_spec = json.loads(slide_spec_raw)
+
+    assert outline["deck_title"] == "30 天设计伙伴试运营管理层决策汇报"
+    assert "2026 秋季新品" not in rendered_html
+    assert "覆盖工作台、Group、CEO" not in rendered_html
+    assert "CEO、Creative V2" in rendered_html
+    assert "伙伴 A–B" in rendered_html
+    assert "伙伴 C–D" in rendered_html
+    assert "伙伴 E" in rendered_html
+    assert "余额必须等于全量 ledger delta" in rendered_html
+    assert "987 Credits" not in rendered_html
+    assert "13 笔" not in rendered_html
+    assert "不映射为生产结论" in rendered_html
+    assert "footer{font-size:16px" in rendered_html
+    assert "<footer data-clawith-text-role='metadata'>" not in rendered_html
+    expected_refs = [f"Task {task_id}" for task_id in task_ids]
+    assert all(slide["source_refs"] == expected_refs for slide in slide_spec["slides"])
+    assert all(rendered_html.count(task_id) == 8 for task_id in task_ids)
+
+
+def test_local_presentation_revision_applies_approved_billing_correction_source() -> None:
+    stub = _load_stub()
+    request_id = "3685a7db-24a0-4d83-bebb-a9f058fc115d"
+    original_task_ids = (
+        "73649f8b-beca-4678-9084-b4ad9b6653ca",
+        "114ad3c0-da6d-47c0-a868-06fbf929978a",
+    )
+    correction_task_id = "5a5d3f98-95d9-4a22-b190-40a450f182fa"
+    contract = {
+        "request_id": request_id,
+        "work_type": "presentation",
+        "workflow_id": "builtin.presentation.v1",
+        "spec": {"page_count": 8},
+        "revision_instruction": (
+            "按已批准的 Credits 计费纠错任务修订伙伴 D 与账本页面；"
+            f"保留来源 Task {original_task_ids[0]}、Task {original_task_ids[1]}，"
+            f"并增加纠错依据 Task {correction_task_id}"
+        ),
+        "revision_targets": ["slide-04", "slide-06"],
+    }
+
+    _outline_raw, slide_spec_raw, rendered_html = stub._local_presentation_files(
+        request_id,
+        contract,
+    )
+    slide_spec = json.loads(slide_spec_raw)
+
+    assert "每次 Runtime 仅 1 笔扣减" not in rendered_html
+    assert "一个 Run 可含多次调用" in rendered_html
+    assert "同一 reservation 重放不得重复扣费" in rendered_html
+    assert "4 个 llm_round reservation，全部 finalized" in rendered_html
+    assert "4 个 reservation 各有 1 条 consume；终态 reserved=0" in rendered_html
+    assert "987 Credits" not in rendered_html
+    assert "13 笔" not in rendered_html
+    assert ".slide[data-layout='ledger'] .visual{grid-template-columns:repeat(3,1fr)" in rendered_html
+    assert len(rendered_html) <= 6000
+    assert correction_task_id in rendered_html
+    assert all(
+        f"Task {correction_task_id}" in slide["source_refs"]
+        for slide in slide_spec["slides"]
+    )
+    assert all(rendered_html.count(task_id) == 8 for task_id in original_task_ids)
+
+
+def test_local_presentation_revision_does_not_promote_run_id_to_task_source() -> None:
+    stub = _load_stub()
+    request_id = "3685a7db-24a0-4d83-bebb-a9f058fc115d"
+    original_task_ids = (
+        "73649f8b-beca-4678-9084-b4ad9b6653ca",
+        "114ad3c0-da6d-47c0-a868-06fbf929978a",
+    )
+    run_id = "6b8a36d8-fb97-42ad-939f-d865b80fbd5b"
+    correction_task_id = "3c75c913-0150-45de-8fcd-b0b5872d1ce5"
+    contract = {
+        "request_id": request_id,
+        "work_type": "presentation",
+        "workflow_id": "builtin.presentation.v1",
+        "spec": {"page_count": 8},
+        "revision_instruction": (
+            f"Run {run_id} 已完成账本核对；"
+            f"保留来源 Task {original_task_ids[0]}、Task {original_task_ids[1]}，"
+            f"并增加纠错依据 Task {correction_task_id}"
+        ),
+        "revision_targets": ["slide-04", "slide-06"],
+    }
+
+    _outline_raw, slide_spec_raw, rendered_html = stub._local_presentation_files(
+        request_id,
+        contract,
+    )
+    slide_spec = json.loads(slide_spec_raw)
+
+    expected_refs = [
+        f"Task {original_task_ids[0]}",
+        f"Task {original_task_ids[1]}",
+        f"Task {correction_task_id}",
+    ]
+    assert all(slide["source_refs"] == expected_refs for slide in slide_spec["slides"])
+    assert f"Task {run_id}" not in rendered_html
+    assert f"Task {correction_task_id}" in rendered_html
+
+
+def test_local_business_answer_corrects_credits_acceptance_boundary() -> None:
+    stub = _load_stub()
+
+    answer = stub._normal_business_answer(
+        "Credits 计费验收口径纠正：请明确 Run、invocation、reservation 和账本关系"
+    )
+
+    assert "一个 Agent Run 可以包含多次 billable LLM invocation" in answer
+    assert "最多产生 1 条 reason=consume" in answer
+    assert "同一 reservation 重放不得重复扣费" in answer
+    assert "reserved 应为 0" in answer
+    assert "每个 Runtime 尝试只扣 1 笔" in answer
+    cjk_count = sum("\u3400" <= character <= "\u9fff" for character in answer)
+    assert 300 <= cjk_count <= 900
+
+
+def test_local_qa_stub_exercises_product_navigation_repair_without_faking_success() -> None:
+    stub = _load_stub()
+
+    invalid = stub._normal_business_answer("LOCAL_QA_PRODUCT_IA_GROUNDING")
+    repaired = stub._normal_business_answer(
+        "LOCAL_QA_PRODUCT_IA_GROUNDING\n"
+        "The result cites an Astra breadcrumb that does not exist in the confirmed product catalog."
+    )
+
+    assert "工作台 → 报告中心" in invalid
+    assert "`/reports`" in invalid
+    assert "公司管理 → 企业知识与集成 → 组织同步" in repaired
+    assert "`/company-admin/integrations/org`" in repaired
+    assert "不能声称已经完成组织同步" in repaired
+
+
+def test_local_qa_stub_emits_two_bounded_continuations_then_stops() -> None:
+    stub = _load_stub()
+    payload: dict[str, Any] = {
+        "model": "astra-local-qa",
+        "messages": [
+            {
+                "role": "user",
+                "content": "LOCAL_QA_BOUNDED_CONTINUATION：生成三段正式验收报告。",
+            }
+        ],
+    }
+
+    kind, first = stub._completion(payload)
+    assert kind == "business_answer"
+    assert first["choices"][0]["finish_reason"] == "length"
+    first_content = first["choices"][0]["message"]["content"]
+    assert "【片段一】" in first_content
+    payload["messages"].extend(
+        [
+            {"role": "assistant", "content": first_content},
+            {"role": "user", "content": "Continue exactly from the previous response."},
+        ]
+    )
+
+    _, second = stub._completion(payload)
+    assert second["choices"][0]["finish_reason"] == "length"
+    second_content = second["choices"][0]["message"]["content"]
+    assert "【片段二】" in second_content
+    payload["messages"].extend(
+        [
+            {"role": "assistant", "content": second_content},
+            {"role": "user", "content": "Continue exactly from the previous response."},
+        ]
+    )
+
+    _, final = stub._completion(payload)
+    assert final["choices"][0]["finish_reason"] == "stop"
+    assert "【片段三】" in final["choices"][0]["message"]["content"]
+
+
+def test_local_business_correction_reads_the_rejected_deck_as_evidence() -> None:
+    stub = _load_stub()
+    deliverable_id = "1eb3bbb5-7b3f-475e-b949-7c78231978b9"
+    payload: dict[str, Any] = {
+        "tools": [
+            {"function": {"name": "list_files"}},
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "read_document"}},
+        ],
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Credits 计费验收口径纠正；必须使用真实工具取得可验证证据回执"
+                ),
+            }
+        ],
+    }
+
+    response = stub._choose_response(payload)
+    assert response[0] == "billing_correction_list_evidence"
+    assert json.loads(response[2][0]["function"]["arguments"]) == {
+        "path": "workspace/deliverables"
+    }
+    _append_tool_result(
+        payload,
+        response,
+        content=json.dumps({"entries": [{"name": deliverable_id}]}),
+    )
+
+    response = stub._choose_response(payload)
+    assert response[0] == "billing_correction_read_evidence"
+    assert json.loads(response[2][0]["function"]["arguments"]) == {
+        "path": f"workspace/deliverables/{deliverable_id}/slide_spec.json"
+    }
+    _append_tool_result(
+        payload,
+        response,
+        content='{"body_points":["每次 Runtime 仅 1 笔扣减"]}',
+    )
+
+    response = stub._choose_response(payload)
+    assert response[0] == "billing_correction_extract_evidence"
+    assert json.loads(response[2][0]["function"]["arguments"]) == {
+        "path": f"workspace/deliverables/{deliverable_id}/result.pptx",
+        "max_chars": 8000,
+    }
+    _append_tool_result(payload, response, content="当前 PPT 可读文本")
+
+    response = stub._choose_response(payload)
+    assert response[0] == "business_answer"
+    assert response[2] == []
+    assert "一个 Agent Run 可以包含多次 billable LLM invocation" in response[1]
+
+
 def test_local_presentation_qa_retries_once_and_never_claims_failed_conversion() -> None:
     stub = _load_stub()
     request_id = "3685a7db-24a0-4d83-bebb-a9f058fc115d"

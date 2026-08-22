@@ -61,6 +61,7 @@ async def complete_llm_once(
     user_id: uuid.UUID | None = None,
     supports_vision: bool = False,
     invocation: AgentLLMInvocation | None = None,
+    billing_ref_id: uuid.UUID | None = None,
 ) -> LLMCompletionStep:
     """Call one pinned model exactly once and normalize its tool proposals.
 
@@ -93,6 +94,7 @@ async def complete_llm_once(
                 messages=api_messages,
                 tools=tools or None,
                 max_tokens=max_tokens,
+                ref_id=billing_ref_id,
             )
         response = await client.complete(
             messages=api_messages,

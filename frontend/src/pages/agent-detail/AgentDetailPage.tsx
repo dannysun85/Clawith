@@ -20,7 +20,7 @@ import {
     DeliverableReviewCard,
 } from '../../components/deliverables/DeliverableWorkbench';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, workApi, type DeliverableRequest } from '../../services/api';
+import { activityApi, agentApi, ApiError, channelApi, deliverableApi, experienceApi, fileApi, focusApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, workApi, type DeliverableRequest } from '../../services/api';
 import { websocketAuthProtocols } from '../../utils/authTransport';
 import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
@@ -2485,7 +2485,13 @@ export default function AgentDetailPage() {
         setActiveTab,
     } = useAgentDetailRoute({ agentId: id });
 
-    const { data: agent, isLoading, isError: agentAccessError } = useQuery({
+    const {
+        data: agent,
+        error: agentError,
+        isLoading,
+        isError: agentAccessError,
+        refetch: refetchAgent,
+    } = useQuery({
         queryKey: ['agent', id],
         queryFn: () => agentApi.get(id!),
         enabled: !!id,
@@ -2493,7 +2499,14 @@ export default function AgentDetailPage() {
         // editor is open so a manage -> use downgrade cannot leave stale
         // controls enabled until the next navigation or manual refresh.
         refetchInterval: activeTab === 'settings' ? 3000 : false,
-        retry: activeTab === 'settings' ? false : 3,
+        retry: activeTab === 'settings'
+            ? false
+            : (failureCount, error) => {
+                if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+                    return false;
+                }
+                return failureCount < 3;
+            },
     });
     const { data: requestedWorkTask } = useQuery({
         queryKey: ['work-task', requestedTaskId],
@@ -5885,15 +5898,51 @@ export default function AgentDetailPage() {
         },
     });
 
-    if (activeTab === 'settings' && agentAccessError) {
+    if (agentAccessError) {
+        const agentUnavailable = agentError instanceof ApiError
+            && (agentError.status === 403 || agentError.status === 404);
         return (
             <div
                 role="alert"
-                style={{ padding: '40px', color: 'var(--text-secondary)' }}
+                style={{
+                    maxWidth: '560px',
+                    margin: '72px auto',
+                    padding: '32px',
+                    color: 'var(--text-secondary)',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: '16px',
+                    background: 'var(--bg-secondary)',
+                }}
             >
-                {i18n.language?.startsWith('zh')
-                    ? 'Agent 访问权限已失效，请返回数字员工中心。'
-                    : 'Your Agent access has expired. Return to the Digital Workforce.'}
+                <h2 style={{ margin: '0 0 12px', color: 'var(--text-primary)' }}>
+                    {agentUnavailable
+                        ? (i18n.language?.startsWith('zh') ? '无法访问此 Agent' : 'Agent unavailable')
+                        : (i18n.language?.startsWith('zh') ? 'Agent 加载失败' : 'Unable to load Agent')}
+                </h2>
+                <p style={{ margin: '0 0 20px', lineHeight: 1.7 }}>
+                    {agentUnavailable
+                        ? (i18n.language?.startsWith('zh')
+                            ? '你没有此 Agent 的访问权限，或该 Agent 已不存在。'
+                            : 'You do not have access to this Agent, or it no longer exists.')
+                        : (i18n.language?.startsWith('zh')
+                            ? '暂时无法加载此 Agent，请稍后重试。'
+                            : 'This Agent could not be loaded. Please try again.')}
+                </p>
+                <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => {
+                        if (agentUnavailable) {
+                            navigate('/employees');
+                            return;
+                        }
+                        void refetchAgent();
+                    }}
+                >
+                    {agentUnavailable
+                        ? (i18n.language?.startsWith('zh') ? '返回数字员工中心' : 'Back to Digital Workforce')
+                        : (i18n.language?.startsWith('zh') ? '重新加载' : 'Try again')}
+                </button>
             </div>
         );
     }

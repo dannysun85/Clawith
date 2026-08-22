@@ -95,6 +95,7 @@ def test_group_router_exposes_management_and_read_state_boundaries() -> None:
 
     assert ("POST", "/api/groups") in routes
     assert ("GET", "/api/groups/{group_id}/members") in routes
+    assert ("GET", "/api/groups/{group_id}/planning-readiness") in routes
     assert ("GET", "/api/groups/{group_id}/tasks") in routes
     assert ("GET", "/api/groups/{group_id}/member-candidates") in routes
     assert ("GET", "/api/groups/member-candidates") in routes
@@ -130,6 +131,135 @@ def test_tenant_member_candidates_is_matched_before_the_group_id_route() -> None
 
 def test_group_invite_write_contract_only_accepts_participant_id() -> None:
     assert set(groups_api.InviteGroupMemberIn.model_fields) == {"participant_id"}
+
+
+@pytest.mark.asyncio
+async def test_group_planning_readiness_fails_closed_without_exposing_model_config(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    user = _user(tenant_id)
+    participant = _participant(user)
+    group = _group(tenant_id, participant.id)
+    authorized = []
+
+    async def fake_participant(_db, _user):
+        return participant
+
+    async def fake_authorize(_db, **kwargs):
+        authorized.append(kwargs)
+
+    async def fake_resolve(_db, **_kwargs):
+        raise groups_api.PlatformModelConfigurationError(
+            "MULTI_AGENT_PLANNING_MODEL_ID",
+            "is not configured",
+        )
+
+    monkeypatch.setattr(groups_api, "_current_participant", fake_participant)
+    monkeypatch.setattr(groups_api.group_chat_service, "authorize_group_member", fake_authorize)
+    monkeypatch.setattr(groups_api, "resolve_multi_agent_planning_model", fake_resolve)
+
+    result = await groups_api.get_group_planning_readiness(
+        group.id,
+        current_user=user,
+        db=object(),  # type: ignore[arg-type]
+    )
+
+    assert result.model_dump() == {
+        "available": False,
+        "code": "planning_model_unavailable",
+        "message": "多 Agent 规划暂不可用。请联系平台运营管理员配置并验证规划模型，或仅 @ 一名 Agent 继续。",
+        "remediation": "contact_platform_operator_or_mention_one_agent",
+    }
+    assert "MULTI_AGENT_PLANNING_MODEL_ID" not in result.message
+    assert authorized == [
+        {
+            "tenant_id": tenant_id,
+            "group_id": group.id,
+            "participant_id": participant.id,
+            "human_only": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_planning_readiness_reports_ready_for_authorized_member(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    user = _user(tenant_id)
+    participant = _participant(user)
+    group = _group(tenant_id, participant.id)
+
+    async def fake_participant(_db, _user):
+        return participant
+
+    async def fake_authorize(_db, **_kwargs):
+        return None
+
+    async def fake_resolve(_db, **_kwargs):
+        return SimpleNamespace(id=uuid.uuid4())
+
+    async def fake_credential_route(_db, _model, **_kwargs):
+        return None
+
+    monkeypatch.setattr(groups_api, "_current_participant", fake_participant)
+    monkeypatch.setattr(groups_api.group_chat_service, "authorize_group_member", fake_authorize)
+    monkeypatch.setattr(groups_api, "resolve_multi_agent_planning_model", fake_resolve)
+    monkeypatch.setattr(groups_api, "ensure_current_platform_credential_route", fake_credential_route)
+
+    result = await groups_api.get_group_planning_readiness(
+        group.id,
+        current_user=user,
+        db=object(),  # type: ignore[arg-type]
+    )
+
+    assert result.model_dump() == {
+        "available": True,
+        "code": "ready",
+        "message": "多 Agent 规划可用。",
+        "remediation": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_group_planning_readiness_fails_closed_when_credential_route_is_unavailable(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    user = _user(tenant_id)
+    participant = _participant(user)
+    group = _group(tenant_id, participant.id)
+
+    async def fake_participant(_db, _user):
+        return participant
+
+    async def fake_authorize(_db, **_kwargs):
+        return None
+
+    async def fake_resolve(_db, **_kwargs):
+        return SimpleNamespace(id=uuid.uuid4(), tenant_id=None, provider="test")
+
+    async def fake_credential_route(_db, _model, **_kwargs):
+        raise groups_api.PlatformModelConfigurationError(
+            "MULTI_AGENT_PLANNING_MODEL_ID",
+            "has no currently verified healthy platform credential route",
+        )
+
+    monkeypatch.setattr(groups_api, "_current_participant", fake_participant)
+    monkeypatch.setattr(groups_api.group_chat_service, "authorize_group_member", fake_authorize)
+    monkeypatch.setattr(groups_api, "resolve_multi_agent_planning_model", fake_resolve)
+    monkeypatch.setattr(groups_api, "ensure_current_platform_credential_route", fake_credential_route)
+
+    result = await groups_api.get_group_planning_readiness(
+        group.id,
+        current_user=user,
+        db=object(),  # type: ignore[arg-type]
+    )
+
+    assert result.available is False
+    assert result.code == "planning_model_unavailable"
+    assert "credential" not in result.message.lower()
 
 
 @pytest.mark.asyncio

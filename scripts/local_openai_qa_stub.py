@@ -288,6 +288,93 @@ def _planning_response(text: str) -> str:
 
 
 def _normal_business_answer(text: str) -> str:
+    if "LOCAL_QA_BOUNDED_CONTINUATION" in text:
+        first_overlap = "这是片段一末尾的确定性重叠边界，最终结果中只能出现一次。"
+        second_overlap = "这是片段二末尾的确定性重叠边界，最终结果中也只能出现一次。"
+        if "【片段二】" in text:
+            return (
+                f"{second_overlap}\n"
+                "【片段三】验收与退出：核对来源、审批、Credits 与状态投影；"
+                "任一证据缺失即保持阻断，不得宣称生产完成。"
+            )
+        if "【片段一】" in text:
+            return (
+                f"{first_overlap}\n"
+                "【片段二】执行：按负责人、里程碑和量化门槛推进，并保留任务与运行回执。\n"
+                f"{second_overlap}"
+            )
+        return (
+            "【片段一】范围：验证正式 Work 的有界续写、人工验收与可恢复状态。\n"
+            f"{first_overlap}"
+        )
+    if "LOCAL_QA_PRODUCT_IA_GROUNDING" in text:
+        if "does not exist in the confirmed product catalog" in text:
+            return (
+                "产品入口：公司管理 → 企业知识与集成 → 组织同步 "
+                "(`/company-admin/integrations/org`)。该页面只提供当前权限下可见的配置状态；"
+                "Provider 未配置时应保持关闭说明，不能声称已经完成组织同步。"
+            )
+        return (
+            "产品入口：工作台 → 报告中心 (`/reports`)。"
+            "在这里自动生成生产周报并直接发送给所有客户。"
+        )
+    if "Credits 计费验收口径纠正" in text:
+        return (
+            "《设计伙伴 D：Credits 计费验收口径纠正回执》\n\n"
+            "1. Run 与调用边界：一个 Agent Run 可以包含多次 billable LLM invocation，"
+            "例如一次任务可能先让模型选择工具，再读取证据，最后生成完整答复，每个模型轮次都是独立的"
+            "可计费调用。因此不能用“每个 Runtime 尝试只扣 1 笔”作为验收标准，也不能把任务数量、"
+            "运行尝试数量和模型调用数量混为同一个经营指标。\n"
+            "2. 成功结算：每次成功的 billable invocation 必须绑定一个 CreditReservation，"
+            "并且该 reservation 最多产生 1 条 reason=consume、ref_type=reservation 的账本记录。"
+            "验收时应同时核对 tenant、user、agent、action、modality、tier、provider、model、delta、"
+            "balance_after 和 created_at，不能只看页面上的余额数字。\n"
+            "3. 幂等与失败：同一 reservation 重放不得重复扣费；Provider 明确未受理时释放预留，"
+            "结果不确定时保留预留交由 reconciliation 处理，不得伪造成功或静默扣费。\n"
+            "失败、取消和网络中断要按 Provider 是否可能已经受理来区分，只有明确未受理才能立即释放；"
+            "已进入 settlement_ready 的债务必须重试落账，不能以释放预留掩盖真实成本。\n"
+            "4. 账实核对：终态任务完成对账后 reserved 应为 0，余额必须等于周期赠送与充值之和"
+            "加上全部 ledger delta；Run ID、reservation ID 与 credit transaction 必须可回链。\n"
+            "核对步骤是先按租户汇总所有 grant、consume、refund，再与 CreditBalance.balance 比较，"
+            "随后检查未终结 reservation 和重复 ref_id；任何差异都应阻断业务批准并留下审计记录。\n"
+            "5. 验收边界：以上仅证明当前本地 PostgreSQL 商业流程，不代表生产 Provider、生产账本"
+            "或真实支付已经验收；生产结论仍需同版本、同租户、同发布身份的 Provider 收据、账本快照"
+            "和独立授权证据。本次工具回执只用于证明已读取当前交付文件中的错误口径，最终批准仍由"
+            "公司所有者根据服务端实现和本地账本事实完成。"
+        )
+    if "30 天设计伙伴试运营管理层汇报 PPT Brief" in text:
+        return (
+            "《30 天设计伙伴试运营管理层汇报 Brief》\n\n"
+            "受众与场景\n"
+            "受众为 CEO、产品、运营、财务和技术负责人；在试运营启动会中用 12 分钟完成决策汇报，讨论是否开始 5 家伙伴的 30 天验证。\n\n"
+            "页数与逐页结构\n"
+            "采用 16:9、8 页：1 封面与决策问题；2 产品定位与目标客群；3 五家伙伴及负责人；4 四周里程碑；5 每家成功门槛与退出条件；6 Credits、返工与员工状态指标；7 风险、人工审批与回滚；8 立即决策和下一步责任人。\n\n"
+            "品牌与版式\n"
+            "使用 ReefTotem 克制、可治理的企业视觉；每页一个决策标题、不超过三个要点，关键数字用大号字，里程碑用时间轴，伙伴用五列卡片，风险用红黄绿表格。\n\n"
+            "数据与证据\n"
+            "内容只采信已批准任务 73649f8b-beca-4678-9084-b4ad9b6653ca 和 114ad3c0-da6d-47c0-a868-06fbf929978a；数字页必须标注 Task、Run、Credits 账本或 workforce/topology 快照来源，无收据的预测必须标识为假设。\n\n"
+            "审批与交付边界\n"
+            "此阶段只确认 Brief，不调用生成工具。后续正式文件必须经过能力与 Credits 预检、文件结构校验、独立质量检查和业务负责人批准；本地流程证据不得外推为生产结论。"
+        )
+    if "失败退出条件只提供了统一规则" in text or "每条必须同时包含" in text:
+        return (
+            "《ReefTotem 30 天设计伙伴验证清单（二次修订）》\n\n"
+            "A. 伙伴甲：负责人=产品经理；成功门槛=1 个正式任务完成创建、驳回、重试和人工批准，且两次尝试均可回查；退出条件=连续 2 次无法产生不可变验收回执；证据来源=Task ID、Agent Run 时间线和 task_result_review_receipts。\n"
+            "B. 伙伴乙：负责人=运营负责人；成功门槛=1 个群组会话产生可追溯的 Agent 回复并转为正式任务；退出条件=两次 @Agent 均未形成任务来源链接；证据来源=Group ID、Session ID、Message ID 与任务 origin。\n"
+            "C. 伙伴丙：负责人=知识管理员；成功门槛=业务批准结果被沉淀后可按标题搜索并回链原任务；退出条件=重建索引后仍无法定位原始证据；证据来源=知识条目 ID、来源任务 ID 和检索回执。\n"
+            "D. 伙伴丁：负责人=财务负责人；成功门槛=每个 Runtime 尝试只产生 1 笔 Credits 扣减，余额=期初余额-账本扣减；退出条件=发现重复扣费或余额与账本不等；证据来源=credit_transactions、Run ID 和订阅余额快照。\n"
+            "E. 伙伴戊：负责人=技术负责人；成功门槛=员工拓扑可观测运行中、待检查、已阻塞和完成阶段，且状态在 10 秒内刷新；退出条件=任务状态变更后拓扑连续 2 次刷新仍不一致；证据来源=workforce/topology 快照、Work 阶段和录屏。\n\n"
+            "边界：以上只是本地商业流程验收，不是生产验证；不发送外部消息、不创建真实支付、不启用 CEO 或 Creative V2 自动化。"
+        )
+    if "上一次业务验收要求修改" in text or "逐家的负责人" in text:
+        return (
+            "《ReefTotem AI 2026 秋季新品上市作战方案（修订版）》\n\n"
+            "1. 定位锁定（第1周）：目标客户为 20–100 人知识型团队，核心价值是可治理、可追溯的企业 Agent 协作；产品经理负责冻结 ICP、价值主张和禁用表述。\n"
+            "2. 方案验证（第2–3周）：设计伙伴甲由产品经理负责，成功门槛是完成任务创建、返工与验收；乙由运营负责人负责，门槛是协作群组形成可追溯结果；丙由知识管理员负责，门槛是结果沉淀并可回查；丁由财务负责人负责，门槛是 Credits 账实一致；戊由技术负责人负责，门槛是异常可恢复且状态实时可见。任一家两次无法完成主流程即退出试点并记录原因。\n"
+            "3. 发布准备（第4周）：产品经理汇总五家证据，销售负责人准备话术，技术负责人确认回滚；缺少收据或仍有阻断时不得进入发布。\n"
+            "4. 上市复盘（发布后7天）：复核激活、任务通过率、返工率、人工接管、Credits 与异常恢复，形成继续、修正或停止决策。\n\n"
+            "关键边界：本结论只证明本地流程验证；不发送外部邮件、不创建真实支付、不调用付费媒体服务。高风险动作必须由人类批准并保留执行收据。"
+        )
     if "四阶段" in text or "上市" in text or "ReefTotem" in text:
         return (
             "《ReefTotem AI 2026 秋季新品上市作战方案》\n\n"
@@ -332,49 +419,163 @@ def _json_marker(text: str, marker: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _local_presentation_files(request_id: str) -> tuple[str, str, str]:
-    headlines = [
-        "ReefTotem AI 2026 秋季新品决策汇报",
-        "客户问题与机会窗口",
-        "产品定位与核心价值",
-        "五家设计伙伴验证",
-        "四阶段上市计划",
-        "成功指标与审计证据",
-        "风险、预算与停止条件",
-        "所有者决策请求",
-    ]
-    bodies = [
-        ["本地验收候选", "面向公司所有者、产品与市场负责人"],
-        ["知识型团队跨岗位协作成本高", "任务、审批与结果证据容易割裂"],
-        ["可治理、可追溯的企业 Agent 协作", "所有高风险外部动作保留人工批准"],
-        ["每家完成一条工作台到审计的真实任务链", "覆盖工作台、Group、CEO 与团队知识"],
-        ["定位锁定", "方案验证", "发布准备", "发布后七天复盘"],
-        ["激活与任务完成", "人工接管与失败恢复", "审计收据与交付批准"],
-        ["本地不发送邮件、不真实支付", "不调用付费图片或视频服务", "触发停止条件即回滚"],
-        ["是否进入发布准备", "是否批准设计伙伴验证范围", "是否接受预算与停止边界"],
-    ]
-    layouts = ["hero", "split", "value", "partners", "timeline", "metrics", "risk", "decision"]
-    visual_kinds = [
-        "editable_typography",
-        "editable_diagram",
-        "editable_diagram",
-        "editable_table",
-        "editable_diagram",
-        "editable_chart",
-        "editable_table",
-        "editable_typography",
-    ]
+def _local_presentation_files(
+    request_id: str,
+    contract: dict[str, Any],
+) -> tuple[str, str, str]:
+    revision_instruction = str(contract.get("revision_instruction") or "").strip()
+    revised = bool(revision_instruction)
+    contract_text = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    # A revision can legitimately mention Run, reservation and Task UUIDs in
+    # the same instruction.  Only explicitly labelled Task references are
+    # business sources; treating the first arbitrary UUID as a Task produces a
+    # misleading deck backlink.  Keep the broad fallback for older fixtures
+    # whose source Task IDs predate the labelled revision contract.
+    labelled_task_refs = tuple(
+        dict.fromkeys(
+            match
+            for match in re.findall(
+                rf"\bTask\s*(?:ID\s*)?[:#]?\s*({_UUID})",
+                revision_instruction,
+                flags=re.IGNORECASE,
+            )
+            if match.casefold() != request_id.casefold()
+        )
+    )
+    all_task_refs = labelled_task_refs[:3] or tuple(
+        dict.fromkeys(
+            match
+            for match in re.findall(_UUID, contract_text)
+            if match.casefold() != request_id.casefold()
+        )
+    )[:3]
+    source_refs = [f"Task {item}" for item in all_task_refs] or ["本地工作台与审计账本"]
+    footer_refs = source_refs[:2]
+    footer_sources = " · ".join(footer_refs)
+    billing_correction_ref = source_refs[2] if len(source_refs) >= 3 else ""
+
+    if revised:
+        headlines = [
+            "30 天设计伙伴试运营管理层决策汇报",
+            f"决策依据：{len(source_refs)} 条已批准业务任务",
+            "伙伴 A–B：任务与协作入口",
+            "伙伴 C–D：知识与 Credits 账实",
+            "伙伴 E：实时状态与恢复门槛",
+            "本地账本与员工拓扑实测",
+            "风险、关闭功能与停止边界",
+            "所有者决策请求",
+        ]
+        bodies = [
+            ["本地商业工作流修订版", "受众：公司所有者、产品与运营负责人"],
+            [
+                "试运营方案：完成创建、驳回、重试与人工批准",
+                "五伙伴清单：逐家负责人、门槛、退出条件与证据",
+            ],
+            [
+                "A｜产品经理｜1 个任务完成创建、驳回、重试、批准；连续 2 次无不可变回执则退出",
+                "B｜运营负责人｜1 个 Group 回复转为正式任务；两次 @Agent 无来源链接则退出",
+            ],
+            [
+                "C｜知识管理员｜批准结果可搜索并回链原任务；重建索引仍找不到证据则退出",
+                "D｜财务负责人｜一个 Run 可含多次调用；每次成功的可计费调用只结算对应 reservation 一次",
+                *(
+                    [f"Credits 纠错依据：{billing_correction_ref}"]
+                    if billing_correction_ref
+                    else []
+                ),
+            ],
+            [
+                "E｜技术负责人｜运行中、待检查、已阻塞、完成在 10 秒内刷新",
+                "任务变化后连续 2 次刷新仍不一致则退出；证据为 topology、Work 阶段与录屏",
+            ],
+            [
+                *(
+                    [
+                        "Credits 纠正任务实测：单个 Run 对应 4 个 llm_round reservation，全部 finalized",
+                        "4 个 reservation 各有 1 条 consume；终态 reserved=0",
+                    ]
+                    if billing_correction_ref
+                    else []
+                ),
+                "一个 Run 可含多次模型调用；同一 reservation 重放不得重复扣费",
+                "余额必须等于全量 ledger delta；动态数值不写成生产结论",
+                "员工拓扑已观察运行中、业务驳回阻塞、待检查与完成；不映射为生产结论",
+            ],
+            [
+                "CEO、Creative V2、OKR 自动化、Heartbeat、Schedule、Code 与抖音直发均未启用",
+                "不发送外部邮件、不创建真实支付、不调用付费媒体；缺少收据立即停止",
+            ],
+            [
+                "是否批准进入下一轮 5 家设计伙伴试运营",
+                "是否接受逐伙伴退出条件与人工审批边界",
+                "生产发布与真实 Provider 验收仍需独立授权和同版本证据",
+            ],
+        ]
+        layouts = [
+            "hero",
+            "evidence",
+            "partners-a-b",
+            "partners-c-d",
+            "partner-e",
+            "ledger",
+            "risk",
+            "decision",
+        ]
+        visual_kinds = [
+            "editable_typography",
+            "editable_diagram",
+            "editable_table",
+            "editable_table",
+            "editable_table",
+            "editable_chart",
+            "editable_table",
+            "editable_typography",
+        ]
+        deck_core_message = "用已批准任务、Credits 账本和实时拓扑决定是否继续试运营。"
+    else:
+        headlines = [
+            "ReefTotem AI 2026 秋季新品决策汇报",
+            "客户问题与机会窗口",
+            "产品定位与核心价值",
+            "五家设计伙伴验证",
+            "四阶段上市计划",
+            "成功指标与审计证据",
+            "风险、预算与停止条件",
+            "所有者决策请求",
+        ]
+        bodies = [
+            ["本地验收候选", "面向公司所有者、产品与市场负责人"],
+            ["知识型团队跨岗位协作成本高", "任务、审批与结果证据容易割裂"],
+            ["可治理、可追溯的企业 Agent 协作", "所有高风险外部动作保留人工批准"],
+            ["每家完成一条工作台到审计的真实任务链", "覆盖工作台、Group、CEO 与团队知识"],
+            ["定位锁定", "方案验证", "发布准备", "发布后七天复盘"],
+            ["激活与任务完成", "人工接管与失败恢复", "审计收据与交付批准"],
+            ["本地不发送邮件、不真实支付", "不调用付费图片或视频服务", "触发停止条件即回滚"],
+            ["是否进入发布准备", "是否批准设计伙伴验证范围", "是否接受预算与停止边界"],
+        ]
+        layouts = ["hero", "split", "value", "partners", "timeline", "metrics", "risk", "decision"]
+        visual_kinds = [
+            "editable_typography",
+            "editable_diagram",
+            "editable_diagram",
+            "editable_table",
+            "editable_diagram",
+            "editable_chart",
+            "editable_table",
+            "editable_typography",
+        ]
+        deck_core_message = "在受控边界内验证 ReefTotem AI 新品上市准备度。"
     outline = {
         "deck_title": headlines[0],
         "audience": "公司所有者、产品与市场负责人",
-        "core_message": "在受控边界内验证 ReefTotem AI 新品上市准备度。",
+        "core_message": deck_core_message,
         "slides": [
             {
                 "slide_id": f"s{index}",
                 "purpose": "形成可验证的所有者决策依据",
                 "headline": headline,
                 "visual_intent": "使用可编辑卡片、指标或流程表达，不依赖外部媒体。",
-                "evidence": ["本地工作台任务", "本地协作与审计记录"],
+                "evidence": source_refs,
             }
             for index, headline in enumerate(headlines, start=1)
         ],
@@ -399,7 +600,7 @@ def _local_presentation_files(request_id: str) -> tuple[str, str, str]:
                 "visual_asset": "editable_html_composition",
                 "asset_ref": "",
                 "body_points": bodies[index - 1],
-                "source_refs": ["local-workbench", "local-audit"],
+                "source_refs": source_refs,
             }
             for index, (headline, layout) in enumerate(zip(headlines, layouts), start=1)
         ]
@@ -412,25 +613,28 @@ def _local_presentation_files(request_id: str) -> tuple[str, str, str]:
             f"<header><small data-clawith-text-role='metadata'>REEFTOTEM AI · LOCAL RELEASE QA</small>"
             f"<h1 data-slide-title>{headline}</h1></header>"
             f"<div class='visual' data-visual>{cards}</div>"
-            f"<footer data-clawith-text-role='metadata'>{index}/8 · request {request_id[:8]}</footer></section>"
+            f"<footer>{index}/8 · {html.escape(footer_sources, quote=True)}</footer></section>"
         )
-    html = (
+    html_document = (
         "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>"
-        "*{box-sizing:border-box}body{margin:0;background:#eef1f7;font-family:Arial,'PingFang SC',sans-serif;color:#152038}"
+        "*{box-sizing:border-box}body{margin:0;font-family:Arial,'PingFang SC',sans-serif;color:#152038}"
         ".slide{width:1280px;height:720px;padding:66px 76px 46px;background:linear-gradient(135deg,#fbfcff,#edf1ff);"
         "display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}small{letter-spacing:3px;color:#5b5bd6}"
-        "h1{font-size:45px;line-height:1.16;margin:18px 0 28px;max-width:1000px}.visual{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;flex:1;align-content:center}"
+        "h1{font-size:45px;line-height:1.16;margin:18px 0 28px}.visual{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;flex:1;align-content:center}"
         ".card{min-height:105px;padding:24px;border:1px solid #cfd5ea;border-radius:18px;background:#fff;box-shadow:0 10px 30px #39426912;display:flex;flex-direction:column;gap:12px}"
         ".card b{font-size:25px}.card span{font-size:16px;color:#65708a}.slide[data-layout='timeline'] .visual,.slide[data-layout='metrics'] .visual{grid-template-columns:repeat(4,1fr)}"
+        ".slide[data-layout='ledger'] .visual{grid-template-columns:repeat(3,1fr);gap:12px}"
+        ".slide[data-layout='ledger'] .card{min-height:82px;padding:14px;gap:6px}"
+        ".slide[data-layout='ledger'] .card b{font-size:19px;line-height:1.18}"
         ".slide[data-layout='decision'] .visual{grid-template-columns:1fr}.slide[data-layout='risk']{background:linear-gradient(135deg,#fffaf2,#f3f0ff)}"
-        "footer{font-size:13px;color:#7b849b;margin-top:24px}</style></head><body>"
+        "footer{font-size:16px;color:#7b849b;margin-top:24px}</style></head><body>"
         + "".join(slides)
         + "</body></html>"
     )
     return (
         json.dumps(outline, ensure_ascii=False, separators=(",", ":")),
         json.dumps(slide_spec, ensure_ascii=False, separators=(",", ":")),
-        html,
+        html_document,
     )
 
 
@@ -767,7 +971,7 @@ def _local_presentation_response(
         return "deliverable_tools_missing", "本地交付工具不完整，未声称已经生成 PPT。", []
     base = f"workspace/deliverables/{request_id}"
     called = [name for _, name in _request_tool_calls(payload, request_id)]
-    outline, slide_spec, html = _local_presentation_files(request_id)
+    outline, slide_spec, html = _local_presentation_files(request_id, contract)
     if "list_files" not in called:
         return "deliverable_inspect", "", [_tool_call("list_files", {"path": base})]
     writes = called.count("write_file")
@@ -971,6 +1175,42 @@ def _choose_response(payload: dict[str, Any]) -> tuple[str, str, list[dict[str, 
         if deliverable_response is not None:
             return deliverable_response
 
+    if (
+        "Credits 计费验收口径纠正" in text
+        and {"list_files", "read_file", "read_document"} <= tools
+    ):
+        if "list_files" not in called:
+            return "billing_correction_list_evidence", "", [
+                _tool_call("list_files", {"path": "workspace/deliverables"})
+            ]
+        if "read_file" not in called:
+            deliverable_ids = []
+            for result in reversed(_tool_results(payload, "list_files")):
+                deliverable_ids.extend(re.findall(_UUID, result))
+            if deliverable_ids:
+                evidence_path = (
+                    "workspace/deliverables/"
+                    f"{deliverable_ids[0]}/slide_spec.json"
+                )
+                return "billing_correction_read_evidence", "", [
+                    _tool_call("read_file", {"path": evidence_path})
+                ]
+        if "read_document" not in called:
+            deliverable_ids = []
+            for result in reversed(_tool_results(payload, "list_files")):
+                deliverable_ids.extend(re.findall(_UUID, result))
+            if deliverable_ids:
+                evidence_path = (
+                    "workspace/deliverables/"
+                    f"{deliverable_ids[0]}/result.pptx"
+                )
+                return "billing_correction_extract_evidence", "", [
+                    _tool_call(
+                        "read_document",
+                        {"path": evidence_path, "max_chars": 8000},
+                    )
+                ]
+
     if len(text.strip()) < 80 and "Say 'ok' and nothing else" in text:
         return "connectivity", "ok", []
     return "business_answer", _normal_business_answer(text), []
@@ -978,10 +1218,25 @@ def _choose_response(payload: dict[str, Any]) -> tuple[str, str, list[dict[str, 
 
 def _completion(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     kind, content, tool_calls = _choose_response(payload)
-    if kind in {"delegate_directory", "delegate_result"}:
+    joined_messages = _joined_messages(payload)
+    if kind in {"delegate_directory", "delegate_result"} or (
+        kind == "business_answer"
+        and "上一次业务验收要求修改" in joined_messages
+    ):
         # Give browser QA enough time to observe the target employee's live state.
         time.sleep(8.0)
     now = int(time.time())
+    bounded_continuation = (
+        kind == "business_answer"
+        and "LOCAL_QA_BOUNDED_CONTINUATION" in joined_messages
+    )
+    finish_reason = (
+        "length"
+        if bounded_continuation and "【片段三】" not in content
+        else "tool_calls"
+        if tool_calls
+        else "stop"
+    )
     response: dict[str, Any] = {
         "id": f"chatcmpl-local-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
@@ -995,7 +1250,7 @@ def _completion(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                     "content": content or None,
                     **({"tool_calls": tool_calls} if tool_calls else {}),
                 },
-                "finish_reason": "tool_calls" if tool_calls else "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {"prompt_tokens": 64, "completion_tokens": 64, "total_tokens": 128},

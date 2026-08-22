@@ -1010,6 +1010,7 @@ async def _ensure_meeting_group(
         name="CEO 会议室",
         description="CEO orchestrator meeting room: governed summaries and minutes.",
         member_participant_ids=member_participant_ids,
+        allow_system_agents=True,
     )
     settings.meeting_group_id = group.id
     await db.flush()

@@ -9,6 +9,7 @@ const subscriptionTab = readFileSync(
   `${root}/src/pages/enterprise-settings/tabs/SubscriptionTab.tsx`,
   'utf8',
 );
+const companyAdmin = readFileSync(`${root}/src/pages/CompanyAdmin.tsx`, 'utf8');
 
 test('billing config keeps provider selection separate from verified checkout readiness', () => {
   assert.match(billingHook, /checkout_enabled: boolean/);
@@ -24,4 +25,6 @@ test('marketplace fails closed and labels manual orders as offline requests', ()
   assert.match(subscriptionTab, /提交人工订单/);
   assert.match(subscriptionTab, /人工订单模式：提交后由平台管理员线下处理/);
   assert.match(subscriptionTab, /billingConfig\?\.native_payment_enabled/);
+  assert.match(companyAdmin, /根据当前支付配置显示在线支付或人工订单流程/);
+  assert.doesNotMatch(companyAdmin, /支付仅允许在官方支付域名上发起/);
 });

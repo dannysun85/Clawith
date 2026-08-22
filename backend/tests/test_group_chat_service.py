@@ -166,6 +166,7 @@ def _agent(
     agent_id: uuid.UUID,
     *,
     access_mode: str = "company",
+    is_system: bool = False,
 ) -> Agent:
     return Agent(
         id=agent_id,
@@ -174,6 +175,7 @@ def _agent(
         name="Group Agent",
         status="idle",
         is_expired=False,
+        is_system=is_system,
         access_mode=access_mode,
     )
 
@@ -369,6 +371,90 @@ async def test_private_agent_cannot_be_invited() -> None:
 
 
 @pytest.mark.asyncio
+async def test_system_agent_cannot_be_invited_to_an_ordinary_group() -> None:
+    tenant_id = uuid.uuid4()
+    actor_user_id = uuid.uuid4()
+    actor = _participant("user", actor_user_id)
+    actor_user = User(
+        id=actor_user_id,
+        tenant_id=tenant_id,
+        display_name="Group Member",
+        role="member",
+        is_active=True,
+    )
+    group = _group(tenant_id, actor.id)
+    actor_membership = _membership(group.id, actor.id)
+    invited_agent_id = uuid.uuid4()
+    invited = _participant("agent", invited_agent_id)
+    db = _RecordingDB(
+        _Result([group]),
+        _Result([actor_membership]),
+        _Result([actor]),
+        _Result([actor_user_id]),
+        _Result([invited]),
+        _Result([_agent(tenant_id, invited_agent_id, is_system=True)]),
+        _Result([actor_user]),
+        _Result([_agent(tenant_id, invited_agent_id, is_system=True)]),
+    )
+
+    with pytest.raises(group_chat_service.GroupChatServiceError) as exc_info:
+        await group_chat_service.invite_group_member(
+            db,
+            tenant_id=tenant_id,
+            group_id=group.id,
+            actor_participant_id=actor.id,
+            participant_id=invited.id,
+        )
+
+    assert exc_info.value.code == "group_participant_invalid"
+    assert str(exc_info.value) == "System Agents cannot join an ordinary group"
+    assert db.added == []
+    assert db.flush_count == 0
+
+
+@pytest.mark.asyncio
+async def test_internal_governed_group_must_explicitly_allow_a_system_agent() -> None:
+    tenant_id = uuid.uuid4()
+    actor_user_id = uuid.uuid4()
+    actor = _participant("user", actor_user_id)
+    actor_user = User(
+        id=actor_user_id,
+        tenant_id=tenant_id,
+        display_name="Company Owner",
+        role="org_owner",
+        is_active=True,
+    )
+    system_agent_id = uuid.uuid4()
+    system_participant = _participant("agent", system_agent_id)
+    system_agent = _agent(tenant_id, system_agent_id, is_system=True)
+    db = _RecordingDB(
+        _Result([actor]),
+        _Result([actor_user_id]),
+        _Result([system_participant]),
+        _Result([system_agent]),
+        _Result([actor_user]),
+        _Result([system_agent]),
+    )
+
+    group = await group_chat_service.create_group(
+        db,
+        tenant_id=tenant_id,
+        creator_participant_id=actor.id,
+        name="Governed system meeting",
+        member_participant_ids=[system_participant.id],
+        allow_system_agents=True,
+    )
+
+    memberships = [value for value in db.added if isinstance(value, GroupMember)]
+    assert group.name == "Governed system meeting"
+    assert [membership.participant_id for membership in memberships] == [
+        actor.id,
+        system_participant.id,
+    ]
+    assert db.flush_count == 1
+
+
+@pytest.mark.asyncio
 async def test_member_candidates_materialize_backend_participant_ids_and_exclude_active_users(
     monkeypatch,
 ) -> None:
@@ -496,6 +582,7 @@ async def test_agent_candidates_apply_visibility_and_runtime_eligibility_filters
 
     assert [candidate.participant_id for candidate in candidates] == [candidate_participant.id]
     candidate_sql = _sql(db.statements[-1])
+    assert "agents.is_system IS false" in candidate_sql
     assert "agents.access_mode != 'private'" in candidate_sql
     assert "agents.status IN ('creating', 'running', 'idle')" in candidate_sql
     assert "agents.is_expired IS false" in candidate_sql

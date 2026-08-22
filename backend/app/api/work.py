@@ -19,8 +19,10 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
+from app.models.agent_run_command import AgentRunCommand
 from app.models.agent_run_event import AgentRunEvent
-from app.models.audit import ChatMessage
+from app.models.agent_tool_execution import AgentToolExecution
+from app.models.audit import AuditLog, ChatMessage
 from app.models.deliverable import (
     DeliverableArtifactRevision,
     DeliverableQualityReview,
@@ -29,7 +31,7 @@ from app.models.deliverable import (
 from app.models.onboarding import UserTenantOnboarding
 from app.models.group import Group, GroupMember
 from app.models.participant import Participant
-from app.models.task import Task, TaskLog
+from app.models.task import Task, TaskLog, TaskResultReviewReceipt
 from app.models.user import User
 from app.schemas.work import (
     WorkArtifactSummary,
@@ -46,10 +48,25 @@ from app.schemas.work import (
     WorkTaskPreflightOut,
     WorkTaskRetry,
     WorkTaskRetryOut,
+    WorkTaskResultReview,
+    WorkTaskResultReviewOut,
+    WorkToolReconciliation,
+    WorkToolReconciliationOut,
 )
+from app.services.agent_runtime.adapter import RuntimeAdapterError, RuntimeCommandIntake
+from app.services.agent_runtime.contracts import ResumeRunCommand
 from app.services.agent_runtime.model_route import (
     RuntimeModelRouteError,
     resolve_runtime_model_route,
+)
+from app.services.agent_runtime.run_state_reader import (
+    RunStateReadError,
+    open_run_state_reader,
+)
+from app.services.agent_runtime.tool_execution import (
+    ToolExecutionError,
+    can_user_reconcile_unknown_execution,
+    reconcile_unknown_tool_execution,
 )
 from app.services.agent_runtime.model_capabilities import (
     PlatformModelConfigurationError,
@@ -60,6 +77,9 @@ from app.services.group_chat_service import (
     authorize_group_member,
     authorize_group_session,
 )
+from app.services.product_information_architecture import (
+    product_information_architecture_snapshot,
+)
 from app.services.task_executor import (
     TaskRuntimeIntakeError,
     enqueue_group_task_runtime,
@@ -68,7 +88,9 @@ from app.services.task_executor import (
 from app.services.work_projection import (
     TERMINAL_RUN_EVENTS,
     project_execution_status,
+    project_task_result_review_status,
     project_user_stage,
+    work_requires_owner_review,
 )
 from app.services.work_deliverable_contract import work_task_deliverable_contract
 from app.services.work_detail_projection import (
@@ -130,12 +152,14 @@ def _confirmation_fingerprint(
     chosen_executor_kind: str | None = None,
     candidate_facts_hash: str = "",
 ) -> str:
+    product_ia = product_information_architecture_snapshot()
     evidence = {
         "request_fingerprint": _fingerprint(data),
         "policy_version": policy_version,
         "chosen_executor_kind": chosen_executor_kind or data.executor_kind or "personal_assistant",
         "agent_id": str(agent_id),
         "candidate_facts_hash": candidate_facts_hash,
+        "product_ia_catalog_sha256": product_ia["catalog_sha256"],
     }
     canonical = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -159,7 +183,9 @@ def _build_work_statement(
     capability_status: str = "available",
 ) -> dict:
     expected_output = _EXPECTED_OUTPUT_BY_WORK_TYPE[data.work_type]
+    acceptance_contract = data.acceptance_contract.model_dump(mode="json")
     completion_criteria = [
+        *acceptance_contract["criteria"],
         "Return the concrete execution result to the task workbench.",
         "Preserve the confirmed objective, executor and output boundary.",
     ]
@@ -168,7 +194,7 @@ def _build_work_statement(
             "Do not claim a formal creative artifact until a linked Deliverable passes its own preflight, review and approval gates."
         )
     statement = {
-        "version": 1,
+        "version": 2,
         "objective": data.intent.strip(),
         "title": data.title.strip(),
         "work_type": data.work_type,
@@ -202,6 +228,8 @@ def _build_work_statement(
             "runtime_actions_checked_separately": True,
         },
         "completion_criteria": completion_criteria,
+        "acceptance_contract": acceptance_contract,
+        "product_information_architecture": product_information_architecture_snapshot(),
     }
     origin = executor_snapshot.get("origin")
     if isinstance(origin, dict):
@@ -700,6 +728,26 @@ async def _work_items(
             continue
         run_by_task.setdefault(projected_task_id, run)
 
+    result_review_by_run: dict[uuid.UUID, TaskResultReviewReceipt] = {}
+    if task_ids:
+        result_review_receipts = list(
+            (
+                await db.execute(
+                    select(TaskResultReviewReceipt)
+                    .where(
+                        TaskResultReviewReceipt.tenant_id == tenant_id,
+                        TaskResultReviewReceipt.task_id.in_(task_ids),
+                    )
+                    .order_by(
+                        TaskResultReviewReceipt.created_at.desc(),
+                        TaskResultReviewReceipt.id.desc(),
+                    )
+                )
+            ).scalars().all()
+        )
+        for receipt in result_review_receipts:
+            result_review_by_run.setdefault(receipt.run_id, receipt)
+
     terminal_event_by_run: dict[uuid.UUID, str] = {}
     run_ids = [run.id for run in run_by_task.values()]
     if run_ids:
@@ -850,6 +898,12 @@ async def _work_items(
         request = deliverable_by_task.get(task.id)
         latest_log = latest_log_by_task.get(task.id)
         artifact_status, review_status, delivery_status = deliverable_facts(request)
+        result_review = result_review_by_run.get(run.id) if run is not None else None
+        result_review_status = project_task_result_review_status(
+            task_status=task.status,
+            work_statement=task.work_statement,
+            receipt_action=result_review.action if result_review is not None else None,
+        )
         formal_delivery_contract = work_task_deliverable_contract(task)
         items.append(
             WorkItemOut(
@@ -879,6 +933,7 @@ async def _work_items(
                 deliverable_status=request.status if request else None,
                 artifact_status=artifact_status,
                 review_status=review_status,
+                result_review_status=result_review_status,
                 approval_status=(
                     "pending" if request and request.status == "waiting_approval" else None
                 ),
@@ -890,6 +945,7 @@ async def _work_items(
                     deliverable_status=request.status if request else None,
                     artifact_status=artifact_status,
                     review_status=review_status,
+                    task_result_review_status=result_review_status,
                 ),
                 artifacts=artifact_summaries(request),
                 latest_update=latest_log.content if latest_log else None,
@@ -994,6 +1050,7 @@ async def list_work(
 
 _WORK_INBOX_KINDS = {
     "quality_review",
+    "task_result_review",
     "runtime_approval",
     "delivery_approval",
     "task_recovery",
@@ -1228,6 +1285,369 @@ def _group_retry_message_id(task_id: uuid.UUID, client_request_id: uuid.UUID) ->
     return uuid.uuid5(task_id, f"group-work-task-message:{client_request_id}")
 
 
+def _task_result_review_fingerprint(data: WorkTaskResultReview) -> str:
+    canonical = json.dumps(
+        data.model_dump(mode="json", exclude={"client_request_id"}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _latest_work_task_run(db: AsyncSession, *, task: Task) -> AgentRun | None:
+    return (
+        await db.execute(
+            select(AgentRun)
+            .where(
+                AgentRun.tenant_id == task.tenant_id,
+                or_(
+                    (AgentRun.source_type == "task")
+                    & (AgentRun.source_id == str(task.id)),
+                    AgentRun.correlation_id == f"work-task:{task.id}",
+                ),
+            )
+            .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def _work_tool_reconciliation_idempotency_key(client_request_id: uuid.UUID) -> str:
+    return f"resume:work-tool-reconcile:{client_request_id}"
+
+
+@router.post(
+    "/tasks/{task_id}/tool-executions/{execution_id}/reconcile",
+    response_model=WorkToolReconciliationOut,
+)
+async def reconcile_work_tool_execution(
+    task_id: uuid.UUID,
+    execution_id: uuid.UUID,
+    data: WorkToolReconciliation,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Settle one unknown Work tool outcome and resume the exact waiting Run."""
+
+    task = await _owned_work_task(
+        db,
+        user=current_user,
+        task_id=task_id,
+        lock=True,
+    )
+    row = (
+        await db.execute(
+            select(AgentToolExecution, AgentRun)
+            .join(
+                AgentRun,
+                (AgentRun.tenant_id == AgentToolExecution.tenant_id)
+                & (AgentRun.id == AgentToolExecution.run_id),
+            )
+            .where(
+                AgentToolExecution.id == execution_id,
+                AgentToolExecution.tenant_id == task.tenant_id,
+                AgentRun.source_type == "task",
+                or_(
+                    AgentRun.source_id == str(task.id),
+                    AgentRun.correlation_id == f"work-task:{task.id}",
+                ),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Work tool execution not found")
+    execution, run = row
+    latest_run = await _latest_work_task_run(db, task=task)
+    if latest_run is None or latest_run.id != run.id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "work_tool_reconciliation_stale_run",
+                "message": "Only the latest Work attempt can be reconciled",
+            },
+        )
+
+    idempotency_key = _work_tool_reconciliation_idempotency_key(
+        data.client_request_id
+    )
+    existing_command = (
+        await db.execute(
+            select(AgentRunCommand).where(
+                AgentRunCommand.tenant_id == task.tenant_id,
+                AgentRunCommand.run_id == run.id,
+                AgentRunCommand.command_type == "resume",
+                AgentRunCommand.idempotency_key == idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+    expected_status = "succeeded" if data.outcome == "applied" else "failed"
+    if existing_command is not None:
+        metadata = (
+            execution.result_metadata
+            if isinstance(execution.result_metadata, dict)
+            else {}
+        )
+        if (
+            execution.status != expected_status
+            or metadata.get("external_reconciliation") is not True
+            or metadata.get("reconciled_by_user_id") != str(current_user.id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "work_tool_reconciliation_idempotency_conflict",
+                    "message": "client_request_id was already used for another decision",
+                },
+            )
+        return WorkToolReconciliationOut(
+            task_id=task.id,
+            run_id=run.id,
+            execution_id=execution.id,
+            execution_status=expected_status,
+            command_id=existing_command.id,
+            created=False,
+            result_summary=execution.result_summary or "",
+        )
+
+    if not can_user_reconcile_unknown_execution(execution):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "work_tool_reconciliation_not_supported",
+                "message": (
+                    "This tool outcome cannot be safely reconciled by the task owner"
+                ),
+            },
+        )
+    try:
+        async with open_run_state_reader(db) as reader:
+            view = await reader.get_run_state(task.tenant_id, run.id)
+    except RunStateReadError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    correlation_id = view.waiting_correlation_id
+    expected_correlations = {
+        str(uuid.uuid5(run.id, f"tool-reconcile:{execution.tool_call_id}")),
+        f"tool-confirm:{run.id}",
+    }
+    if (
+        view.execution_status != "waiting_user"
+        or view.source_type != "task"
+        or correlation_id not in expected_correlations
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "work_run_not_waiting_for_tool_reconciliation",
+                "message": "The Work attempt is not waiting for this tool decision",
+            },
+        )
+
+    try:
+        execution = await reconcile_unknown_tool_execution(
+            db,
+            tenant_id=task.tenant_id,
+            run_id=run.id,
+            execution_id=execution.id,
+            confirmed_status=expected_status,
+            confirmed_by_user_id=current_user.id,
+            note=data.note,
+        )
+        assert correlation_id is not None
+        handle = await RuntimeCommandIntake(db).resume_run(
+            ResumeRunCommand(
+                tenant_id=task.tenant_id,
+                run_id=run.id,
+                idempotency_key=idempotency_key,
+                payload={
+                    "resume_type": "user_input",
+                    "correlation_id": correlation_id,
+                    "payload": {
+                        "content": (
+                            "The Work owner confirmed that the prior tool operation "
+                            + (
+                                "took effect. Continue without repeating it."
+                                if data.outcome == "applied"
+                                else (
+                                    "did not take effect. Consume the recorded failed "
+                                    "outcome and decide whether a new call is needed."
+                                )
+                            )
+                        ),
+                        "tool_reconciliation": {
+                            "execution_id": str(execution.id),
+                            "outcome": data.outcome,
+                        },
+                    },
+                },
+                actor_user_id=current_user.id,
+            )
+        )
+    except (ToolExecutionError, RuntimeAdapterError) as exc:
+        code = exc.code
+        raise HTTPException(
+            status_code=409,
+            detail={"code": code, "message": str(exc)},
+        ) from exc
+
+    db.add(
+        AuditLog(
+            tenant_id=task.tenant_id,
+            user_id=current_user.id,
+            agent_id=run.agent_id,
+            action="work_tool_execution_reconciled",
+            details={
+                "task_id": str(task.id),
+                "run_id": str(run.id),
+                "execution_id": str(execution.id),
+                "tool_name": execution.tool_name,
+                "confirmed_outcome": data.outcome,
+                "execution_status": execution.status,
+                "resume_command_id": str(handle.command_id),
+            },
+        )
+    )
+    await db.commit()
+    return WorkToolReconciliationOut(
+        task_id=task.id,
+        run_id=run.id,
+        execution_id=execution.id,
+        execution_status=expected_status,
+        command_id=handle.command_id,
+        created=handle.created,
+        result_summary=execution.result_summary or "",
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/result-review",
+    response_model=WorkTaskResultReviewOut,
+)
+async def review_work_task_result(
+    task_id: uuid.UUID,
+    data: WorkTaskResultReview,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record one immutable owner decision for the latest completed attempt."""
+
+    task = await _owned_work_task(
+        db,
+        user=current_user,
+        task_id=task_id,
+        lock=True,
+    )
+    if not work_requires_owner_review(task.work_statement):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "task_result_review_not_required",
+                "message": "This Work contract does not require owner review",
+            },
+        )
+
+    fingerprint = _task_result_review_fingerprint(data)
+    existing_request = (
+        await db.execute(
+            select(TaskResultReviewReceipt).where(
+                TaskResultReviewReceipt.tenant_id == task.tenant_id,
+                TaskResultReviewReceipt.task_id == task.id,
+                TaskResultReviewReceipt.client_request_id == data.client_request_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_request is not None:
+        if not hmac.compare_digest(existing_request.request_fingerprint, fingerprint):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "task_result_review_idempotency_conflict",
+                    "message": "The review request id was already used for another decision",
+                },
+            )
+        return WorkTaskResultReviewOut(receipt=existing_request, created=False)
+
+    latest_run = await _latest_work_task_run(db, task=task)
+    if task.status != "done" or latest_run is None or latest_run.id != data.run_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "task_result_review_stale",
+                "message": "Only the latest completed Work attempt can be reviewed",
+            },
+        )
+    completed_event = (
+        await db.execute(
+            select(AgentRunEvent.id).where(
+                AgentRunEvent.tenant_id == task.tenant_id,
+                AgentRunEvent.run_id == latest_run.id,
+                AgentRunEvent.event_type == "run_completed",
+            )
+        )
+    ).scalar_one_or_none()
+    if completed_event is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "task_result_review_not_completed",
+                "message": "The selected Runtime attempt has not completed",
+            },
+        )
+
+    existing_attempt = (
+        await db.execute(
+            select(TaskResultReviewReceipt).where(
+                TaskResultReviewReceipt.tenant_id == task.tenant_id,
+                TaskResultReviewReceipt.task_id == task.id,
+                TaskResultReviewReceipt.run_id == latest_run.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_attempt is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "task_result_review_immutable",
+                "message": "This Runtime attempt already has an immutable owner decision",
+            },
+        )
+
+    receipt = TaskResultReviewReceipt(
+        tenant_id=task.tenant_id,
+        task_id=task.id,
+        run_id=latest_run.id,
+        actor_user_id=current_user.id,
+        client_request_id=data.client_request_id,
+        request_fingerprint=fingerprint,
+        action=data.action,
+        comment=data.comment,
+    )
+    db.add(receipt)
+    db.add(
+        TaskLog(
+            task_id=task.id,
+            content=(
+                "✅ 业务验收通过"
+                if data.action == "approve"
+                else f"↩️ 业务验收要求修改\n\n{data.comment}"
+            ),
+        )
+    )
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "task_result_review_conflict",
+                "message": "The Runtime attempt was reviewed concurrently",
+            },
+        ) from exc
+    await db.refresh(receipt)
+    return WorkTaskResultReviewOut(receipt=receipt, created=True)
+
+
 async def _existing_retry_run(
     db: AsyncSession,
     *,
@@ -1430,16 +1850,34 @@ async def retry_work_task(
         item = await _work_item_for_task(db, user=current_user, task_id=task.id)
         return WorkTaskRetryOut(item=item, run_id=existing_run.id, created=False)
 
-    if task.status not in {"pending", "failed"}:
+    latest_run = await _latest_work_task_run(db, task=task)
+    requested_changes_receipt = None
+    if task.status == "done" and latest_run is not None:
+        requested_changes_receipt = (
+            await db.execute(
+                select(TaskResultReviewReceipt).where(
+                    TaskResultReviewReceipt.tenant_id == task.tenant_id,
+                    TaskResultReviewReceipt.task_id == task.id,
+                    TaskResultReviewReceipt.run_id == latest_run.id,
+                    TaskResultReviewReceipt.action == "request_changes",
+                )
+            )
+        ).scalar_one_or_none()
+    retry_after_owner_changes = requested_changes_receipt is not None
+    if task.status not in {"pending", "failed"} and not retry_after_owner_changes:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "work_retry_not_recoverable",
-                "message": "Only a terminal failed or cancelled attempt can be retried",
+                "message": (
+                    "Only a failed, cancelled, or owner-rejected Work attempt can be retried"
+                ),
             },
         )
-    terminal_event = await _latest_task_attempt_event(db, task=task)
-    if terminal_event is None:
+    terminal_event = (
+        None if retry_after_owner_changes else await _latest_task_attempt_event(db, task=task)
+    )
+    if terminal_event is None and not retry_after_owner_changes:
         raise HTTPException(
             status_code=409,
             detail={
@@ -1471,6 +1909,11 @@ async def retry_work_task(
                 task=task,
                 primary_agent=executor.primary_agent,
                 execution_id=data.client_request_id,
+                owner_change_request=(
+                    requested_changes_receipt.comment
+                    if requested_changes_receipt is not None
+                    else None
+                ),
             )
         else:
             handle = await enqueue_task_runtime(
@@ -1478,6 +1921,11 @@ async def retry_work_task(
                 task=task,
                 agent=executor.primary_agent,
                 execution_id=data.client_request_id,
+                owner_change_request=(
+                    requested_changes_receipt.comment
+                    if requested_changes_receipt is not None
+                    else None
+                ),
             )
     except TaskRuntimeIntakeError as exc:
         raise HTTPException(

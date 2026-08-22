@@ -142,6 +142,37 @@ export function EntryDrawer({ entryId, onClose, onEdit, onChanged, docked }: {
                 {(entry.tags || []).map(tg => <Badge key={tg}>#{tg}</Badge>)}
             </div>
             <div style={{ marginBottom: 16 }}><CreatorLine entry={entry} /></div>
+            {(entry.source_task_id || entry.source_deliverable_request_id) && (
+                <section aria-label="工作来源" style={{
+                    marginBottom: 16,
+                    padding: '10px 12px',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: 8,
+                    background: 'var(--bg-secondary)',
+                }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 6 }}>
+                        工作来源
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 }}>
+                        {entry.source_task_id && (
+                            <a
+                                href={`/work/${entry.source_task_id}`}
+                                style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}
+                            >
+                                查看来源任务
+                            </a>
+                        )}
+                        {entry.source_deliverable_request_id && (
+                            <span
+                                title={entry.source_deliverable_request_id}
+                                style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono, monospace)' }}
+                            >
+                                交付请求 {entry.source_deliverable_request_id}
+                            </span>
+                        )}
+                    </div>
+                </section>
+            )}
             {EXP_FIELDS.map(fl => {
                 const value = (entry[fl.key] as string) || '';
                 return (

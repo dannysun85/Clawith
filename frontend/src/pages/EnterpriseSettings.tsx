@@ -136,7 +136,7 @@ function DouyinAccountTab({ onCreateAgent }: { onCreateAgent: () => void }) {
     const startOAuth = useMutation({
         mutationFn: () => fetchJson<any>('/douyin/oauth/start', {
             method: 'POST',
-            body: JSON.stringify({ redirect_after: '/enterprise#douyin' }),
+            body: JSON.stringify({ redirect_after: '/company-admin/integrations/douyin' }),
         }),
         onSuccess: (res) => {
             if (res?.authorization_url) {

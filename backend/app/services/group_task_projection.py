@@ -23,7 +23,7 @@ from app.models.deliverable import (
     DeliverableQualityReview,
     DeliverableRequest,
 )
-from app.models.task import Task
+from app.models.task import Task, TaskResultReviewReceipt
 from app.models.user import User
 from app.schemas.work import (
     GroupTaskParticipantOut,
@@ -35,7 +35,11 @@ from app.services.work_detail_projection import (
     load_work_inbox_actions,
     project_status_axes,
 )
-from app.services.work_projection import project_user_stage
+from app.services.work_projection import (
+    project_task_result_review_status,
+    project_user_stage,
+    work_requires_owner_review,
+)
 
 
 def _uuid(value: object) -> uuid.UUID | None:
@@ -153,6 +157,26 @@ async def load_group_task_summaries(
         if run_ids
         else []
     )
+    reviewable_task_ids = [
+        task.id
+        for task in tasks
+        if task.status == "done"
+        and work_requires_owner_review(getattr(task, "work_statement", {}))
+    ]
+    task_result_reviews = (
+        list(
+            (
+                await db.execute(
+                    select(TaskResultReviewReceipt).where(
+                        TaskResultReviewReceipt.tenant_id == tenant_id,
+                        TaskResultReviewReceipt.task_id.in_(reviewable_task_ids),
+                    )
+                )
+            ).scalars().all()
+        )
+        if reviewable_task_ids
+        else []
+    )
     requests = list(
         (
             await db.execute(
@@ -238,6 +262,7 @@ async def load_group_task_summaries(
     artifacts_by_request: dict[uuid.UUID, list[DeliverableArtifactRevision]] = defaultdict(list)
     reviews_by_request: dict[uuid.UUID, list[DeliverableQualityReview]] = defaultdict(list)
     receipts_by_request: dict[uuid.UUID, list[DeliverableApprovalReceipt]] = defaultdict(list)
+    result_reviews_by_task: dict[uuid.UUID, list[TaskResultReviewReceipt]] = defaultdict(list)
     for value in executions:
         executions_by_request[value.request_id].append(value)
     for value in artifacts:
@@ -246,6 +271,8 @@ async def load_group_task_summaries(
         reviews_by_request[value.request_id].append(value)
     for value in receipts:
         receipts_by_request[value.request_id].append(value)
+    for value in task_result_reviews:
+        result_reviews_by_task[value.task_id].append(value)
     approvals_by_run: dict[uuid.UUID, list[ApprovalRequest]] = defaultdict(list)
     for approval in approvals:
         if (run_id := _runtime_run_id(approval)) in run_ids:
@@ -290,6 +317,7 @@ async def load_group_task_summaries(
             for run_id in task_run_ids
             for value in approvals_by_run.get(run_id, [])
         ]
+        task_result_receipts = result_reviews_by_task.get(task.id, [])
         axes = project_status_axes(
             task=task,
             runs=task_runs,
@@ -300,6 +328,29 @@ async def load_group_task_summaries(
             reviews=task_reviews,
             runtime_approvals=task_approvals,
             approval_receipts=task_receipts,
+            task_result_reviews=task_result_receipts,
+        )
+        latest_task_run = max(
+            task_runs,
+            key=lambda value: (value.created_at, value.id),
+            default=None,
+        )
+        latest_result_receipt = next(
+            (
+                receipt
+                for receipt in reversed(task_result_receipts)
+                if latest_task_run is not None and receipt.run_id == latest_task_run.id
+            ),
+            None,
+        )
+        task_result_review_status = project_task_result_review_status(
+            task_status=task.status,
+            work_statement=getattr(task, "work_statement", {}),
+            receipt_action=(
+                latest_result_receipt.action
+                if latest_result_receipt is not None
+                else None
+            ),
         )
         latest_request = max(
             task_requests,
@@ -372,6 +423,7 @@ async def load_group_task_summaries(
                     deliverable_status=(latest_request.status if latest_request else None),
                     artifact_status=(latest_artifact.status if latest_artifact else None),
                     review_status=(latest_review.status if latest_review else None),
+                    task_result_review_status=task_result_review_status,
                 ),
                 status_axes=axes,
                 primary_owner_agent_id=owner_id,

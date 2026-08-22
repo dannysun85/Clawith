@@ -23,12 +23,15 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["manual_order_decisions"]
+    assert _script_directory().get_heads() == ["planning_cost_controls"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("manual_order_decisions")
+    release_head = script.get_revision("planning_cost_controls")
+    planning_system_costs_revision = script.get_revision("planning_system_costs")
+    task_result_reviews_revision = script.get_revision("task_result_reviews")
+    manual_order_revision = script.get_revision("manual_order_decisions")
     billing_effect_receipts_revision = script.get_revision("billing_effect_receipts")
     deliverable_audit_revision = script.get_revision("backfill_deliv_audit_tenant")
     widen_creative_brief_revision = script.get_revision("widen_creative_brief_schema")
@@ -76,7 +79,16 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("billing_effect_receipts",)
+    assert release_head._normalized_down_revisions == ("planning_system_costs",)
+    assert planning_system_costs_revision._normalized_down_revisions == (
+        "task_result_reviews",
+    )
+    assert task_result_reviews_revision._normalized_down_revisions == (
+        "manual_order_decisions",
+    )
+    assert manual_order_revision._normalized_down_revisions == (
+        "billing_effect_receipts",
+    )
     assert billing_effect_receipts_revision._normalized_down_revisions == (
         "backfill_deliv_audit_tenant",
     )
@@ -168,13 +180,65 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         BACKEND_ROOT.parent / "scripts/tenant-purge-postgres-smoke.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-manual_order_decisions' in smoke
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-manual_order_decisions' in purge_smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-planning_cost_controls' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-planning_cost_controls' in purge_smoke
     assert 'grep -F "${release_head} (head)"' in purge_smoke
     assert "restore_runtime_chat_foreign_key" in smoke
+    assert "DROP TABLE IF EXISTS llm_system_cost_resolutions" in smoke
+    assert "DROP TABLE IF EXISTS llm_system_cost_receipts" in smoke
+    assert "partial Planning cost table unexpectedly passed migration" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke
     assert "partial allowance table unexpectedly passed migration" in smoke
     assert "Incompatible pre-existing media_provider_daily_allowance_claims" in smoke
+    assert "planning-system-cost-postgres-smoke.py" in smoke
+
+
+def test_planning_cost_postgres_smoke_has_actionable_schema_preflight() -> None:
+    planning_smoke = (
+        BACKEND_ROOT.parent / "scripts/planning-system-cost-postgres-smoke.py"
+    ).read_text(encoding="utf-8")
+
+    assert "async def _assert_schema_ready()" in planning_smoke
+    assert "await _assert_schema_ready()" in planning_smoke
+    assert "DATABASE_URL" in planning_smoke
+    assert "planning_cost_controls" in planning_smoke
+    assert "missing table(s)" in planning_smoke
+
+
+def test_planning_system_cost_migration_is_tenant_fenced_and_fail_closed() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608221400_add_planning_system_costs.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "task_result_reviews"' in migration
+    assert 'TABLE_NAME = "llm_system_cost_receipts"' in migration
+    assert "uq_llm_system_cost_receipts_run_call" in migration
+    assert "fk_llm_system_cost_receipts_tenant_run_agent_runs" in migration
+    assert "fk_llm_system_cost_receipts_tenant_session_chat_sessions" in migration
+    assert "fk_llm_system_cost_receipts_tenant_group_groups" in migration
+    assert "provider_inflight" in migration
+    assert "acceptance_unknown" in migration
+    assert "response_snapshot" in migration
+    assert "get_check_constraints" in migration
+    assert "get_foreign_keys" in migration
+    assert "get_indexes" in migration
+    assert "Incompatible pre-existing llm_system_cost_receipts" in migration
+
+
+def test_planning_cost_controls_support_fresh_metadata_and_incremental_upgrade() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608221630_add_planning_cost_controls.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "planning_system_costs"' in migration
+    assert "_assert_existing_controls_compatible" in migration
+    assert "if RESOLUTION_TABLE in _table_names()" in migration
+    assert "budget_reservation_credits" in migration
+    assert "fk_llm_system_cost_resolutions_tenant_receipt" in migration
+    assert "uq_llm_system_cost_resolutions_idempotency" in migration
+    assert "Incompatible pre-existing Planning cost controls" in migration
 
 
 def test_tenant_deletion_purge_migration_is_minimal_reentrant_and_reversible() -> None:

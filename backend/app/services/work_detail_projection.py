@@ -21,6 +21,7 @@ from app.core.permissions import build_manageable_agents_query
 from app.models.agent import Agent
 from app.models.agent_run import AgentRun
 from app.models.agent_run_event import AgentRunEvent
+from app.models.agent_tool_execution import AgentToolExecution
 from app.models.audit import ApprovalRequest
 from app.models.deliverable import (
     DeliverableApprovalReceipt,
@@ -30,7 +31,7 @@ from app.models.deliverable import (
     DeliverableQualityReviewAssignment,
     DeliverableRequest,
 )
-from app.models.task import Task, TaskLog
+from app.models.task import Task, TaskLog, TaskResultReviewReceipt
 from app.models.user import User
 from app.schemas.work import (
     WorkApprovalSummaryOut,
@@ -43,9 +44,17 @@ from app.schemas.work import (
     WorkRunSummaryOut,
     WorkStatusAxesOut,
     WorkTaskDetailOut,
+    WorkTaskResultReviewReceiptOut,
     WorkTimelineEventOut,
 )
-from app.services.work_projection import project_execution_status
+from app.services.work_projection import (
+    project_execution_status,
+    project_task_result_review_status,
+    work_requires_owner_review,
+)
+from app.services.agent_runtime.tool_execution import (
+    can_user_reconcile_unknown_execution,
+)
 
 
 _RUNTIME_LIFECYCLE_EVENT_TYPES = frozenset(
@@ -144,7 +153,14 @@ def collaboration_safe_work_item(item: WorkItemOut) -> WorkItemOut:
         safe_snapshot["origin"] = origin
     safe_statement = {
         key: statement[key]
-        for key in ("version", "title", "objective", "work_type", "priority")
+        for key in (
+            "version",
+            "title",
+            "objective",
+            "work_type",
+            "priority",
+            "acceptance_contract",
+        )
         if statement.get(key) is not None
     }
     if origin:
@@ -210,6 +226,7 @@ def collaboration_safe_work_detail(detail: WorkTaskDetailOut) -> WorkTaskDetailO
             "detail_scope": "collaboration",
             "summary": safe_summary,
             "timeline": safe_timeline,
+            "task_result_reviews": [],
             "deliverables": [],
             "artifacts": [],
             "reviews": [],
@@ -283,14 +300,27 @@ def _execution_axis(
     if task.status == "failed":
         return "failed"
     latest_event = max(
-        events,
+        (
+            event
+            for event in events
+            if event.event_type in _RUNTIME_LIFECYCLE_EVENT_TYPES
+        ),
         key=lambda event: _sort_key(event.created_at, str(event.id)),
         default=None,
     )
     if task.status == "doing" and latest_event and latest_event.event_type == "waiting_started":
         return "waiting"
     if task.status == "doing":
-        return "running"
+        terminal = (
+            latest_event.event_type
+            if latest_event is not None
+            and latest_event.event_type in {"run_completed", "run_failed", "run_cancelled"}
+            else None
+        )
+        return project_execution_status(
+            task_status=task.status,
+            terminal_run_event=terminal,
+        )
     terminal_events = [
         event for event in events if event.event_type in {"run_failed", "run_cancelled"}
     ]
@@ -314,7 +344,9 @@ def project_status_axes(
     reviews: list[DeliverableQualityReview],
     runtime_approvals: list[ApprovalRequest],
     approval_receipts: list[DeliverableApprovalReceipt],
+    task_result_reviews: list[TaskResultReviewReceipt] | None = None,
 ) -> WorkStatusAxesOut:
+    task_result_reviews = task_result_reviews or []
     latest_request = max(
         requests,
         key=lambda item: _sort_key(item.updated_at, str(item.id)),
@@ -357,6 +389,28 @@ def project_status_axes(
         key=lambda item: _sort_key(item.created_at, str(item.id)),
         default=None,
     )
+    latest_run = max(
+        runs,
+        key=lambda item: _sort_key(item.created_at, str(item.id)),
+        default=None,
+    )
+    latest_task_result_review = next(
+        (
+            receipt
+            for receipt in reversed(task_result_reviews)
+            if latest_run is not None and receipt.run_id == latest_run.id
+        ),
+        None,
+    )
+    task_result_review_status = project_task_result_review_status(
+        task_status=task.status,
+        work_statement=getattr(task, "work_statement", {}),
+        receipt_action=(
+            latest_task_result_review.action
+            if latest_task_result_review is not None
+            else None
+        ),
+    )
 
     if latest_receipt is not None:
         delivery_approval = {
@@ -397,7 +451,15 @@ def project_status_axes(
     return WorkStatusAxesOut(
         execution=_execution_axis(task=task, runs=runs, events=events),
         artifact=latest_artifact.status if latest_artifact is not None else "missing",
-        quality=latest_review.status if latest_review is not None else "not_required",
+        quality=(
+            latest_review.status
+            if latest_review is not None
+            else {
+                "pending": "open",
+                "approved": "passed",
+                "request_changes": "blocked",
+            }.get(task_result_review_status, "not_required")
+        ),
         runtime_approval=_runtime_approval_status(latest_runtime_approval),
         delivery_approval=delivery_approval,
         delivery=delivery,
@@ -627,12 +689,164 @@ async def load_work_inbox_actions(
     )
     task_by_id = {task.id: task for task in owned_tasks}
     task_runs = await _task_runs(db, tenant_id=tenant_id, task_ids=list(task_by_id))
+    latest_run_by_task: dict[uuid.UUID, AgentRun] = {}
+    for run in sorted(
+        task_runs,
+        key=lambda item: _sort_key(item.created_at, str(item.id)),
+        reverse=True,
+    ):
+        task_id = _task_id_for_run(run)
+        if task_id in task_by_id:
+            latest_run_by_task.setdefault(task_id, run)
+    reviewable_task_ids = [
+        task.id
+        for task in owned_tasks
+        if task.status == "done"
+        and work_requires_owner_review(getattr(task, "work_statement", {}))
+    ]
+    task_result_receipts = (
+        list(
+            (
+                await db.execute(
+                    select(TaskResultReviewReceipt).where(
+                        TaskResultReviewReceipt.tenant_id == tenant_id,
+                        TaskResultReviewReceipt.task_id.in_(reviewable_task_ids),
+                    )
+                )
+            ).scalars().all()
+        )
+        if reviewable_task_ids
+        else []
+    )
+    latest_result_review_by_run: dict[uuid.UUID, TaskResultReviewReceipt] = {}
+    for receipt in sorted(
+        task_result_receipts,
+        key=lambda item: _sort_key(item.created_at, str(item.id)),
+        reverse=True,
+    ):
+        latest_result_review_by_run.setdefault(receipt.run_id, receipt)
+    for task_id, task in task_by_id.items():
+        latest_run = latest_run_by_task.get(task_id)
+        if (
+            latest_run is None
+            or task.status != "done"
+            or not work_requires_owner_review(getattr(task, "work_statement", {}))
+        ):
+            continue
+        latest_result_review = latest_result_review_by_run.get(latest_run.id)
+        if latest_result_review is not None:
+            if latest_result_review.action == "request_changes":
+                actions.append(
+                    WorkNextActionOut(
+                        id=f"task_recovery:{latest_result_review.id}",
+                        task_id=task_id,
+                        kind="task_recovery",
+                        title="Retry the task after the owner requested changes",
+                        reason_code="task_result_changes_requested",
+                        source_type="task_result_review_receipt",
+                        source_id=str(latest_result_review.id),
+                        action_url=f"/work/{task_id}",
+                        created_at=latest_result_review.created_at,
+                        version=str(latest_result_review.id),
+                    )
+                )
+            continue
+        actions.append(
+            WorkNextActionOut(
+                id=f"task_result_review:{latest_run.id}",
+                task_id=task_id,
+                kind="task_result_review",
+                title="Review the completed task result against the confirmed criteria",
+                reason_code="task_result_owner_review_pending",
+                source_type="agent_run",
+                source_id=str(latest_run.id),
+                action_url=f"/work/{task_id}",
+                created_at=latest_run.updated_at,
+                version=str(latest_run.id),
+            )
+        )
     task_events = await _run_events(
         db,
         tenant_id=tenant_id,
         run_ids=[run.id for run in task_runs],
     )
     run_by_id = {run.id: run for run in task_runs}
+    latest_event_by_run = latest_runtime_lifecycle_event_by_run(task_events)
+    waiting_event_by_run = {
+        run_id: event
+        for run_id, event in latest_event_by_run.items()
+        if event.event_type == "waiting_started"
+        and isinstance(event.payload, dict)
+        and event.payload.get("waiting_type") == "user"
+    }
+    reconciliation_run_ids = [
+        run_id
+        for run_id in waiting_event_by_run
+        if (run := run_by_id.get(run_id)) is not None
+        and run.source_type == "task"
+        and _task_id_for_run(run) in task_by_id
+    ]
+    if reconciliation_run_ids:
+        unknown_executions = list(
+            (
+                await db.execute(
+                    select(AgentToolExecution)
+                    .where(
+                        AgentToolExecution.tenant_id == tenant_id,
+                        AgentToolExecution.run_id.in_(reconciliation_run_ids),
+                        AgentToolExecution.status == "unknown",
+                    )
+                    .order_by(
+                        AgentToolExecution.started_at,
+                        AgentToolExecution.id,
+                    )
+                )
+            ).scalars().all()
+        )
+        for execution in unknown_executions:
+            if not can_user_reconcile_unknown_execution(execution):
+                continue
+            waiting_event = waiting_event_by_run.get(execution.run_id)
+            payload = (
+                waiting_event.payload
+                if waiting_event is not None and isinstance(waiting_event.payload, dict)
+                else {}
+            )
+            correlation_id = payload.get("correlation_id")
+            expected_correlations = {
+                str(
+                    uuid.uuid5(
+                        execution.run_id,
+                        f"tool-reconcile:{execution.tool_call_id}",
+                    )
+                ),
+                f"tool-confirm:{execution.run_id}",
+            }
+            if correlation_id not in expected_correlations:
+                continue
+            run = run_by_id.get(execution.run_id)
+            task_id = _task_id_for_run(run) if run is not None else None
+            if task_id not in task_by_id:
+                continue
+            actions.append(
+                WorkNextActionOut(
+                    id=f"tool_reconciliation:{execution.id}",
+                    task_id=task_id,
+                    kind="tool_reconciliation",
+                    title=f"Confirm the outcome of {execution.tool_name}",
+                    reason_code=(
+                        str(execution.result_metadata.get("error_code"))
+                        if isinstance(execution.result_metadata, dict)
+                        and execution.result_metadata.get("error_code")
+                        else "tool_outcome_unknown"
+                    ),
+                    source_type="agent_tool_execution",
+                    source_id=str(execution.id),
+                    action_url=f"/work/{task_id}",
+                    created_at=execution.updated_at,
+                    version=f"{execution.status}:{execution.attempt_count}",
+                )
+            )
     latest_recovery_by_task: dict[uuid.UUID, tuple[AgentRun, AgentRunEvent]] = {}
     for event in sorted(
         task_events,
@@ -755,6 +969,21 @@ async def load_work_task_detail(
                 select(TaskLog)
                 .where(TaskLog.task_id == task.id)
                 .order_by(TaskLog.created_at, TaskLog.id)
+            )
+        ).scalars().all()
+    )
+    task_result_reviews = list(
+        (
+            await db.execute(
+                select(TaskResultReviewReceipt)
+                .where(
+                    TaskResultReviewReceipt.tenant_id == tenant_id,
+                    TaskResultReviewReceipt.task_id == task.id,
+                )
+                .order_by(
+                    TaskResultReviewReceipt.created_at,
+                    TaskResultReviewReceipt.id,
+                )
             )
         ).scalars().all()
     )
@@ -917,6 +1146,22 @@ async def load_work_task_detail(
             summary=log.content,
         )
         for log in logs
+    )
+    timeline.extend(
+        WorkTimelineEventOut(
+            id=f"task_result_review:{receipt.id}",
+            type="task_result_review",
+            occurred_at=receipt.created_at,
+            source_type="task_result_review_receipt",
+            source_id=str(receipt.id),
+            status=receipt.action,
+            title="Task result approved" if receipt.action == "approve" else "Task changes requested",
+            summary=receipt.comment,
+            actor_type="user",
+            actor_id=receipt.actor_user_id,
+            metadata={"run_id": str(receipt.run_id)},
+        )
+        for receipt in task_result_reviews
     )
     timeline.extend(
         WorkTimelineEventOut(
@@ -1083,6 +1328,7 @@ async def load_work_task_detail(
             reviews=reviews,
             runtime_approvals=runtime_approvals,
             approval_receipts=receipts,
+            task_result_reviews=task_result_reviews,
         ),
         timeline=timeline,
         next_actions=next_actions,
@@ -1105,6 +1351,10 @@ async def load_work_task_detail(
                 key=lambda item: _sort_key(item.created_at, str(item.id)),
                 reverse=True,
             )
+        ],
+        task_result_reviews=[
+            WorkTaskResultReviewReceiptOut.model_validate(receipt)
+            for receipt in reversed(task_result_reviews)
         ],
         deliverables=[
             WorkDeliverableSummaryOut.model_validate(request, from_attributes=True)

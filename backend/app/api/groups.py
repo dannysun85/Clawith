@@ -34,6 +34,11 @@ from app.services.agent_runtime.session_context_service import (
 )
 from app.services.agent_runtime.adapter import RuntimeCommandIntake
 from app.services.agent_runtime.contracts import CancelRunCommand
+from app.services.agent_runtime.model_capabilities import (
+    PlatformModelConfigurationError,
+    ensure_current_platform_credential_route,
+    resolve_multi_agent_planning_model,
+)
 from app.services.agent_runtime.run_state_reader import (
     RunStateReadError,
     open_run_state_reader as _open_run_state_reader,
@@ -170,6 +175,13 @@ class GroupMessageIntakeOut(BaseModel):
     created: bool
     error_code: str | None = None
     error: GroupErrorOut | None = None
+
+
+class GroupPlanningReadinessOut(BaseModel):
+    available: bool
+    code: Literal["ready", "planning_model_unavailable"]
+    message: str
+    remediation: Literal["contact_platform_operator_or_mention_one_agent"] | None = None
 
 
 class GroupRunStateOut(BaseModel):
@@ -600,6 +612,54 @@ async def get_group(
         )
     except GroupChatServiceError as exc:
         raise _translate_domain_error(exc) from exc
+
+
+@router.get(
+    "/{group_id}/planning-readiness",
+    response_model=GroupPlanningReadinessOut,
+)
+async def get_group_planning_readiness(
+    group_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Expose only the tenant's multi-Agent readiness, never model identities or secrets."""
+
+    tenant_id = _tenant_id(current_user)
+    participant = await _current_participant(db, current_user)
+    try:
+        await group_chat_service.authorize_group_member(
+            db,
+            tenant_id=tenant_id,
+            group_id=group_id,
+            participant_id=participant.id,
+            human_only=True,
+        )
+    except GroupChatServiceError as exc:
+        raise _translate_domain_error(exc) from exc
+
+    try:
+        planning_model = await resolve_multi_agent_planning_model(db, tenant_id=tenant_id)
+        await ensure_current_platform_credential_route(
+            db,
+            planning_model,
+            setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
+        )
+    except (PlatformModelConfigurationError, ValueError):
+        return GroupPlanningReadinessOut(
+            available=False,
+            code="planning_model_unavailable",
+            message=(
+                "多 Agent 规划暂不可用。请联系平台运营管理员配置并验证规划模型，"
+                "或仅 @ 一名 Agent 继续。"
+            ),
+            remediation="contact_platform_operator_or_mention_one_agent",
+        )
+    return GroupPlanningReadinessOut(
+        available=True,
+        code="ready",
+        message="多 Agent 规划可用。",
+    )
 
 
 @router.get("/{group_id}/tasks", response_model=list[GroupTaskSummaryOut])

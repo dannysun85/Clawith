@@ -1857,7 +1857,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                                     ? `目前只有 ${eligibleReviewerCount} 位可用评审人，还差 ${3 - eligibleReviewerCount} 位。`
                                     : `Only ${eligibleReviewerCount} eligible reviewers are available; ${3 - eligibleReviewerCount} more required.`}
                                 {' '}
-                                <a href="/enterprise#org">{isZh ? '管理企业成员' : 'Manage organization members'}</a>
+                                <a href="/company-admin/integrations/org">{isZh ? '管理组织同步' : 'Manage organization sync'}</a>
                             </span>
                         </div>
                     )}

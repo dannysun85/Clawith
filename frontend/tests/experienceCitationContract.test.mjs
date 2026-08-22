@@ -23,3 +23,10 @@ test('the experience drawer distinguishes load failure from loading', () => {
   assert.match(detailDrawer, /经验已删除或不可访问/);
   assert.match(detailDrawer, /enabled: Boolean\(entry\)/);
 });
+
+test('published work knowledge exposes its durable task and delivery provenance', () => {
+  assert.match(detailDrawer, /entry\.source_task_id \|\| entry\.source_deliverable_request_id/);
+  assert.match(detailDrawer, /href=\{`\/work\/\$\{entry\.source_task_id\}`\}/);
+  assert.match(detailDrawer, /查看来源任务/);
+  assert.match(detailDrawer, /交付请求 \{entry\.source_deliverable_request_id\}/);
+});

@@ -1230,6 +1230,104 @@ async def test_empty_output_is_repaired_once_then_fails_explicitly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_truncated_output_continues_and_deduplicates_exact_overlap() -> None:
+    run_id = uuid.uuid4()
+    overlap = "这是上一段末尾用于确定性去重的完整边界标记，不应在最终答案里重复。"
+    first = f"第一部分：范围与目标。\n{overlap}"
+    second = f"{overlap}\n第二部分：执行计划。"
+    final = "\n第三部分：验收与退出条件。"
+    model = ModelService(
+        ModelStepResult(
+            intent="text",
+            assistant_message={"role": "assistant", "content": first},
+            repair_instruction="Continue from the previous partial response.",
+            repair_code="incomplete_output",
+        ),
+        ModelStepResult(
+            intent="text",
+            assistant_message={"role": "assistant", "content": second},
+            repair_instruction="Continue from the previous partial response.",
+            repair_code="incomplete_output",
+        ),
+        ModelStepResult(
+            intent="finish",
+            assistant_message={"role": "assistant", "content": final},
+            finish_content=final,
+        ),
+    )
+    executor = _executor(model)
+
+    result = await _invoke(run_id, executor, model_turn_limit=50)
+
+    lifecycle = result["lifecycle"]
+    expected = f"{first}\n第二部分：执行计划。{final}"
+    assert lifecycle["status"] == "completed"
+    assert lifecycle["result_summary"]["summary"] == expected
+    assert lifecycle["model_protocol_repairs"] == {"incomplete_output": 2}
+    assert "incomplete_output_buffer" not in lifecycle
+    assert expected.count(overlap) == 1
+    assert model.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_truncated_output_fails_after_three_bounded_continuations() -> None:
+    run_id = uuid.uuid4()
+    repair = ModelStepResult(
+        intent="text",
+        assistant_message={"role": "assistant", "content": "bounded partial"},
+        repair_instruction="Continue from the previous partial response.",
+        repair_code="incomplete_output",
+    )
+    model = ModelService(repair, repair, repair, repair)
+    executor = _executor(model)
+
+    result = await _invoke(run_id, executor, model_turn_limit=50)
+
+    lifecycle = result["lifecycle"]
+    assert lifecycle["status"] == "failed"
+    assert lifecycle["reason"] == "model_incomplete_output"
+    assert lifecycle["model_protocol_repairs"] == {"incomplete_output": 3}
+    assert lifecycle["error"] == {
+        "code": "model_incomplete_output",
+        "message": (
+            "The model output remained truncated after "
+            "3 bounded continuation attempts."
+        ),
+    }
+    assert model.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_verification_repair_does_not_reuse_completed_continuation_buffer() -> None:
+    run_id = uuid.uuid4()
+    partial = "旧候选的第一部分。"
+    tail = "旧候选的第二部分。"
+    revised = "根据验收意见完全重写的新候选。"
+    model = ModelService(
+        ModelStepResult(
+            intent="text",
+            assistant_message={"role": "assistant", "content": partial},
+            repair_instruction="Continue from the previous partial response.",
+            repair_code="incomplete_output",
+        ),
+        ModelStepResult(intent="finish", finish_content=tail),
+        ModelStepResult(intent="finish", finish_content=revised),
+    )
+    verifier = Verifier(
+        VerificationResult(outcome="repair", reason="Rewrite the answer."),
+        VerificationResult(outcome="pass", details={"code": "ok"}),
+    )
+    executor = _executor(model, verifier=verifier)
+
+    result = await _invoke(run_id, executor, model_turn_limit=50)
+
+    assert result["lifecycle"]["status"] == "completed"
+    assert result["lifecycle"]["result_summary"]["summary"] == revised
+    assert verifier.calls == [f"{partial}{tail}", revised]
+    assert partial not in result["lifecycle"]["result_summary"]["summary"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("repair_code", "instruction"),
     [

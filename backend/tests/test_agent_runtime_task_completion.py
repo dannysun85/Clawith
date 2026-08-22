@@ -196,6 +196,24 @@ async def test_completed_checkpoint_marks_task_done_and_writes_one_receipt_log()
 
 
 @pytest.mark.asyncio
+async def test_task_source_identity_wins_over_compatible_work_correlation() -> None:
+    run, checkpoint, stored_run, task = _records()
+    correlation_id = f"work-task:{task.id}"
+    run = replace(run, correlation_id=correlation_id)
+    stored_run.correlation_id = correlation_id
+    session = _Session(stored_run, None, task)
+    handler = TaskRuntimeCompletionHandler(
+        session_factory=_SessionFactory(session),  # type: ignore[arg-type]
+    )
+
+    await handler.handle(run=run, checkpoint=checkpoint)
+
+    assert task.status == "done"
+    assert isinstance(session.added[0], TaskLog)
+    assert session.added[0].content == "✅ 任务完成\n\nReport completed"
+
+
+@pytest.mark.asyncio
 async def test_existing_terminal_log_makes_reconciliation_idempotent() -> None:
     run, checkpoint, stored_run, task = _records()
     receipt_id = uuid.uuid5(run.run_id, "task-terminal:checkpoint-terminal")

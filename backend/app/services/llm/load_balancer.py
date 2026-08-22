@@ -204,6 +204,7 @@ def _diagnose_base_filter_failure(
     *,
     quota_modality: str | None = None,
     quota_model: str | None = None,
+    require_current_verification: bool = False,
 ) -> CredentialUnavailableReason:
     if not credentials:
         return CredentialUnavailableReason.NOT_CONFIGURED
@@ -213,7 +214,7 @@ def _diagnose_base_filter_failure(
     enabled = [credential for credential in capable if credential.enabled]
     if not enabled:
         return CredentialUnavailableReason.ALL_UNHEALTHY
-    if _requires_explicit_account_verification(modality):
+    if require_current_verification or _requires_explicit_account_verification(modality):
         enabled = [
             credential
             for credential in enabled
@@ -387,6 +388,7 @@ async def pick_credential(
     quota_modality: str | None = None,
     quota_model: str | None = None,
     exclude_credential_ids: set[uuid.UUID] | None = None,
+    require_current_verification: bool = False,
 ) -> LLMCredential:
     """Pick a credential from the pool for (provider, modality).
 
@@ -407,6 +409,9 @@ async def pick_credential(
             model then does not poison other models in the same modality.
         exclude_credential_ids: Credentials already rejected by an outer,
             modality-specific transactional allowance claim.
+        require_current_verification: Require a successful receipt for the
+            credential's current stored configuration. Group planning uses this
+            stricter route even though legacy text calls remain backward-compatible.
     """
     redis = await _get_redis_or_none()
     effective_quota_modality = quota_modality if quota_modality is not None else modality
@@ -441,7 +446,7 @@ async def pick_credential(
             conditions.append(
                 or_(*capability_conditions)
             )
-            if _requires_explicit_account_verification(modality):
+            if require_current_verification or _requires_explicit_account_verification(modality):
                 conditions.append(LLMCredential.last_verification_at.is_not(None))
 
         # Order by priority DESC, weight DESC for weighted pick
@@ -454,7 +459,10 @@ async def pick_credential(
             credential
             for credential in result.scalars().all()
             if (
-                not _requires_explicit_account_verification(modality)
+                not (
+                    require_current_verification
+                    or _requires_explicit_account_verification(modality)
+                )
                 or current_credential_verification_receipt(credential) is not None
             )
             if not credential_quota_is_blocked(
@@ -479,6 +487,7 @@ async def pick_credential(
                     modality,
                     quota_modality=effective_quota_modality,
                     quota_model=quota_model,
+                    require_current_verification=require_current_verification,
                 )
             )
             logger.warning(

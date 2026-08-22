@@ -27,6 +27,7 @@ from app.services.agent_runtime.contracts import RunHandle, StartRunCommand
 from app.services.agent_runtime.persistence import RuntimePersistenceError
 from app.services.agent_runtime.model_capabilities import (
     PlatformModelConfigurationError,
+    ensure_current_platform_credential_route,
     resolve_multi_agent_planning_model,
 )
 
@@ -706,6 +707,11 @@ async def enqueue_group_message(
                 db,
                 runtime_settings,
                 tenant_id=tenant_id,
+            )
+            await ensure_current_platform_credential_route(
+                db,
+                planning_model,
+                setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
             )
             handle = await adapter.start_run(
                 _planning_command(

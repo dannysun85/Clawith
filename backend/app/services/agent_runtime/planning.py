@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
+import logging
 import re
 from typing import Protocol, cast
 import uuid
@@ -30,11 +31,23 @@ from app.services.agent_runtime.state import (
     RuntimeNodeName,
     RuntimeStateUpdate,
 )
+from app.services.agent_runtime.system_costs import (
+    PlanningCostAccountingError,
+    PlanningCostAccountingPort,
+    PlanningCostReplay,
+    PlanningSystemCostService,
+    planning_request_fingerprint,
+    planning_request_token_upper_bound,
+)
 from app.services.llm.client import LLMMessage
+from app.services.llm.caller import AgentLLMInvocation, resolve_model_key
+from app.services.llm.load_balancer import NoCredentialAvailable
 from app.services.llm.single_step import LLMCompletionStep, complete_llm_once
 from app.services.llm.model_resolution import load_active_model
 from app.services.llm.utils import get_max_tokens
 
+
+logger = logging.getLogger(__name__)
 
 _PLANNING_ROLE = "group_planning"
 _PLAN_VERSION = 2
@@ -125,6 +138,8 @@ class PlanningCompletionPort(Protocol):
         tools: list[dict] | None = None,
         agent_id: uuid.UUID | None = None,
         supports_vision: bool = False,
+        invocation: object | None = None,
+        billing_ref_id: uuid.UUID | None = None,
     ) -> LLMCompletionStep: ...
 
 
@@ -380,9 +395,35 @@ class PlanningModelService:
         *,
         session_factory: RuntimeSessionFactory,
         completion: PlanningCompletionPort = complete_llm_once,  # type: ignore[assignment]
+        cost_accounting: PlanningCostAccountingPort | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._completion = completion
+        self._cost_accounting = cost_accounting or PlanningSystemCostService(
+            session_factory
+        )
+
+    @staticmethod
+    def _completion_from_replay(replay: PlanningCostReplay) -> LLMCompletionStep:
+        return LLMCompletionStep(
+            content=replay.content,
+            tool_calls=replay.tool_calls,
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=replay.usage,
+            retry_tool_name=None,
+            finish_reason=replay.finish_reason,
+        )
+
+    @staticmethod
+    def _planning_call_index(state: RuntimeGraphState) -> int:
+        value = state["lifecycle"].get("planning_attempt_count", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise PlanningCostAccountingError(
+                "planning_cost_context_invalid",
+                "Planning attempt count is invalid",
+            )
+        return value + 1
 
     async def _load_model(self, context: RuntimeContext) -> LLMModel:
         try:
@@ -477,20 +518,167 @@ class PlanningModelService:
                 content=json.dumps(request, ensure_ascii=False, sort_keys=True),
             ),
         ]
-        try:
-            completion = await self._completion(
-                model,
-                messages,
-                tools=None,
-                agent_id=None,
-                supports_vision=False,
+        completion_kwargs: dict[str, object] = {
+            "tools": None,
+            "agent_id": None,
+            "supports_vision": False,
+        }
+        completion: LLMCompletionStep | None = None
+        cost_receipt_id: uuid.UUID | None = None
+        if self._completion is complete_llm_once:
+            try:
+                call_index = self._planning_call_index(state)
+            except PlanningCostAccountingError as exc:
+                return PlanningModelResult(
+                    error_code=exc.code,
+                    error_message="Planning cost context is invalid",
+                    retryable=False,
+                )
+            request_fingerprint = planning_request_fingerprint(messages)
+            request_input_token_upper_bound = planning_request_token_upper_bound(messages)
+            request_max_output_tokens = get_max_tokens(
+                model.provider,
+                model.model,
+                model.max_output_tokens,
             )
-        except Exception:
-            return PlanningModelResult(
-                error_code="planning_model_call_failed",
-                error_message="Planning model call failed",
-                retryable=True,
-            )
+            try:
+                replay = await self._cost_accounting.find_replay_or_raise(
+                    context=context,
+                    model=model,
+                    request_fingerprint=request_fingerprint,
+                    call_index=call_index,
+                )
+            except PlanningCostAccountingError as exc:
+                return PlanningModelResult(
+                    error_code=exc.code,
+                    error_message="Planning cost accounting requires reconciliation",
+                    retryable=False,
+                )
+            if replay is not None:
+                completion = self._completion_from_replay(replay)
+            else:
+                try:
+                    api_key, base_url, credential_id = await resolve_model_key(
+                        model,
+                        capability_modality="text",
+                        require_current_verification=True,
+                    )
+                except NoCredentialAvailable:
+                    return PlanningModelResult(
+                        error_code="planning_model_unavailable",
+                        error_message="Planning model is currently unavailable",
+                        retryable=False,
+                    )
+                try:
+                    attempt = await self._cost_accounting.begin(
+                        context=context,
+                        model=model,
+                        credential_id=credential_id,
+                        request_fingerprint=request_fingerprint,
+                        call_index=call_index,
+                        request_input_token_upper_bound=request_input_token_upper_bound,
+                        request_max_output_tokens=request_max_output_tokens,
+                    )
+                except PlanningCostAccountingError as exc:
+                    return PlanningModelResult(
+                        error_code=exc.code,
+                        error_message="Planning cost accounting is unavailable",
+                        retryable=False,
+                    )
+                if attempt.replay is not None:
+                    completion = self._completion_from_replay(attempt.replay)
+                else:
+                    cost_receipt_id = attempt.receipt_id
+                    completion_kwargs["invocation"] = AgentLLMInvocation(
+                        model=model,
+                        fallback_model=None,
+                        route_meta=None,
+                        tenant_id=uuid.UUID(context.tenant_id),
+                        api_key=api_key,
+                        base_url=base_url,
+                        credential_id=credential_id,
+                    )
+                    completion_kwargs["billing_ref_id"] = uuid.UUID(context.run_id)
+        if completion is None:
+            try:
+                completion = await self._completion(
+                    model,
+                    messages,
+                    **completion_kwargs,
+                )
+            except Exception as exc:
+                if cost_receipt_id is not None:
+                    provider_outcome_ambiguous = bool(
+                        getattr(exc, "provider_outcome_ambiguous", False)
+                    )
+                    try:
+                        if provider_outcome_ambiguous:
+                            await self._cost_accounting.mark_reconciling(
+                                cost_receipt_id,
+                                provider_outcome="acceptance_unknown",
+                                error_code=type(exc).__name__,
+                            )
+                        else:
+                            await self._cost_accounting.discard_unaccepted(
+                                cost_receipt_id
+                            )
+                    except Exception:
+                        return PlanningModelResult(
+                            error_code="planning_cost_reconciliation_required",
+                            error_message="Planning cost accounting requires reconciliation",
+                            retryable=False,
+                        )
+                    if provider_outcome_ambiguous:
+                        return PlanningModelResult(
+                            error_code="planning_cost_reconciliation_required",
+                            error_message="Planning provider outcome requires reconciliation",
+                            retryable=False,
+                        )
+                return PlanningModelResult(
+                    error_code="planning_model_call_failed",
+                    error_message="Planning model call failed",
+                    retryable=True,
+                )
+            if cost_receipt_id is not None:
+                try:
+                    await self._cost_accounting.finalize(
+                        cost_receipt_id,
+                        content=completion.content,
+                        tool_calls=completion.tool_calls,
+                        usage=completion.usage,
+                        finish_reason=completion.finish_reason,
+                    )
+                except Exception as exc:
+                    try:
+                        await self._cost_accounting.mark_reconciling(
+                            cost_receipt_id,
+                            provider_outcome="accepted",
+                            error_code=type(exc).__name__,
+                            content=completion.content,
+                            tool_calls=completion.tool_calls,
+                            usage=completion.usage,
+                            finish_reason=completion.finish_reason,
+                        )
+                    except Exception as reconciliation_exc:
+                        # The Provider response was accepted, so this path must
+                        # remain non-retryable. Preserve a secret-free signal for
+                        # operators even when both ledger writes fail; never log
+                        # response content or usage payloads here.
+                        logger.warning(
+                            "planning_cost_mark_reconciling_failed",
+                            extra={
+                                "cost_receipt_id": str(cost_receipt_id),
+                                "finalize_error_type": type(exc).__name__,
+                                "reconciliation_error_type": type(
+                                    reconciliation_exc
+                                ).__name__,
+                            },
+                        )
+                    return PlanningModelResult(
+                        error_code="planning_cost_reconciliation_required",
+                        error_message="Planning cost accounting requires reconciliation",
+                        retryable=False,
+                    )
         if completion.tool_calls:
             return PlanningModelResult(
                 error_code="invalid_plan",

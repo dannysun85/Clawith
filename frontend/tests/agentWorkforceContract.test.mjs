@@ -39,7 +39,8 @@ test('an open Agent settings page continuously revalidates manage authority', ()
   ) ?? [];
   assert.equal(activeSettingsRefetches.length, 2);
   assert.match(agentDetail, /isError: agentAccessError/);
-  assert.match(agentDetail, /retry: activeTab === 'settings' \? false : 3/);
+  assert.match(agentDetail, /error instanceof ApiError && \(error\.status === 403 \|\| error\.status === 404\)/);
+  assert.match(agentDetail, /return failureCount < 3/);
   assert.match(agentDetail, /queryKey: \['agent-permissions', id\]/);
   assert.match(agentDetail, /isError: permissionAccessError/);
   assert.match(agentDetail, /permissionAccessError=\{permissionAccessError\}/);
@@ -47,6 +48,8 @@ test('an open Agent settings page continuously revalidates manage authority', ()
     agentDetail,
     /const canManagePermissions = canManage\s+&& !permissionAccessError\s+&& \(permData\?\.can_manage \?\? canManage\)/,
   );
-  assert.match(agentDetail, /activeTab === 'settings' && agentAccessError/);
-  assert.match(agentDetail, /Agent 访问权限已失效，请返回数字员工中心/);
+  assert.match(agentDetail, /if \(agentAccessError\)/);
+  assert.match(agentDetail, /无法访问此 Agent/);
+  assert.match(agentDetail, /返回数字员工中心/);
+  assert.match(agentDetail, /void refetchAgent\(\)/);
 });

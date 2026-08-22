@@ -19,6 +19,9 @@ from app.services.task_executor import (
     enqueue_task_runtime,
     execute_task,
 )
+from app.services.product_information_architecture import (
+    product_information_architecture_snapshot,
+)
 
 
 class _Session:
@@ -113,6 +116,17 @@ async def test_work_retry_uses_a_new_idempotent_runtime_attempt_identity() -> No
     task.origin_type = "workbench"
     task.confirmation_fingerprint = "a" * 64
     task.confirmed_at = datetime(2026, 8, 19, tzinfo=UTC)
+    task.work_statement = {
+        "version": 2,
+        "work_type": "general",
+        "expected_output": "task_result",
+        "acceptance_contract": {
+            "version": 1,
+            "criteria": ["给出准确的客户上线方案"],
+            "owner_review_required": True,
+        },
+        "product_information_architecture": product_information_architecture_snapshot(),
+    }
     session = _Session()
     attempt_id = uuid.uuid4()
     handle = RunHandle(
@@ -133,12 +147,21 @@ async def test_work_retry_uses_a_new_idempotent_runtime_attempt_identity() -> No
             task=task,
             agent=agent,
             execution_id=attempt_id,
+            owner_change_request="补齐五家设计伙伴逐家的负责人和失败退出条件。",
             settings_override=_settings(enabled=True),
         )
 
     command = start_run.await_args.args[0]
     assert command.source_execution_id == f"task:{task.id}:attempt:{attempt_id}"
     assert command.idempotency_key == f"start:task:{task.id}:attempt:{attempt_id}"
+    assert "上一次业务验收要求修改" in command.goal
+    assert "五家设计伙伴逐家的负责人" in command.goal
+    assert command.payload["owner_change_request"] == (
+        "补齐五家设计伙伴逐家的负责人和失败退出条件。"
+    )
+    assert "Astra 产品入口目录（astra-product-ia-1.12.0-r1" in command.goal
+    assert "公司管理 → 企业知识与集成 → 组织同步" in command.goal
+    assert "报告中心" not in command.goal
 
 
 @pytest.mark.asyncio
@@ -290,6 +313,7 @@ async def test_confirmed_group_task_enters_native_group_runtime_with_stable_iden
             session,  # type: ignore[arg-type]
             task=task,
             primary_agent=agent,
+            owner_change_request="补充每位参与者的可验证结果。",
         )
 
     assert result == handle
@@ -304,6 +328,8 @@ async def test_confirmed_group_task_enters_native_group_runtime_with_stable_iden
     assert kwargs["correlation_id"] == f"work-task:{task.id}"
     assert kwargs["work_task_id"] == task.id
     assert kwargs["application_tools_enabled"] is True
+    assert "上一次业务验收要求修改" in kwargs["content"]
+    assert "补充每位参与者的可验证结果" in kwargs["content"]
 
 
 @pytest.mark.asyncio

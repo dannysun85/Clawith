@@ -2989,14 +2989,20 @@ async def test_retryable_read_exhaustion_returns_one_non_retryable_result(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_type", "expects_human_wait"),
+    [("chat", True), ("task", True), ("heartbeat", False), ("trigger", False)],
+)
 async def test_write_exception_is_unknown_and_preserves_the_unresolved_batch(
     monkeypatch,
+    source_type: str,
+    expects_human_wait: bool,
 ) -> None:
     tenant_id = uuid.uuid4()
     agent = _agent(tenant_id)
     first = _call("call-write", "write_file")
     second = _call("call-after", "read_file")
-    state = _state(tenant_id, agent, (first, second))
+    state = _state(tenant_id, agent, (first, second), source_type=source_type)
     execution = _execution(
         tenant_id,
         uuid.UUID(state["registry"].run_id),
@@ -3030,11 +3036,23 @@ async def test_write_exception_is_unknown_and_preserves_the_unresolved_batch(
     )
 
     assert result.messages == ()
-    assert result.error is None
-    assert result.waiting_request is not None
-    assert result.waiting_request["waiting_type"] == "user"
-    assert result.waiting_request["reason"] == "tool_outcome_unknown"
-    assert result.pending_tool_calls == (first, second)
+    if expects_human_wait:
+        assert result.error is None
+        assert result.waiting_request is not None
+        assert result.waiting_request["waiting_type"] == "user"
+        assert result.waiting_request["reason"] == "tool_outcome_unknown"
+        assert result.pending_tool_calls == (first, second)
+    else:
+        assert result.waiting_request is None
+        assert result.pending_tool_calls == ()
+        assert result.error == {
+            "code": "tool_outcome_reconciliation_required",
+            "message": (
+                "A tool outcome is unknown and this background source has no "
+                "human reconciliation surface. The run failed safely for "
+                "operator review."
+            ),
+        }
 
 
 @pytest.mark.asyncio

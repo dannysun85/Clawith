@@ -108,7 +108,7 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
                         </p>
                     </div>
                     {!account && (
-                        <button className="btn btn-primary" type="button" onClick={() => { window.location.href = '/enterprise#douyin'; }}>
+                        <button className="btn btn-primary" type="button" onClick={() => { window.location.href = '/company-admin/integrations/douyin'; }}>
                             <IconLink size={15} stroke={1.7} />
                             {isZh ? '连接抖音账号' : 'Connect account'}
                         </button>

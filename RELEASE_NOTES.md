@@ -15,6 +15,10 @@
   Agent Runs, Work tasks, deliverables, and media jobs. It keeps company-visible
   redacted execution, viewer-owned work, and governed analytics as three
   explicit scopes, and refreshes while the employee page is open.
+- Ordinary collaboration groups accept only billable, non-system Agent
+  employees. Governed CEO meeting groups retain a separate explicit internal
+  allowance for the system CEO, so a platform-seeded role cannot bypass the
+  commercial employee-seat boundary.
 
 ## Dormant CEO control plane
 
@@ -74,6 +78,21 @@
   than being rewritten as locally canceled. Unknown Provider outcomes retain
   their evidence and do not release or settle Credits speculatively.
 
+## Planning platform-cost governance
+
+- Design-partner Group Planning remains platform-funded: it never writes
+  customer Credit reservations or transactions. Each accepted Planning call
+  instead receives a tenant/group/run/model/credential-scoped platform-cost
+  receipt with replay-safe finalization and secret-free operator views.
+- Per-run and per-tenant daily call/cost caps fail closed under concurrent
+  PostgreSQL execution. Stale `provider_inflight` and `acceptance_unknown`
+  receipts enter an explicit reconciliation queue and can only be closed by a
+  platform operator with evidence, expected-state checks, and an idempotent
+  append-only resolution receipt.
+- These controls prove local accounting behavior only. They do not prove a real
+  Provider invoice, enable multi-Agent Planning in production, or make the
+  current dirty worktree an immutable release candidate.
+
 ## Creative deliverables
 
 - Poster, video, and presentation v1 remain the customer-facing production
@@ -88,11 +107,12 @@
 - Refreshes the frontend lockfile from `nanoid` 3.3.16 to 3.3.18, removing
   the transitive high-severity development dependency advisory without adding
   a new runtime dependency.
-- Includes one linear Alembic head, `manual_order_decisions`. The final two
-  revisions add durable paid-effect receipts/provider-close state and
-  evidence-backed manual-order operator decisions after
-  `backfill_deliv_audit_tenant`; both are included in the isolated PostgreSQL
-  fresh/history/downgrade/re-upgrade release gate.
+- Includes one linear Alembic head, `planning_cost_controls`. The final five
+  revisions add durable paid-effect receipts/provider-close state,
+  evidence-backed manual-order operator decisions, immutable owner review
+  receipts, Planning platform-cost receipts, and reconciliation/cap controls
+  after `backfill_deliv_audit_tenant`; all are included in the
+  isolated PostgreSQL fresh/history/downgrade/re-upgrade release gate.
 - Registration-code business-flow smoke now follows the governed platform
   registration-credential contract and its structured error responses.
 - Production releases can explicitly prepare dedicated Release QA principals

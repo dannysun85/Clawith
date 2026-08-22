@@ -1362,6 +1362,11 @@ def _upgrade_group_domain() -> None:
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_groups"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "id",
+            name="uq_groups_tenant_id_id",
+        ),
     )
     op.create_index(
         "ix_groups_tenant_id_deleted_at",

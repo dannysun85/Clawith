@@ -15,6 +15,7 @@ import { hasEffectiveCapability, productAccessSignature } from '../../../utils/p
 import {
     buildPaymentDomainRedirectUrl,
     needsPaymentDomainRedirect,
+    shouldRedirectToPaymentDomain,
 } from '../../../utils/paymentCheckout';
 
 interface Usage {
@@ -134,7 +135,11 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     /** Real-money checkout only runs on the public payment domain; carry the session across hosts. */
     const redirectToPaymentDomain = () => {
         const host = billingConfig?.payment_host;
-        if (!host || !needsPaymentDomainRedirect(host, window.location.hostname)) return false;
+        if (!host || !shouldRedirectToPaymentDomain(
+            billingConfig?.native_payment_enabled,
+            host,
+            window.location.hostname,
+        )) return false;
         window.location.assign(buildPaymentDomainRedirectUrl({
             paymentHost: host,
             currentHref: window.location.href,

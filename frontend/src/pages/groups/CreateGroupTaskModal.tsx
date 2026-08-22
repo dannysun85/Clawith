@@ -48,6 +48,9 @@ export default function CreateGroupTaskModal({
     );
     const [title, setTitle] = useState(() => defaultTitle(sourceMessage.content));
     const [intent, setIntent] = useState(sourceMessage.content);
+    const [acceptanceCriteria, setAcceptanceCriteria] = useState(
+        '汇总结果必须直接回应任务目标，明确每位 Agent 的贡献，并给出可执行的下一步。',
+    );
     const [primaryOwnerId, setPrimaryOwnerId] = useState('');
     const [collaboratorIds, setCollaboratorIds] = useState<string[]>([]);
     const [preflight, setPreflight] = useState<WorkTaskPreflight | null>(null);
@@ -78,11 +81,23 @@ export default function CreateGroupTaskModal({
         source_group_id: groupId,
         source_session_id: sessionId,
         source_message_id: sourceMessage.id,
-    }), [groupId, intent, selectedAgentParticipantIds, sessionId, sourceMessage.id, title]);
+        acceptance_contract: {
+            version: 1,
+            criteria: acceptanceCriteria
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean),
+            result_language: 'auto',
+            owner_review_required: true,
+        },
+    }), [acceptanceCriteria, groupId, intent, selectedAgentParticipantIds, sessionId, sourceMessage.id, title]);
     const draftKey = JSON.stringify(draft);
     const confirmedKey = useRef<string | null>(null);
     const currentPreflight = confirmedKey.current === draftKey ? preflight : null;
-    const canCheck = title.trim().length > 0 && intent.trim().length >= 3 && primaryOwnerId.length > 0;
+    const canCheck = title.trim().length > 0
+        && intent.trim().length >= 3
+        && acceptanceCriteria.trim().length > 0
+        && primaryOwnerId.length > 0;
 
     const choosePrimaryOwner = (participantId: string) => {
         setPrimaryOwnerId(participantId);
@@ -183,6 +198,18 @@ export default function CreateGroupTaskModal({
                     <input value={title} maxLength={500} onChange={(event) => setTitle(event.target.value)} />
                 </label>
                 <label className="group-task-field">
+                    <span>{t('groups.taskAcceptanceCriteria', '业务验收标准（每行一条）')}</span>
+                    <textarea
+                        value={acceptanceCriteria}
+                        maxLength={3600}
+                        onChange={(event) => setAcceptanceCriteria(event.target.value)}
+                    />
+                    <small>{t(
+                        'groups.taskAcceptanceHint',
+                        '全部 Agent 执行结束后仍不会自动算作业务完成，任务发起人必须按这些标准验收。',
+                    )}</small>
+                </label>
+                <label className="group-task-field">
                     <span>{t('groups.taskObjective', '任务目标与边界')}</span>
                     <textarea value={intent} maxLength={4000} onChange={(event) => setIntent(event.target.value)} />
                 </label>
@@ -259,6 +286,9 @@ export default function CreateGroupTaskModal({
                             <strong>{t('groups.taskStatementReady', '工作说明已生成，等待最终确认')}</strong>
                             <span>{currentPreflight.executor_proposal.agent_name} · {currentPreflight.capability_status}</span>
                             <small>{currentPreflight.cost_note}</small>
+                            {currentPreflight.work_statement.acceptance_contract.criteria.map((criterion) => (
+                                <small key={criterion}>✓ {criterion}</small>
+                            ))}
                             <small>
                                 {currentPreflight.approval_required
                                     ? t('groups.taskApprovalRequired', '启动前需要审批')

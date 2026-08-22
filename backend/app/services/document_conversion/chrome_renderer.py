@@ -271,7 +271,12 @@ async def collect_browser_layout(
   function itemFor(el, rootRect, kind, text, directOnly = false) {
     const cs = getComputedStyle(el);
     const r = el.getBoundingClientRect();
-    const itemId = `item-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+    // One DOM element can contribute both a painted shape and editable text.
+    // Reusing its identifier is essential: assigning a second id for the text
+    // entry makes the earlier shape-capture selector point at nothing, so the
+    // generated PPTX embeds a crop of the slide background instead of the card.
+    const itemId = el.getAttribute('data-clawith-item-id')
+      || `item-${Math.random().toString(36).slice(2)}-${Date.now()}`;
     el.setAttribute('data-clawith-item-id', itemId);
     return {
       itemId,
@@ -399,9 +404,20 @@ if (content) items.push(itemFor(el, rootRect, 'text', content));
 return;
       }
       if (children.length && !hasBlockChildren && !hasSeparatedInlineChildren) {
-const content = fullText(el);
-if (content) items.push(itemFor(el, rootRect, 'text', content));
-return;
+        // Painted containers such as cards need their own visual layer, while
+        // their inline descendants retain distinct typography in the editable
+        // layer. Collapsing the whole card into one text item loses heading and
+        // metadata styles and also used to overwrite the shape capture id.
+        if (hasPaint(cs)) {
+          if (text) {
+            items.push(fitTextItemToLines(itemFor(el, rootRect, 'text', text, true)));
+          }
+          children.forEach(walk);
+          return;
+        }
+        const content = fullText(el);
+        if (content) items.push(itemFor(el, rootRect, 'text', content));
+        return;
       }
       if (children.length && !hasBlockChildren && hasSeparatedInlineChildren) {
         if (text) {

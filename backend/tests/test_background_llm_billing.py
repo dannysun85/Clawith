@@ -250,6 +250,7 @@ async def test_heartbeat_aggregate_settlement_only_consumes_agent_quota():
 @pytest.mark.asyncio
 async def test_llm_round_reserves_conservative_max_output_cost_before_provider_call():
     reservation_id = uuid.uuid4()
+    run_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     agent_id = uuid.uuid4()
     model = SimpleNamespace(provider="minimax", model="MiniMax-M3")
@@ -272,12 +273,14 @@ async def test_llm_round_reserves_conservative_max_output_cost_before_provider_c
             messages=[llm_caller.LLMMessage(role="user", content="hello")],
             tools=None,
             max_tokens=8192,
+            ref_id=run_id,
         )
 
     assert result == reservation_id
     assert reserve.await_args.kwargs["amount"] >= 10
     assert reserve.await_args.kwargs["action"] == "chat"
     assert reserve.await_args.kwargs["ref_type"] == "llm_round"
+    assert reserve.await_args.kwargs["ref_id"] == run_id
     assert reserve.await_args.kwargs["initial_status"] == "provider_inflight"
 
 
@@ -1013,7 +1016,7 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
             single_step,
             "reserve_llm_round_credits",
             AsyncMock(return_value=uuid.uuid4()),
-        ),
+        ) as reserve_round,
         patch.object(
             single_step,
             "settle_llm_round_credits",
@@ -1026,12 +1029,14 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
             AsyncMock(),
         ) as settle_credits,
     ):
+        run_id = uuid.uuid4()
         completion = await single_step.complete_llm_once(
             model,
             [LLMMessage(role="user", content="run")],
             agent_id=agent_id,
             user_id=creator_id,
             invocation=invocation,
+            billing_ref_id=run_id,
         )
 
     assert completion.usage.total_tokens == 100
@@ -1042,6 +1047,7 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
     assert settle_credits.await_args.kwargs["user_id"] == creator_id
     assert settle_credits.await_args.kwargs["usage"].total_tokens == 100
     settle_round.assert_awaited_once()
+    assert reserve_round.await_args.kwargs["ref_id"] == run_id
     client.close.assert_awaited_once()
 
 

@@ -6,15 +6,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from app.api import admin as admin_api
 from app.api import saas as saas_api
+from app.core.security import get_current_user
+from app.database import get_db
 from app.schemas.saas import (
     InitializeFreeSubscriptionsIn,
     LLMCreditHoldResolutionIn,
+    LLMSystemCostReceiptOut,
     MediaRouteUpdateIn,
 )
+from app.models.agent_run import LLMSystemCostReceipt
 
 
 class DummyResult:
@@ -35,6 +40,14 @@ class DummyResult:
 
     def all(self):
         return list(self._values)
+
+
+class OneRowResult:
+    def __init__(self, row):
+        self._row = row
+
+    def one(self):
+        return self._row
 
 
 class RecordingDB:
@@ -150,6 +163,185 @@ async def test_saas_admin_rejects_owner_email_without_platform_identity_grant():
         await saas_api.get_saas_admin(user)
 
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_saas_system_cost_list_is_bounded_and_tenant_filterable():
+    tenant_id = uuid.uuid4()
+    group_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    receipt = SimpleNamespace(id=uuid.uuid4())
+    db = RecordingDB([DummyResult(values=[receipt])])
+
+    result = await saas_api.list_llm_system_costs(
+        tenant_id=tenant_id,
+        group_id=group_id,
+        run_id=run_id,
+        status_filter="reconciling",
+        page=-10,
+        limit=10_000,
+        current_user=_admin_user(),
+        db=db,
+    )
+
+    assert result == [receipt]
+    sql = str(db.statements[0])
+    assert "llm_system_cost_receipts.tenant_id" in sql
+    assert "llm_system_cost_receipts.group_id" in sql
+    assert "llm_system_cost_receipts.run_id" in sql
+    assert "llm_system_cost_receipts.status" in sql
+    assert "LIMIT" in sql and "OFFSET" in sql
+
+
+@pytest.mark.asyncio
+async def test_saas_system_cost_summary_separates_operational_states():
+    db = RecordingDB(
+        [
+            OneRowResult(
+                (
+                    7,
+                    3,
+                    2,
+                    2,
+                    0,
+                    0,
+                    1,
+                    1_200,
+                    300,
+                    9,
+                    14,
+                )
+            )
+        ]
+    )
+
+    result = await saas_api.summarize_llm_system_costs(
+        tenant_id=uuid.uuid4(),
+        group_id=None,
+        run_id=None,
+        current_user=_admin_user(),
+        db=db,
+    )
+
+    assert result.model_dump() == {
+        "receipt_count": 7,
+        "finalized_count": 3,
+        "reconciling_count": 2,
+        "provider_inflight_count": 2,
+        "reconciled_count": 0,
+        "voided_count": 0,
+        "unpriced_count": 1,
+        "total_tokens": 1_200,
+        "estimated_tokens": 300,
+        "system_cost_credits": 9,
+        "active_budget_credits": 14,
+    }
+
+
+def test_saas_system_cost_output_never_exposes_prompt_or_response_snapshots():
+    now = datetime.now(timezone.utc)
+    receipt = LLMSystemCostReceipt(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        group_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        call_index=1,
+        operation="group_planning",
+        model_id=uuid.uuid4(),
+        credential_id=uuid.uuid4(),
+        provider="minimax",
+        model="MiniMax-M3",
+        provider_service_tier="standard",
+        request_fingerprint="a" * 64,
+        status="finalized",
+        provider_outcome="accepted",
+        usage_source="provider_reported",
+        input_tokens=100,
+        output_tokens=20,
+        total_tokens=120,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+        estimated_tokens=0,
+        budget_reservation_credits=4,
+        request_input_token_upper_bound=500,
+        request_max_output_tokens=2_048,
+        system_cost_credits=1,
+        cost_status="priced",
+        response_snapshot={"content": "tenant confidential plan"},
+        response_fingerprint="b" * 64,
+        created_at=now,
+        updated_at=now,
+        finalized_at=now,
+    )
+
+    payload = LLMSystemCostReceiptOut.model_validate(receipt).model_dump()
+
+    assert "request_fingerprint" not in payload
+    assert "response_snapshot" not in payload
+    assert "response_fingerprint" not in payload
+    assert "tenant confidential plan" not in str(payload)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "json_body"),
+    [
+        ("get", "/api/saas/llm-system-costs", None),
+        ("get", "/api/saas/llm-system-costs/summary", None),
+        ("get", "/api/saas/llm-system-cost-resolutions", None),
+        (
+            "post",
+            "/api/saas/llm-system-costs/stale-scan",
+            {
+                "apply": False,
+                "limit": 10,
+                "evidence_ref": "ops-preview:permission-test",
+                "reason": "Verify that company members cannot inspect platform cost",
+            },
+        ),
+        (
+            "post",
+            f"/api/saas/llm-system-costs/{uuid.uuid4()}/resolutions",
+            {
+                "expected_tenant_id": str(uuid.uuid4()),
+                "expected_status": "reconciling",
+                "expected_provider_outcome": "acceptance_unknown",
+                "disposition": "confirm_not_accepted",
+                "evidence_ref": "provider-query:permission-test",
+                "reason": "Verify that company members cannot resolve platform cost",
+            },
+        ),
+    ],
+)
+def test_company_roles_cannot_access_planning_system_costs_before_database(
+    method,
+    path,
+    json_body,
+):
+    calls = 0
+    user = _admin_user(
+        role="org_owner",
+        identity_is_platform_admin=False,
+    )
+
+    async def forbidden_db():
+        nonlocal calls
+        calls += 1
+        raise AssertionError("platform cost database dependency must not run")
+
+    app = FastAPI()
+    app.include_router(saas_api.router, prefix="/api")
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_db] = forbidden_db
+    with TestClient(app) as client:
+        response = getattr(client, method)(
+            path,
+            **({"json": json_body} if json_body is not None else {}),
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "platform_operator_required"
+    assert calls == 0
 
 
 @pytest.mark.asyncio

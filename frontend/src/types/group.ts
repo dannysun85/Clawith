@@ -90,6 +90,13 @@ export interface GroupMessageIntake {
     error?: GroupError | null;
 }
 
+export interface GroupPlanningReadiness {
+    available: boolean;
+    code: 'ready' | 'planning_model_unavailable';
+    message: string;
+    remediation: 'contact_platform_operator_or_mention_one_agent' | null;
+}
+
 export interface GroupRunState {
     run_id: string;
     status: string;

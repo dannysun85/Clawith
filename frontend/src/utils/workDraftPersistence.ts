@@ -31,6 +31,13 @@ export interface PersistedWorkDraft {
     groupId: string;
     groupSessionId: string;
     groupAgentParticipantIds: string[];
+    acceptanceCriteria: string;
+    requiredSections: string;
+    forbiddenTerms: string;
+    minimumLength: string;
+    maximumLength: string;
+    lengthUnit: 'characters' | 'cjk_characters' | 'words';
+    evidenceRequired: boolean;
     clientRequestId: string;
 }
 
@@ -69,7 +76,30 @@ export function loadWorkDraft(
         ) {
             return null;
         }
-        return value as PersistedWorkDraft;
+        return {
+            ...(value as PersistedWorkDraft),
+            acceptanceCriteria: typeof value.acceptanceCriteria === 'string'
+                ? value.acceptanceCriteria
+                : '',
+            requiredSections: typeof value.requiredSections === 'string'
+                ? value.requiredSections
+                : '',
+            forbiddenTerms: typeof value.forbiddenTerms === 'string'
+                ? value.forbiddenTerms
+                : '',
+            minimumLength: typeof value.minimumLength === 'string'
+                ? value.minimumLength
+                : '',
+            maximumLength: typeof value.maximumLength === 'string'
+                ? value.maximumLength
+                : '',
+            lengthUnit: ['characters', 'cjk_characters', 'words'].includes(
+                String(value.lengthUnit),
+            )
+                ? value.lengthUnit as PersistedWorkDraft['lengthUnit']
+                : 'characters',
+            evidenceRequired: value.evidenceRequired === true,
+        };
     } catch {
         return null;
     }

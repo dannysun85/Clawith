@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import uuid
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password_async
 from app.database import async_session, engine
@@ -32,6 +36,8 @@ from app.models.tenant_deletion import (
 )
 from app.models.user import Identity, User
 from app.services.mfa_service import generate_totp_secret, seal_mfa_secret
+from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
+from app.services.tenant_purge import TenantRowPlanner
 
 
 ROLES = (
@@ -42,6 +48,41 @@ ROLES = (
     "second_owner",
     "platform",
 )
+_RUN_TAG_PATTERN = re.compile(r"^[0-9a-f]{12}$")
+_TENANT_SLUG_PREFIXES = {
+    "primary": "browser-primary",
+    "secondary": "browser-secondary",
+    "purge": "g11-purge-browser",
+}
+_USER_DISPLAY_NAMES = {
+    "owner": "Browser Owner",
+    "admin": "Browser Admin",
+    "member": "Browser Member",
+    "agent_manager": "Browser Agent Manager",
+    "second_owner": "Browser Second Owner",
+    "platform": "Browser Platform Operator",
+}
+_USER_ROLES = {
+    "owner": "org_owner",
+    "admin": "org_admin",
+    "member": "member",
+    "agent_manager": "agent_admin",
+    "second_owner": "org_owner",
+    "platform": "platform_admin",
+}
+_AGENT_KEYS = frozenset(
+    {"current_assistant", "retained_assistant", "managed_employee"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupScope:
+    run_tag: str
+    identity_emails: dict[uuid.UUID, str]
+    users: dict[uuid.UUID, tuple[uuid.UUID, uuid.UUID | None, str, str]]
+    tenant_slugs: dict[uuid.UUID, str]
+    agent_ids: tuple[uuid.UUID, ...]
+    fixture_template_id: uuid.UUID | None
 
 
 def _write_state(path: Path, payload: dict[str, object]) -> None:
@@ -64,6 +105,194 @@ def _read_state(path: Path) -> dict[str, object]:
     if payload.get("schema_version") != 1:
         raise RuntimeError("unsupported_state_file")
     return payload
+
+
+def _fixture_uuid(value: object, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid_fixture_state:{field}") from exc
+
+
+def _cleanup_scope(payload: Mapping[str, object]) -> _CleanupScope:
+    """Parse the cleanup receipt and bind every destructive ID to fixture names."""
+
+    run_tag = payload.get("run_tag")
+    if not isinstance(run_tag, str) or _RUN_TAG_PATTERN.fullmatch(run_tag) is None:
+        raise RuntimeError("invalid_fixture_state:run_tag")
+
+    identities = payload.get("identities")
+    if not isinstance(identities, Mapping) or set(identities) != set(ROLES):
+        raise RuntimeError("invalid_fixture_state:identities")
+    identity_emails: dict[uuid.UUID, str] = {}
+    user_ids_by_role: dict[str, uuid.UUID] = {}
+    identity_ids_by_role: dict[str, uuid.UUID] = {}
+    for role in ROLES:
+        details = identities[role]
+        if not isinstance(details, Mapping):
+            raise RuntimeError(f"invalid_fixture_state:identity:{role}")
+        expected_email = f"browser-{role}-{run_tag}@local.clawith.test"
+        if details.get("email") != expected_email:
+            raise RuntimeError(f"fixture_ownership_mismatch:identity:{role}")
+        identity_id = _fixture_uuid(details.get("id"), f"identity:{role}:id")
+        user_id = _fixture_uuid(details.get("user_id"), f"identity:{role}:user_id")
+        identity_emails[identity_id] = expected_email
+        identity_ids_by_role[role] = identity_id
+        user_ids_by_role[role] = user_id
+    if len(identity_emails) != len(ROLES) or len(set(user_ids_by_role.values())) != len(
+        ROLES
+    ):
+        raise RuntimeError("invalid_fixture_state:duplicate_identity_or_user")
+
+    tenants = payload.get("tenants")
+    if not isinstance(tenants, Mapping) or set(tenants) != set(
+        _TENANT_SLUG_PREFIXES
+    ):
+        raise RuntimeError("invalid_fixture_state:tenants")
+    tenant_ids_by_name = {
+        name: _fixture_uuid(tenants[name], f"tenant:{name}")
+        for name in _TENANT_SLUG_PREFIXES
+    }
+    if len(set(tenant_ids_by_name.values())) != len(_TENANT_SLUG_PREFIXES):
+        raise RuntimeError("invalid_fixture_state:duplicate_tenant")
+    tenant_slugs = {
+        tenant_ids_by_name[name]: f"{prefix}-{run_tag}"
+        for name, prefix in _TENANT_SLUG_PREFIXES.items()
+    }
+
+    tenant_for_role = {
+        "owner": tenant_ids_by_name["primary"],
+        "admin": tenant_ids_by_name["primary"],
+        "member": tenant_ids_by_name["primary"],
+        "agent_manager": tenant_ids_by_name["primary"],
+        "second_owner": tenant_ids_by_name["secondary"],
+        "platform": None,
+    }
+    users = {
+        user_ids_by_role[role]: (
+            identity_ids_by_role[role],
+            tenant_for_role[role],
+            _USER_DISPLAY_NAMES[role],
+            _USER_ROLES[role],
+        )
+        for role in ROLES
+    }
+    additional_memberships = payload.get("additional_memberships")
+    if not isinstance(additional_memberships, Mapping) or set(
+        additional_memberships
+    ) != {"owner_secondary"}:
+        raise RuntimeError("invalid_fixture_state:additional_memberships")
+    owner_secondary_id = _fixture_uuid(
+        additional_memberships["owner_secondary"],
+        "additional_memberships:owner_secondary",
+    )
+    if owner_secondary_id in users:
+        raise RuntimeError("invalid_fixture_state:duplicate_user")
+    users[owner_secondary_id] = (
+        identity_ids_by_role["owner"],
+        tenant_ids_by_name["secondary"],
+        "Browser Owner (Secondary Member)",
+        "member",
+    )
+
+    agents = payload.get("agents")
+    if not isinstance(agents, Mapping) or set(agents) != _AGENT_KEYS:
+        raise RuntimeError("invalid_fixture_state:agents")
+    agent_ids = tuple(
+        _fixture_uuid(agents[name], f"agent:{name}") for name in sorted(_AGENT_KEYS)
+    )
+    if len(set(agent_ids)) != len(_AGENT_KEYS):
+        raise RuntimeError("invalid_fixture_state:duplicate_agent")
+
+    global_rows = payload.get("fixture_global_rows")
+    if not isinstance(global_rows, Mapping) or set(global_rows) != {
+        "assistant_template"
+    }:
+        raise RuntimeError("invalid_fixture_state:fixture_global_rows")
+    fixture_template_value = global_rows.get("assistant_template")
+    fixture_template_id = (
+        _fixture_uuid(fixture_template_value, "assistant_template")
+        if fixture_template_value is not None
+        else None
+    )
+    return _CleanupScope(
+        run_tag=run_tag,
+        identity_emails=identity_emails,
+        users=users,
+        tenant_slugs=tenant_slugs,
+        agent_ids=agent_ids,
+        fixture_template_id=fixture_template_id,
+    )
+
+
+def _assert_fixture_rows_owned(
+    kind: str,
+    *,
+    expected: Mapping[uuid.UUID, object],
+    actual: Mapping[uuid.UUID, object],
+) -> None:
+    # Missing rows are safe and support an idempotent retry after external test
+    # activity. Any present row must still carry the exact fixture provenance.
+    if any(expected.get(row_id) != value for row_id, value in actual.items()):
+        raise RuntimeError(f"fixture_ownership_mismatch:{kind}")
+
+
+async def _validate_cleanup_ownership(
+    db: AsyncSession,
+    scope: _CleanupScope,
+) -> None:
+    identity_result = await db.execute(
+        select(Identity.id, Identity.email).where(
+            Identity.id.in_(scope.identity_emails)
+        )
+    )
+    _assert_fixture_rows_owned(
+        "identities",
+        expected=scope.identity_emails,
+        actual={row.id: row.email for row in identity_result.all()},
+    )
+
+    user_result = await db.execute(
+        select(
+            User.id,
+            User.identity_id,
+            User.tenant_id,
+            User.display_name,
+            User.role,
+        ).where(User.id.in_(scope.users))
+    )
+    _assert_fixture_rows_owned(
+        "users",
+        expected=scope.users,
+        actual={
+            row.id: (row.identity_id, row.tenant_id, row.display_name, row.role)
+            for row in user_result.all()
+        },
+    )
+
+    tenant_result = await db.execute(
+        select(Tenant.id, Tenant.slug).where(Tenant.id.in_(scope.tenant_slugs))
+    )
+    _assert_fixture_rows_owned(
+        "tenants",
+        expected=scope.tenant_slugs,
+        actual={row.id: row.slug for row in tenant_result.all()},
+    )
+
+    if scope.fixture_template_id is not None:
+        template_result = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.id == scope.fixture_template_id
+            )
+        )
+        template = template_result.scalar_one_or_none()
+        if template is not None and (
+            template.name != f"Browser Private Assistant {scope.run_tag}"
+            or not isinstance(template.source_provenance, Mapping)
+            or template.source_provenance.get("source")
+            != "browser_acceptance_fixture"
+        ):
+            raise RuntimeError("fixture_ownership_mismatch:assistant_template")
 
 
 async def _seed(path: Path) -> dict[str, object]:
@@ -121,6 +350,14 @@ async def _seed(path: Path) -> dict[str, object]:
         )
         db.add_all([primary, secondary, purge])
         await db.flush()
+
+        # Keep browser acceptance tenants on the same commercial initialization
+        # path as self-service and operator-created companies.  Without a real
+        # subscription + credit grant the Work preflight quite correctly sees
+        # no entitled model route, so an identity-only fixture cannot prove the
+        # business workflow it is meant to exercise.
+        await ensure_free_subscription_for_tenant(db, primary.id)
+        await ensure_free_subscription_for_tenant(db, secondary.id)
 
         users = {
             "owner": User(
@@ -188,7 +425,40 @@ async def _seed(path: Path) -> dict[str, object]:
                 AgentTemplate.is_builtin.is_(True),
             )
         )
-        assistant_template = assistant_template_result.scalar_one()
+        assistant_template = assistant_template_result.scalar_one_or_none()
+        fixture_template_id: uuid.UUID | None = None
+        if assistant_template is None:
+            # A production-like database is expected to have the built-in
+            # private-assistant template, while migration smoke starts from an
+            # intentionally empty schema. Create one bounded global dependency
+            # for that case and record it in the cleanup receipt; never mutate
+            # or delete an existing product template.
+            assistant_template = AgentTemplate(
+                name=f"Browser Private Assistant {run_tag}",
+                description="Private assistant browser acceptance dependency",
+                icon="assistant",
+                category="assistant",
+                soul_template="Browser acceptance fixture only.",
+                default_skills=[],
+                default_tools=[],
+                default_mcp_servers=[],
+                default_autonomy_policy={},
+                capability_bullets=[],
+                role_key="private-assistant",
+                role_revision=1,
+                responsibilities=[],
+                non_responsibilities=[],
+                limitations=[],
+                workflows=[],
+                deliverables=[],
+                evaluation_criteria=[],
+                source_provenance={"source": "browser_acceptance_fixture"},
+                lifecycle_status="enabled",
+                is_builtin=True,
+            )
+            db.add(assistant_template)
+            await db.flush()
+            fixture_template_id = assistant_template.id
         agents = {
             "current_assistant": Agent(
                 name="Browser Current Assistant",
@@ -270,6 +540,11 @@ async def _seed(path: Path) -> dict[str, object]:
             "additional_memberships": {
                 "owner_secondary": str(owner_secondary_membership.id),
             },
+            "fixture_global_rows": {
+                "assistant_template": (
+                    str(fixture_template_id) if fixture_template_id is not None else None
+                ),
+            },
         }
         # Persist the cleanup receipt before committing the fixture. If the
         # commit outcome is uncertain, the known IDs remain available to the
@@ -286,19 +561,20 @@ async def _seed(path: Path) -> dict[str, object]:
 
 async def _cleanup(path: Path) -> dict[str, object]:
     payload = _read_state(path)
-    identities = payload["identities"]
-    tenants = payload["tenants"]
-    agents = payload.get("agents", {})
-    identity_ids = [uuid.UUID(value["id"]) for value in identities.values()]
-    user_ids = [uuid.UUID(value["user_id"]) for value in identities.values()]
-    user_ids.extend(
-        uuid.UUID(value)
-        for value in payload.get("additional_memberships", {}).values()
-    )
-    tenant_ids = [uuid.UUID(value) for value in tenants.values()]
-    agent_ids = [uuid.UUID(value) for value in agents.values()]
+    scope = _cleanup_scope(payload)
+    identity_ids = list(scope.identity_emails)
+    user_ids = list(scope.users)
+    tenant_ids = list(scope.tenant_slugs)
 
     async with async_session() as db:
+        # Fail closed before the first DELETE. A valid mode-0600 state file is
+        # necessary but not sufficient: each present target row must still carry
+        # the exact fixture email/slug/profile/provenance written by ``seed``.
+        await _validate_cleanup_ownership(db, scope)
+
+        # Identity-scoped rows are intentionally outside the tenant purge graph.
+        # Remove only rows owned by this bounded fixture before deleting the
+        # fixture identities after all tenant rows are gone.
         await db.execute(
             delete(AuditLog).where(
                 or_(AuditLog.user_id.in_(user_ids), AuditLog.tenant_id.in_(tenant_ids))
@@ -325,26 +601,29 @@ async def _cleanup(path: Path) -> dict[str, object]:
                 TenantDeletionTombstone.tenant_id.in_(tenant_ids)
             )
         )
-        await db.execute(
-            update(Tenant)
-            .where(Tenant.id.in_(tenant_ids))
-            .values(owner_user_id=None, initialized_by_user_id=None, deletion_requested_by_user_id=None)
-        )
-        await db.execute(
-            delete(UserTenantOnboarding).where(
-                or_(
-                    UserTenantOnboarding.user_id.in_(user_ids),
-                    UserTenantOnboarding.tenant_id.in_(tenant_ids),
+
+        # Browser acceptance can create far more than the seed rows (Groups,
+        # sessions, tasks, subscriptions, Credits ledgers, and future
+        # tenant-owned tables). Reuse the production tenant ownership planner
+        # instead of maintaining a second, inevitably incomplete delete list.
+        # The surrounding transaction makes cleanup all-or-nothing; the state
+        # file remains available for an idempotent retry after any failure.
+        for tenant_id in tenant_ids:
+            planner = TenantRowPlanner(db, tenant_id)
+            await planner.build()
+            await planner.delete_planned_rows()
+
+        if scope.fixture_template_id is not None:
+            await db.execute(
+                delete(AgentTemplate).where(
+                    AgentTemplate.id == scope.fixture_template_id
                 )
             )
-        )
-        if agent_ids:
-            await db.execute(
-                delete(AgentPermission).where(AgentPermission.agent_id.in_(agent_ids))
-            )
-            await db.execute(delete(Agent).where(Agent.id.in_(agent_ids)))
+
+        # The platform fixture user is deliberately tenantless and therefore
+        # not part of any tenant plan. Tenant-scoped fixture users have already
+        # been deleted, so this statement normally removes only that user.
         await db.execute(delete(User).where(User.id.in_(user_ids)))
-        await db.execute(delete(Tenant).where(Tenant.id.in_(tenant_ids)))
         await db.execute(delete(Identity).where(Identity.id.in_(identity_ids)))
         await db.commit()
 
@@ -353,7 +632,7 @@ async def _cleanup(path: Path) -> dict[str, object]:
         "status": "cleaned",
         "identities": len(identity_ids),
         "tenants": len(tenant_ids),
-        "agents": len(agent_ids),
+        "agents": len(scope.agent_ids),
     }
 
 

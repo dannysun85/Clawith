@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 
 TERMINAL_RUN_EVENTS = {
     "run_completed": "completed",
@@ -35,6 +37,7 @@ def project_user_stage(
     deliverable_status: str | None,
     artifact_status: str | None,
     review_status: str | None,
+    task_result_review_status: str = "not_required",
 ) -> str:
     """Return a stage, never promoting Task.done to formal Delivery."""
     if deliverable_status == "failed" or execution_status == "failed":
@@ -53,9 +56,43 @@ def project_user_stage(
         return "execution"
     if execution_status in {"queued", "running"}:
         return "execution"
+    if task_result_review_status == "request_changes":
+        return "blocked"
+    if task_result_review_status == "pending":
+        return "review"
     if task_status == "done" or execution_status == "completed":
         return "completed"
     return "task"
 
 
-__all__ = ["TERMINAL_RUN_EVENTS", "project_execution_status", "project_user_stage"]
+def work_requires_owner_review(work_statement: object) -> bool:
+    if not isinstance(work_statement, Mapping):
+        return False
+    contract = work_statement.get("acceptance_contract")
+    return (
+        isinstance(contract, Mapping)
+        and contract.get("version") == 1
+        and contract.get("owner_review_required") is True
+    )
+
+
+def project_task_result_review_status(
+    *,
+    task_status: str | None,
+    work_statement: object,
+    receipt_action: str | None,
+) -> str:
+    if not work_requires_owner_review(work_statement) or task_status != "done":
+        return "not_required"
+    if receipt_action in {"approve", "request_changes"}:
+        return "approved" if receipt_action == "approve" else "request_changes"
+    return "pending"
+
+
+__all__ = [
+    "TERMINAL_RUN_EVENTS",
+    "project_execution_status",
+    "project_task_result_review_status",
+    "project_user_stage",
+    "work_requires_owner_review",
+]

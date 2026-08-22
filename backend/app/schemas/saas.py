@@ -228,6 +228,168 @@ class BillingRuleOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class LLMSystemCostReceiptOut(BaseModel):
+    """Secret-free platform-cost receipt for one system-owned LLM call."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    group_id: uuid.UUID
+    session_id: uuid.UUID
+    run_id: uuid.UUID
+    call_index: int
+    operation: str
+    model_id: uuid.UUID
+    credential_id: uuid.UUID | None = None
+    provider: str
+    model: str
+    provider_service_tier: str
+    status: str
+    provider_outcome: str
+    usage_source: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    estimated_tokens: int
+    budget_reservation_credits: int
+    request_input_token_upper_bound: int
+    request_max_output_tokens: int
+    system_cost_credits: int | None = None
+    cost_status: str
+    reconciliation_error_code: str | None = None
+    provider_accepted_at: datetime | None = None
+    finalized_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LLMSystemCostSummaryOut(BaseModel):
+    """Bounded aggregate for platform operations and margin reconciliation."""
+
+    receipt_count: int
+    finalized_count: int
+    reconciling_count: int
+    provider_inflight_count: int
+    reconciled_count: int
+    voided_count: int
+    unpriced_count: int
+    total_tokens: int
+    estimated_tokens: int
+    system_cost_credits: int
+    active_budget_credits: int
+
+
+class LLMSystemCostResolutionOut(BaseModel):
+    """Append-only, secret-free receipt for a Planning cost transition."""
+
+    id: uuid.UUID
+    receipt_id: uuid.UUID
+    tenant_id: uuid.UUID
+    actor_user_id: uuid.UUID | None = None
+    action: str
+    source: str
+    evidence_ref: str
+    reason: str
+    previous_status: str
+    resulting_status: str
+    previous_provider_outcome: str
+    resulting_provider_outcome: str
+    reported_system_cost_credits: int | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PlanningCostResolutionIn(BaseModel):
+    """Evidence-backed terminal disposition for one ambiguous receipt."""
+
+    expected_tenant_id: uuid.UUID
+    expected_status: Literal["reconciling"]
+    expected_provider_outcome: Literal["acceptance_unknown"]
+    disposition: Literal["confirm_not_accepted", "settle_accepted"]
+    evidence_ref: str = Field(min_length=8, max_length=500)
+    reason: str = Field(min_length=8, max_length=500)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    cache_read_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_tokens: int | None = Field(default=None, ge=0)
+    system_cost_credits: int | None = Field(default=None, ge=0)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("evidence_ref", "reason")
+    @classmethod
+    def normalize_evidence_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 8:
+            raise ValueError("value must contain at least 8 non-whitespace characters")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_resolution_shape(self):
+        usage_values = (
+            self.input_tokens,
+            self.output_tokens,
+            self.total_tokens,
+            self.cache_read_tokens,
+            self.cache_creation_tokens,
+            self.system_cost_credits,
+        )
+        if self.disposition == "confirm_not_accepted":
+            if any(value is not None for value in usage_values):
+                raise ValueError(
+                    "confirm_not_accepted must not include usage or system cost"
+                )
+            return self
+        if any(value is None for value in usage_values):
+            raise ValueError(
+                "settle_accepted requires complete usage and system cost"
+            )
+        assert self.total_tokens is not None
+        assert self.input_tokens is not None
+        assert self.output_tokens is not None
+        if self.total_tokens <= 0 or self.total_tokens < self.input_tokens + self.output_tokens:
+            raise ValueError(
+                "total_tokens must be positive and cover input_tokens plus output_tokens"
+            )
+        return self
+
+
+class PlanningCostResolutionResultOut(BaseModel):
+    receipt: LLMSystemCostReceiptOut
+    resolution: LLMSystemCostResolutionOut
+    replayed: bool
+
+
+class PlanningCostStaleScanIn(BaseModel):
+    """Preview/apply the server-configured stale inflight transition."""
+
+    apply: bool = False
+    limit: int = Field(default=100, ge=1, le=500)
+    evidence_ref: str = Field(min_length=8, max_length=500)
+    reason: str = Field(min_length=8, max_length=500)
+
+    model_config = ConfigDict(extra="forbid")
+
+    _normalize_evidence_ref = field_validator("evidence_ref")(
+        PlanningCostResolutionIn.normalize_evidence_text.__func__
+    )
+    _normalize_reason = field_validator("reason")(
+        PlanningCostResolutionIn.normalize_evidence_text.__func__
+    )
+
+
+class PlanningCostStaleScanOut(BaseModel):
+    cutoff: datetime
+    candidate_receipt_ids: list[uuid.UUID]
+    candidate_count: int
+    applied_count: int
+
+
 class BillingRuleCreateIn(BaseModel):
     """Create a billing rule."""
 

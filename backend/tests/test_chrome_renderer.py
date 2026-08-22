@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from app.services.document_conversion.chrome_renderer import (
     build_hybrid_text_capture_css,
@@ -76,6 +77,67 @@ async def test_browser_layout_splits_painted_inline_labels(tmp_path: Path) -> No
             and item["text"] == "深圳前海瑞孚图腾科技有限公司"
         )
         assert company["x"] > 110
+    finally:
+        for key in (
+            "screenshots",
+            "backgroundScreenshots",
+            "contentScreenshots",
+        ):
+            for value in layout.get(key) or []:
+                if value:
+                    Path(value).unlink(missing_ok=True)
+        for value in (layout.get("shapeScreenshots") or {}).values():
+            Path(value).unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(chrome_executable() is None, reason="Chrome is not installed")
+async def test_hybrid_card_capture_keeps_painted_layer_and_inline_typography(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "painted-card.html"
+    source.write_text(
+        """
+        <!doctype html>
+        <html><body style="margin:0">
+          <section class="slide" style="position:relative;width:1280px;height:720px;background:#081225">
+            <div class="card" style="position:absolute;left:120px;top:160px;width:600px;height:220px;padding:32px;background:#ffffff;border:4px solid #22d3ee;border-radius:18px;box-shadow:0 12px 30px #00000055">
+              <b style="display:block;font-size:34px;color:#101828">正式业务结论</b>
+              <span style="display:block;font-size:20px;color:#475467">不可变证据回链</span>
+            </div>
+          </section>
+        </body></html>
+        """,
+        encoding="utf-8",
+    )
+
+    layout = await collect_browser_layout(
+        source,
+        design_w_px=1280,
+        design_h_px=720,
+        render_mode="hybrid_editable",
+        render_scale=1,
+    )
+    assert layout is not None
+    try:
+        items = layout["slides"][0]["items"]
+        card = next(
+            item
+            for item in items
+            if item["kind"] == "shape" and item["tag"] == "div"
+        )
+        texts = [item for item in items if item["kind"] == "text"]
+        assert [item["text"] for item in texts] == [
+            "正式业务结论",
+            "不可变证据回链",
+        ]
+        assert [item["tag"] for item in texts] == ["b", "span"]
+
+        capture_path = Path(layout["shapeScreenshots"][card["itemId"]])
+        capture = Image.open(capture_path).convert("RGB")
+        center = capture.getpixel((capture.width // 2, capture.height // 2))
+        assert min(center) >= 240
+        assert len(capture.getcolors(maxcolors=capture.width * capture.height) or []) > 2
     finally:
         for key in (
             "screenshots",

@@ -11,12 +11,14 @@ from io import StringIO
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_saas_admin
 from app.database import get_db
 from app.models.audit import AuditLog
+from app.config import get_settings
+from app.models.agent_run import LLMSystemCostReceipt, LLMSystemCostResolution
 from app.models.llm import LLMModel
 from app.models.subscription import (
     BillingRule,
@@ -43,6 +45,9 @@ from app.schemas.saas import (
     InitializeFreeSubscriptionsIn,
     InitializeFreeSubscriptionsOut,
     LLMCreditHoldResolutionIn,
+    LLMSystemCostReceiptOut,
+    LLMSystemCostResolutionOut,
+    LLMSystemCostSummaryOut,
     MediaRouteOut,
     MediaRouteUpdateIn,
     MediaFailureRemediationIn,
@@ -52,6 +57,10 @@ from app.schemas.saas import (
     ModelRouteOut,
     ModelRouteUpdateIn,
     SaasTenantOut,
+    PlanningCostResolutionIn,
+    PlanningCostResolutionResultOut,
+    PlanningCostStaleScanIn,
+    PlanningCostStaleScanOut,
 )
 from app.schemas.subscription import (
     CreditPackOut,
@@ -78,6 +87,11 @@ from app.services.llm_credit_reconciliation import resolve_llm_credit_holds
 from app.services.manual_order_governance import (
     ManualOrderGovernanceError,
     apply_manual_order_decision_in_session,
+)
+from app.services.planning_cost_reconciliation import (
+    PlanningCostResolutionError,
+    apply_planning_cost_resolution_in_session,
+    scan_stale_planning_costs_in_session,
 )
 from app.services.entitlements import get_active_subscription, get_tenant_entitlements
 from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
@@ -1416,6 +1430,242 @@ def _credit_transactions_query(
     if action:
         stmt = stmt.where(CreditTransaction.action == action)
     return stmt
+
+
+def _llm_system_cost_query(
+    *,
+    tenant_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    run_id: uuid.UUID | None = None,
+    status_filter: str | None = None,
+):
+    stmt = select(LLMSystemCostReceipt)
+    if tenant_id is not None:
+        stmt = stmt.where(LLMSystemCostReceipt.tenant_id == tenant_id)
+    if group_id is not None:
+        stmt = stmt.where(LLMSystemCostReceipt.group_id == group_id)
+    if run_id is not None:
+        stmt = stmt.where(LLMSystemCostReceipt.run_id == run_id)
+    if status_filter is not None:
+        stmt = stmt.where(LLMSystemCostReceipt.status == status_filter)
+    return stmt
+
+
+@router.get(
+    "/llm-system-costs",
+    response_model=list[LLMSystemCostReceiptOut],
+)
+async def list_llm_system_costs(
+    tenant_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    run_id: uuid.UUID | None = None,
+    status_filter: str | None = Query(default=None, alias="status"),
+    page: int = 1,
+    limit: int = 100,
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List secret-free system-cost receipts for platform operators only."""
+
+    result = await db.execute(
+        _llm_system_cost_query(
+            tenant_id=tenant_id,
+            group_id=group_id,
+            run_id=run_id,
+            status_filter=status_filter,
+        )
+        .order_by(
+            LLMSystemCostReceipt.created_at.desc(),
+            LLMSystemCostReceipt.id.desc(),
+        )
+        .offset((max(page, 1) - 1) * min(max(limit, 1), 500))
+        .limit(min(max(limit, 1), 500))
+    )
+    return result.scalars().all()
+
+
+@router.get(
+    "/llm-system-costs/summary",
+    response_model=LLMSystemCostSummaryOut,
+)
+async def summarize_llm_system_costs(
+    tenant_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    run_id: uuid.UUID | None = None,
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate finalized and unresolved Planning cost for operations."""
+
+    filters = []
+    if tenant_id is not None:
+        filters.append(LLMSystemCostReceipt.tenant_id == tenant_id)
+    if group_id is not None:
+        filters.append(LLMSystemCostReceipt.group_id == group_id)
+    if run_id is not None:
+        filters.append(LLMSystemCostReceipt.run_id == run_id)
+    result = await db.execute(
+        select(
+            func.count(LLMSystemCostReceipt.id),
+            func.count(LLMSystemCostReceipt.id).filter(
+                LLMSystemCostReceipt.status == "finalized"
+            ),
+            func.count(LLMSystemCostReceipt.id).filter(
+                LLMSystemCostReceipt.status == "reconciling"
+            ),
+            func.count(LLMSystemCostReceipt.id).filter(
+                LLMSystemCostReceipt.status == "provider_inflight"
+            ),
+            func.count(LLMSystemCostReceipt.id).filter(
+                LLMSystemCostReceipt.status == "reconciled"
+            ),
+            func.count(LLMSystemCostReceipt.id).filter(
+                LLMSystemCostReceipt.status == "voided"
+            ),
+            func.count(LLMSystemCostReceipt.id).filter(
+                LLMSystemCostReceipt.cost_status == "unpriced"
+            ),
+            func.coalesce(func.sum(LLMSystemCostReceipt.total_tokens), 0),
+            func.coalesce(func.sum(LLMSystemCostReceipt.estimated_tokens), 0),
+            func.coalesce(func.sum(LLMSystemCostReceipt.system_cost_credits), 0),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (LLMSystemCostReceipt.status == "voided", 0),
+                        (
+                            LLMSystemCostReceipt.system_cost_credits.is_not(None),
+                            LLMSystemCostReceipt.system_cost_credits,
+                        ),
+                        else_=LLMSystemCostReceipt.budget_reservation_credits,
+                    )
+                ),
+                0,
+            ),
+        ).where(*filters)
+    )
+    row = result.one()
+    return LLMSystemCostSummaryOut(
+        receipt_count=int(row[0] or 0),
+        finalized_count=int(row[1] or 0),
+        reconciling_count=int(row[2] or 0),
+        provider_inflight_count=int(row[3] or 0),
+        reconciled_count=int(row[4] or 0),
+        voided_count=int(row[5] or 0),
+        unpriced_count=int(row[6] or 0),
+        total_tokens=int(row[7] or 0),
+        estimated_tokens=int(row[8] or 0),
+        system_cost_credits=int(row[9] or 0),
+        active_budget_credits=int(row[10] or 0),
+    )
+
+
+@router.get(
+    "/llm-system-cost-resolutions",
+    response_model=list[LLMSystemCostResolutionOut],
+)
+async def list_llm_system_cost_resolutions(
+    tenant_id: uuid.UUID | None = None,
+    receipt_id: uuid.UUID | None = None,
+    page: int = 1,
+    limit: int = 100,
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List append-only Planning cost transitions for platform audit."""
+
+    stmt = select(LLMSystemCostResolution)
+    if tenant_id is not None:
+        stmt = stmt.where(LLMSystemCostResolution.tenant_id == tenant_id)
+    if receipt_id is not None:
+        stmt = stmt.where(LLMSystemCostResolution.receipt_id == receipt_id)
+    result = await db.execute(
+        stmt.order_by(
+            LLMSystemCostResolution.created_at.desc(),
+            LLMSystemCostResolution.id.desc(),
+        )
+        .offset((max(page, 1) - 1) * min(max(limit, 1), 500))
+        .limit(min(max(limit, 1), 500))
+    )
+    return result.scalars().all()
+
+
+@router.post(
+    "/llm-system-costs/stale-scan",
+    response_model=PlanningCostStaleScanOut,
+)
+async def scan_stale_llm_system_costs(
+    data: PlanningCostStaleScanIn,
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview/apply the safe transition from stale inflight to ambiguity review."""
+
+    settings = get_settings()
+    try:
+        result = await scan_stale_planning_costs_in_session(
+            db,
+            stale_after_seconds=settings.PLANNING_SYSTEM_COST_INFLIGHT_STALE_SECONDS,
+            limit=data.limit,
+            apply=data.apply,
+            source="operator",
+            actor_user_id=current_user.id,
+            evidence_ref=data.evidence_ref,
+            reason=data.reason,
+        )
+    except PlanningCostResolutionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if data.apply:
+        await db.commit()
+    return PlanningCostStaleScanOut(
+        cutoff=result.cutoff,
+        candidate_receipt_ids=list(result.candidate_receipt_ids),
+        candidate_count=len(result.candidate_receipt_ids),
+        applied_count=result.applied_count,
+    )
+
+
+@router.post(
+    "/llm-system-costs/{receipt_id}/resolutions",
+    response_model=PlanningCostResolutionResultOut,
+)
+async def resolve_llm_system_cost(
+    receipt_id: uuid.UUID,
+    data: PlanningCostResolutionIn,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: User = Depends(get_platform_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Settle or void one ambiguous receipt using explicit Provider evidence."""
+
+    try:
+        result = await apply_planning_cost_resolution_in_session(
+            db,
+            receipt_id=receipt_id,
+            expected_tenant_id=data.expected_tenant_id,
+            expected_status=data.expected_status,
+            expected_provider_outcome=data.expected_provider_outcome,
+            disposition=data.disposition,
+            evidence_ref=data.evidence_ref,
+            reason=data.reason,
+            input_tokens=data.input_tokens,
+            output_tokens=data.output_tokens,
+            total_tokens=data.total_tokens,
+            cache_read_tokens=data.cache_read_tokens,
+            cache_creation_tokens=data.cache_creation_tokens,
+            system_cost_credits=data.system_cost_credits,
+            actor_user_id=current_user.id,
+            idempotency_key=idempotency_key,
+        )
+    except PlanningCostResolutionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    await db.commit()
+    await db.refresh(result.receipt)
+    await db.refresh(result.resolution)
+    return PlanningCostResolutionResultOut(
+        receipt=LLMSystemCostReceiptOut.model_validate(result.receipt),
+        resolution=LLMSystemCostResolutionOut.model_validate(result.resolution),
+        replayed=result.replayed,
+    )
 
 
 @router.get("/orders/export.csv")

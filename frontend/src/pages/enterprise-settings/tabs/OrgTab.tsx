@@ -1024,7 +1024,7 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                         {t('enterprise.identity.title', 'Organization & Directory Sync')}
                     </h3>
                     <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-                        Configure enterprise directory synchronization and Identity Provider settings.
+                        {t('enterprise.identity.description', 'Configure enterprise directory synchronization and Identity Provider settings.')}
                     </div>
                 </div>
 

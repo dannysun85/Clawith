@@ -424,6 +424,10 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
             new=AsyncMock(return_value=mention.model),
         ),
         patch(
+            "app.services.group_message_service.ensure_current_platform_credential_route",
+            new=AsyncMock(),
+        ) as ensure_credential_route,
+        patch(
             "app.services.group_message_service.RuntimeCommandIntake.start_run",
             new=AsyncMock(return_value=handle),
         ) as start_run,
@@ -446,6 +450,11 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
     assert intake.dispatch_kind == "planning"
     assert intake.run_handles == (handle,)
     assert intake.error_code is None
+    ensure_credential_route.assert_awaited_once_with(
+        db,
+        mention.model,
+        setting_name="MULTI_AGENT_PLANNING_MODEL_ID",
+    )
     assert len(db.added) == 1
     command = start_run.await_args.args[0]
     assert command.run_kind == "orchestration"
@@ -553,6 +562,10 @@ async def test_missing_planning_model_persists_one_visible_idempotent_failure() 
         "planning-configuration-failure",
     )
     assert failure_message.role == "system"
+    assert failure_message.id == uuid.uuid5(
+        public_message.id,
+        "planning-configuration-failure",
+    )
     assert failure_message.participant_id is None
     assert failure_message.content == (
         "任务规划未完成。\n"
@@ -561,6 +574,92 @@ async def test_missing_planning_model_persists_one_visible_idempotent_failure() 
     )
     assert "MULTI_AGENT_PLANNING_MODEL_ID" not in failure_message.content
     assert failure_message.created_at == NOW.replace(microsecond=1)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_platform_credential_route_blocks_planning_run_safely() -> None:
+    tenant_id, _, scope, target, mention = _records()
+    planning_model = mention.model
+    planning_model.tenant_id = None
+    planning_model.provider = "private-provider-name"
+    other_agent = Agent(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        creator_id=uuid.uuid4(),
+        name="Writer",
+        primary_model_id=mention.model.id,
+        status="idle",
+        is_expired=False,
+        access_mode="company",
+    )
+    other = ResolvedGroupMention(
+        participant_id=uuid.uuid4(),
+        participant_type="agent",
+        participant_ref_id=other_agent.id,
+        display_name=other_agent.name,
+        valid=True,
+        triggers_agent=True,
+        agent=other_agent,
+        model=mention.model,
+    )
+    db = _Session()
+
+    with (
+        patch(
+            "app.services.group_message_service._load_sender_scope",
+            new=AsyncMock(return_value=scope),
+        ),
+        patch(
+            "app.services.group_message_service._resolve_mentions",
+            new=AsyncMock(return_value=(mention, other)),
+        ),
+        patch(
+            "app.services.group_message_service.resolve_multi_agent_planning_model",
+            new=AsyncMock(return_value=planning_model),
+        ),
+        patch(
+            "app.services.group_message_service.ensure_current_platform_credential_route",
+            new=AsyncMock(
+                side_effect=PlatformModelConfigurationError(
+                    "MULTI_AGENT_PLANNING_MODEL_ID",
+                    "private-provider-name credential secret is unavailable",
+                )
+            ),
+        ),
+        patch(
+            "app.services.group_message_service.RuntimeCommandIntake.start_run",
+            new=AsyncMock(),
+        ) as start_run,
+    ):
+        intake = await enqueue_group_message(
+            db,  # type: ignore[arg-type]
+            tenant_id=tenant_id,
+            group_id=scope.group.id,
+            session_id=scope.session.id,
+            sender_participant_id=scope.participant.id,
+            content="Work together",
+            mention_participant_ids=[target.id, other.participant_id],
+            settings_override=_settings(),
+            clock=NOW,
+        )
+
+    assert intake.dispatch_kind == "planning"
+    assert intake.run_handles == ()
+    assert intake.error_code == "planning_model_unavailable"
+    start_run.assert_not_awaited()
+    assert len(db.added) == 2
+    public_message, failure_message = db.added
+    assert intake.new_public_messages == (public_message, failure_message)
+    assert failure_message.role == "system"
+    assert failure_message.content == (
+        "任务规划未完成。\n"
+        "错误：多 Agent 规划模型未配置或当前不可用，请联系管理员检查运行时模型设置。\n"
+        "错误码：planning_model_unavailable"
+    )
+    assert "private-provider-name" not in failure_message.content
+    assert "MULTI_AGENT_PLANNING_MODEL_ID" not in failure_message.content
+    assert "credential" not in failure_message.content
+    assert "secret" not in failure_message.content
 
 
 @pytest.mark.asyncio

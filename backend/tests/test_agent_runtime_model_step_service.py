@@ -997,7 +997,10 @@ async def test_truncated_plain_text_is_not_treated_as_a_final_candidate() -> Non
     assert result.intent == "text"
     assert result.repair_code == "incomplete_output"
     assert result.finish_content is None
-    assert "truncated" in (result.repair_instruction or "").lower()
+    instruction = (result.repair_instruction or "").lower()
+    assert "continue exactly" in instruction
+    assert "do not restart" in instruction
+    assert "from the beginning" not in instruction
 
 
 @pytest.mark.asyncio
@@ -1489,6 +1492,13 @@ async def test_sessionless_background_run_gets_one_explicit_current_directive() 
     )
     assert serialized.count("Prepare the weekly risk report") == 1
     assert '"description"' not in str(_runtime_data_message(calls[0][0]).content)
+    task_tools = {
+        tool["function"]["name"]: tool for tool in calls[0][1]["tools"]
+    }
+    assert "at" not in task_tools
+    assert task_tools["wait"]["function"]["parameters"]["properties"][
+        "waiting_type"
+    ]["enum"] == ["agent", "external"]
 
 
 @pytest.mark.asyncio
@@ -1987,6 +1997,66 @@ async def test_group_mention_validation_fails_closed_for_invalid_group_scope() -
 
 
 @pytest.mark.asyncio
+async def test_non_group_task_can_describe_at_mentions_without_group_scope() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["registry"] = replace(
+        state["registry"],
+        source_type="task",
+        run_kind="background",
+        session_id=None,
+    )
+    state["snapshots"] = RunInputSnapshots(
+        session_context={"version": 0, "summary": ""},
+        session_context_version=0,
+        recent_session_messages=(),
+        related_run_summaries=(),
+        initial_input={
+            "task_id": str(uuid.uuid4()),
+            "title": "Audit Group conversion evidence",
+            "description": "Explain whether two @Agent attempts created a formal task.",
+        },
+    )
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content=(
+                "Two @Agent attempts did not create a formal task; verify the Group ID, "
+                "Session ID, Message ID, and task origin."
+            ),
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+            finish_reason="stop",
+        )
+
+    with patch(
+        "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+        new=AsyncMock(),
+    ) as validate_group_mentions:
+        result = await _service(
+            model,
+            agent,
+            _ContextBuilder(
+                _build(
+                    session_context_snapshot={"version": 0, "summary": ""},
+                    recent_session_messages_snapshot=(),
+                    initial_input=state["snapshots"].initial_input,
+                )
+            ),
+            complete,
+        ).complete_once(state, _context(state))
+
+    assert result.intent == "finish"
+    assert "@Agent" in (result.finish_content or "")
+    validate_group_mentions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_group_response_repairs_visible_agent_mention_without_staged_id() -> None:
     tenant_id = uuid.uuid4()
     model = _model(tenant_id)
@@ -2354,6 +2424,81 @@ async def test_group_confirmation_is_turned_into_a_public_finish_not_waiting_use
     assert calls
     assert "unknown outcome" in str(calls[0][0][0].content)
     assert "final public group reply" in str(calls[0][0][0].content)
+
+
+@pytest.mark.asyncio
+async def test_work_unknown_tool_confirmation_waits_for_projected_reconciliation_action() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["registry"] = replace(
+        state["registry"],
+        source_type="task",
+        run_kind="background",
+        session_id=None,
+    )
+    called = False
+
+    async def complete(*args, **kwargs):
+        nonlocal called
+        del args, kwargs
+        called = True
+        raise AssertionError("provider must not be called before reconciliation")
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build(requires_confirmation=True)),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "wait"
+    assert result.waiting_request == {
+        "waiting_type": "user",
+        "correlation_id": f"tool-confirm:{state['registry'].run_id}",
+        "reason": "A prior tool outcome is unknown and requires confirmation.",
+    }
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_noninteractive_source_unknown_tool_confirmation_fails_for_operator_review() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["registry"] = replace(
+        state["registry"],
+        source_type="heartbeat",
+        run_kind="background",
+        session_id=None,
+    )
+    called = False
+
+    async def complete(*args, **kwargs):
+        nonlocal called
+        del args, kwargs
+        called = True
+        raise AssertionError("provider must not be called before operator review")
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build(requires_confirmation=True)),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error == {
+        "code": "tool_outcome_reconciliation_required",
+        "message": (
+            "A prior tool outcome is unknown and this background source has "
+            "no human reconciliation surface. The run failed safely for "
+            "operator review."
+        ),
+    }
+    assert called is False
 
 
 @pytest.mark.asyncio
@@ -3127,6 +3272,44 @@ async def test_retryable_primary_error_without_fallback_pauses_for_resume() -> N
     assert result.waiting_request["error_code"] == "model_provider_unavailable"
     assert result.waiting_request["provider_error"] == {
         "error_type": "RuntimeError"
+    }
+    assert calls == 4
+
+
+@pytest.mark.asyncio
+async def test_retryable_provider_error_fails_sessionless_task_for_work_recovery() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["registry"] = replace(
+        state["registry"],
+        source_type="task",
+        run_kind="background",
+        session_id=None,
+    )
+    calls = 0
+
+    async def complete(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        raise RuntimeError("HTTP 502 Bad Gateway")
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error == {
+        "code": "model_provider_unavailable",
+        "message": (
+            "Model provider remained unavailable after 4 attempts. "
+            "The background run was failed safely and can be retried."
+        ),
     }
     assert calls == 4
 

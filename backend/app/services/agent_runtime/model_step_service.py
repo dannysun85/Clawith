@@ -313,6 +313,7 @@ class CompletionPort(Protocol):
         user_id: uuid.UUID | None = None,
         supports_vision: bool = False,
         invocation: object | None = None,
+        billing_ref_id: uuid.UUID | None = None,
     ) -> LLMCompletionStep: ...
 
 
@@ -1003,7 +1004,12 @@ def _parse_step(
                 state,
                 context,
                 step,
-                "The response was truncated. Regenerate one complete final answer from the beginning.",
+                (
+                    "The response hit the provider output limit. Continue exactly from "
+                    "the final character of the previous partial response. Return only "
+                    "the missing remainder; do not restart or repeat completed sections. "
+                    "Finish the answer within this continuation when possible."
+                ),
                 repair_code="incomplete_output",
             )
         if step.finish_reason == "content_filter":
@@ -1112,15 +1118,23 @@ def _parse_step(
                 repair_code="invalid_wait",
             )
         if waiting_type == "user" and not allow_user_wait:
+            if _is_group_agent_run(state):
+                repair_instruction = (
+                    "This Group Run cannot enter waiting_user. Ask the question in "
+                    "the final public group reply; a later structured human mention "
+                    "creates a new Run."
+                )
+            else:
+                repair_instruction = (
+                    "This confirmed background Run cannot enter waiting_user because "
+                    "it has no Direct Chat reply surface. Complete from the confirmed "
+                    "inputs or return an explicit limitation for owner review."
+                )
             return _repair(
                 state,
                 context,
                 step,
-                (
-                    "This Group Run cannot enter waiting_user. Ask the question in "
-                    "the final public group reply; a later "
-                    "structured human mention creates a new Run."
-                ),
+                repair_instruction,
             )
         correlation_id = str(
             uuid.uuid5(
@@ -1379,7 +1393,8 @@ class RuntimeModelStepService:
     ) -> RunCompactInputs:
         """Profile the exact business request shape used by the Compact node."""
         model, agent, ledger = await self._load(context, state)
-        allow_user_wait = not _is_group_agent_run(state)
+        allow_group_handoff = _is_group_agent_run(state)
+        allow_user_wait = context.source_type == "chat" and not allow_group_handoff
         application_tools = (
             with_group_runtime_tools(
                 await self._tool_provider(agent.id),
@@ -1395,7 +1410,7 @@ class RuntimeModelStepService:
         tools = _with_runtime_tools(
             application_tools,
             allow_user_wait=allow_user_wait,
-            allow_group_handoff=not allow_user_wait,
+            allow_group_handoff=allow_group_handoff,
         )
         allowed_names = frozenset(
             name for name in (_tool_name(tool) for tool in tools) if name
@@ -1505,7 +1520,15 @@ class RuntimeModelStepService:
             token_counter=_message_token_counter,
         )
         if build.requires_confirmation:
-            if not _is_group_agent_run(state):
+            if _is_group_agent_run(state):
+                static_prompt = (
+                    f"{static_prompt}\n\n# Group Confirmation Required\n\n"
+                    "A prior side-effecting operation has an unknown outcome. Do not "
+                    "repeat it or continue the affected work. Ask the human to confirm "
+                    "the outcome in the final public group reply as normal Assistant content. "
+                    "Do not call `wait`."
+                )
+            elif context.source_type in {"chat", "task"}:
                 return ModelStepResult(
                     intent="wait",
                     waiting_request={
@@ -1514,13 +1537,15 @@ class RuntimeModelStepService:
                         "reason": "A prior tool outcome is unknown and requires confirmation.",
                     },
                 )
-            static_prompt = (
-                f"{static_prompt}\n\n# Group Confirmation Required\n\n"
-                "A prior side-effecting operation has an unknown outcome. Do not "
-                "repeat it or continue the affected work. Ask the human to confirm "
-                "the outcome in the final public group reply as normal Assistant content. "
-                "Do not call `wait`."
-            )
+            else:
+                raise RuntimeModelCallError(
+                    "tool_outcome_reconciliation_required",
+                    (
+                        "A prior tool outcome is unknown and this background source has "
+                        "no human reconciliation surface. The run failed safely for "
+                        "operator review."
+                    ),
+                )
         if build.blocked:
             return ModelStepResult(
                 intent="wait",
@@ -1673,6 +1698,7 @@ class RuntimeModelStepService:
             )
             completion_kwargs["user_id"] = user_id
             completion_kwargs["invocation"] = invocation
+            completion_kwargs["billing_ref_id"] = uuid.UUID(context.run_id)
         return await self._completion(
             model,
             messages,
@@ -1763,6 +1789,14 @@ class RuntimeModelStepService:
         error: Exception,
     ) -> ModelStepResult:
         attempts = self._model_retry_attempts + 1
+        if context.source_type != "chat":
+            raise RuntimeModelCallError(
+                "model_provider_unavailable",
+                (
+                    f"Model provider remained unavailable after {attempts} attempts. "
+                    "The background run was failed safely and can be retried."
+                ),
+            ) from error
         return ModelStepResult(
             intent="wait",
             waiting_request={
@@ -1808,7 +1842,12 @@ class RuntimeModelStepService:
     ) -> ModelStepResult:
         try:
             model, agent, ledger = await self._load(context, state)
-            allow_user_wait = not _is_group_agent_run(state)
+            # Only Direct Chat exposes a general-purpose reply surface for
+            # model-authored clarification. Work may enter waiting_user only
+            # through the separately projected unknown-tool reconciliation
+            # action; its model must not invent a free-form question here.
+            allow_group_handoff = _is_group_agent_run(state)
+            allow_user_wait = context.source_type == "chat" and not allow_group_handoff
             application_tools = (
                 with_group_runtime_tools(
                     await self._tool_provider(agent.id),
@@ -1825,7 +1864,7 @@ class RuntimeModelStepService:
             tools = _with_runtime_tools(
                 application_tools,
                 allow_user_wait=allow_user_wait,
-                allow_group_handoff=not allow_user_wait,
+                allow_group_handoff=allow_group_handoff,
             )
             allowed_names = frozenset(
                 name for name in (_tool_name(tool) for tool in tools) if name
@@ -1936,7 +1975,7 @@ class RuntimeModelStepService:
                 fallback_tools = _with_runtime_tools(
                     fallback_application_tools,
                     allow_user_wait=allow_user_wait,
-                    allow_group_handoff=not allow_user_wait,
+                    allow_group_handoff=allow_group_handoff,
                 )
                 fallback_allowed_names = frozenset(
                     name
@@ -2036,9 +2075,13 @@ class RuntimeModelStepService:
                 step,
                 allowed_tool_names=active_allowed_names,
                 allow_user_wait=allow_user_wait,
-                allow_group_handoff=not allow_user_wait,
+                allow_group_handoff=allow_group_handoff,
             )
-            if result.intent == "finish" and not allow_user_wait:
+            if (
+                result.intent == "finish"
+                and not allow_user_wait
+                and allow_group_handoff
+            ):
                 try:
                     staged_participant_ids = _pending_group_at_participant_ids(state)
                     legacy_participant_ids = result.finish_mention_participant_ids

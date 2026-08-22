@@ -7,10 +7,13 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 import json
 from typing import cast
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import uuid
 
 import pytest
 
+import app.services.agent_runtime.planning as planning_module
 from app.models.llm import LLMModel
 from app.services.agent_runtime.planning import (
     PlanningContractError,
@@ -27,7 +30,16 @@ from app.services.agent_runtime.state import (
     RuntimeGraphState,
     RuntimeNodeExecutor,
 )
+from app.services.agent_runtime.system_costs import (
+    PlanningCostAccountingError,
+    PlanningCostAttempt,
+    PlanningCostReplay,
+)
 from app.services.llm.single_step import LLMCompletionStep
+from app.services.llm.load_balancer import (
+    CredentialUnavailableReason,
+    NoCredentialAvailable,
+)
 from app.services.token_tracker import TokenUsage
 
 
@@ -154,6 +166,21 @@ def _session_factory(model: LLMModel):
         yield _DB(model)
 
     return factory
+
+
+def _cost_accounting(*, replay: PlanningCostReplay | None = None):
+    return SimpleNamespace(
+        find_replay_or_raise=AsyncMock(return_value=replay),
+        begin=AsyncMock(
+            return_value=PlanningCostAttempt(
+                receipt_id=uuid.uuid4(),
+                replay=None,
+            )
+        ),
+        finalize=AsyncMock(),
+        discard_unaccepted=AsyncMock(),
+        mark_reconciling=AsyncMock(),
+    )
 
 
 def test_plan_validator_accepts_an_entry_subset_without_inventing_a_dag() -> None:
@@ -286,6 +313,455 @@ async def test_planning_model_uses_the_pinned_platform_model_without_tools() -> 
     assert "Each assigned Agent must author its own public group reply" in planning_prompt
     assert "Never route a planned group transition through private A2A" in planning_prompt
     assert "must say exactly which different Agent to wake publicly next" in planning_prompt
+
+
+@pytest.mark.asyncio
+async def test_real_planning_completion_uses_verified_platform_credential_route(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="openai",
+        model="planning-model",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    resolve_key = AsyncMock(
+        return_value=("platform-pool-key", "https://provider.example/v1", credential_id)
+    )
+    calls = []
+
+    async def real_completion_boundary(model_arg, messages, **kwargs):
+        calls.append((model_arg, messages, kwargs))
+        return LLMCompletionStep(
+            content=json.dumps(_plan(first)),
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(),
+        )
+
+    monkeypatch.setattr(planning_module, "resolve_model_key", resolve_key)
+    monkeypatch.setattr(
+        planning_module,
+        "complete_llm_once",
+        real_completion_boundary,
+    )
+    cost_accounting = _cost_accounting()
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=real_completion_boundary,
+        cost_accounting=cost_accounting,
+    ).complete_once(
+        _state((first, second)),
+        _context(model_id=model.id, run_id=run_id, tenant_id=tenant_id),
+    )
+
+    assert result.plan == _plan(first)
+    resolve_key.assert_awaited_once_with(
+        model,
+        capability_modality="text",
+        require_current_verification=True,
+    )
+    invocation = calls[0][2]["invocation"]
+    assert invocation.model is model
+    assert invocation.tenant_id == tenant_id
+    assert invocation.api_key == "platform-pool-key"
+    assert invocation.base_url == "https://provider.example/v1"
+    assert invocation.credential_id == credential_id
+    assert calls[0][2]["billing_ref_id"] == run_id
+    cost_accounting.begin.assert_awaited_once()
+    assert cost_accounting.begin.await_args.kwargs["credential_id"] == credential_id
+    cost_accounting.finalize.assert_awaited_once()
+    assert cost_accounting.finalize.await_args.kwargs["usage"].total_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_real_planning_completion_fails_before_provider_without_verified_route(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="openai",
+        model="planning-model",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    resolve_key = AsyncMock(
+        side_effect=NoCredentialAvailable(
+            "openai",
+            "text",
+            CredentialUnavailableReason.ALL_UNHEALTHY,
+        )
+    )
+    completion = AsyncMock()
+    monkeypatch.setattr(planning_module, "resolve_model_key", resolve_key)
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    cost_accounting = _cost_accounting()
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(
+        _state((first, second)),
+        _context(model_id=model.id),
+    )
+
+    assert result.error_code == "planning_model_unavailable"
+    assert result.retryable is False
+    assert "credential" not in result.error_message.lower()
+    completion.assert_not_awaited()
+    cost_accounting.begin.assert_not_awaited()
+    cost_accounting.finalize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finalized_planning_cost_receipt_replays_without_provider_or_credential(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    completion = AsyncMock()
+    resolve_key = AsyncMock()
+    cost_accounting = _cost_accounting(
+        replay=PlanningCostReplay(
+            content=json.dumps(_plan(first)),
+            tool_calls=(),
+            usage=TokenUsage(
+                input_tokens=100,
+                output_tokens=20,
+                total_tokens=120,
+            ),
+            finish_reason="stop",
+        )
+    )
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(planning_module, "resolve_model_key", resolve_key)
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(_state((first, second)), _context(model_id=model.id))
+
+    assert result.plan == _plan(first)
+    resolve_key.assert_not_awaited()
+    completion.assert_not_awaited()
+    cost_accounting.begin.assert_not_awaited()
+    cost_accounting.finalize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_planning_provider_failure_enters_reconciliation_without_retry(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    error = RuntimeError("timeout")
+    error.provider_outcome_ambiguous = True  # type: ignore[attr-defined]
+    completion = AsyncMock(side_effect=error)
+    cost_accounting = _cost_accounting()
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(
+        planning_module,
+        "resolve_model_key",
+        AsyncMock(return_value=("key", None, uuid.uuid4())),
+    )
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(_state((first, second)), _context(model_id=model.id))
+
+    assert result.error_code == "planning_cost_reconciliation_required"
+    assert result.retryable is False
+    cost_accounting.mark_reconciling.assert_awaited_once()
+    assert (
+        cost_accounting.mark_reconciling.await_args.kwargs["provider_outcome"]
+        == "acceptance_unknown"
+    )
+    cost_accounting.discard_unaccepted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_planning_provider_rejection_discards_zero_cost_attempt(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    completion = AsyncMock(side_effect=RuntimeError("rejected before request"))
+    cost_accounting = _cost_accounting()
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(
+        planning_module,
+        "resolve_model_key",
+        AsyncMock(return_value=("key", None, uuid.uuid4())),
+    )
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(_state((first, second)), _context(model_id=model.id))
+
+    assert result.error_code == "planning_model_call_failed"
+    assert result.retryable is True
+    cost_accounting.discard_unaccepted.assert_awaited_once()
+    cost_accounting.mark_reconciling.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_planning_cost_finalize_failure_preserves_response_for_reconciliation(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    usage = TokenUsage(input_tokens=100, output_tokens=20, total_tokens=120)
+    completion = AsyncMock(
+        return_value=LLMCompletionStep(
+            content=json.dumps(_plan(first)),
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=usage,
+            finish_reason="stop",
+        )
+    )
+    cost_accounting = _cost_accounting()
+    cost_accounting.finalize.side_effect = RuntimeError("ledger unavailable")
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(
+        planning_module,
+        "resolve_model_key",
+        AsyncMock(return_value=("key", None, uuid.uuid4())),
+    )
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(_state((first, second)), _context(model_id=model.id))
+
+    assert result.error_code == "planning_cost_reconciliation_required"
+    assert result.retryable is False
+    cost_accounting.mark_reconciling.assert_awaited_once()
+    kwargs = cost_accounting.mark_reconciling.await_args.kwargs
+    assert kwargs["provider_outcome"] == "accepted"
+    assert kwargs["usage"] is usage
+    assert kwargs["content"] == json.dumps(_plan(first))
+
+
+@pytest.mark.asyncio
+async def test_planning_cost_double_ledger_failure_is_observable_and_never_retries_provider(
+    monkeypatch,
+    caplog,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    sensitive_content = "sensitive-response-body"
+    completion = AsyncMock(
+        return_value=LLMCompletionStep(
+            content=sensitive_content,
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(input_tokens=100, output_tokens=20, total_tokens=120),
+            finish_reason="stop",
+        )
+    )
+    cost_accounting = _cost_accounting()
+    cost_accounting.finalize.side_effect = RuntimeError("ledger unavailable")
+    cost_accounting.mark_reconciling.side_effect = RuntimeError(sensitive_content)
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(
+        planning_module,
+        "resolve_model_key",
+        AsyncMock(return_value=("key", None, uuid.uuid4())),
+    )
+    caplog.set_level("WARNING", logger=planning_module.__name__)
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(_state((first, second)), _context(model_id=model.id))
+
+    assert result.error_code == "planning_cost_reconciliation_required"
+    assert result.retryable is False
+    completion.assert_awaited_once()
+    cost_accounting.finalize.assert_awaited_once()
+    cost_accounting.mark_reconciling.assert_awaited_once()
+    records = [
+        record
+        for record in caplog.records
+        if record.message == "planning_cost_mark_reconciling_failed"
+    ]
+    assert len(records) == 1
+    assert records[0].cost_receipt_id == str(
+        cost_accounting.begin.return_value.receipt_id
+    )
+    assert records[0].finalize_error_type == "RuntimeError"
+    assert records[0].reconciliation_error_type == "RuntimeError"
+    assert sensitive_content not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reconciling_planning_cost_blocks_provider_before_credential_resolution(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    completion = AsyncMock()
+    resolve_key = AsyncMock()
+    cost_accounting = _cost_accounting()
+    cost_accounting.find_replay_or_raise.side_effect = PlanningCostAccountingError(
+        "planning_cost_reconciliation_required",
+        "blocked",
+    )
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(planning_module, "resolve_model_key", resolve_key)
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(_state((first, second)), _context(model_id=model.id))
+
+    assert result.error_code == "planning_cost_reconciliation_required"
+    assert result.retryable is False
+    resolve_key.assert_not_awaited()
+    completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invalid_planning_attempt_count_fails_closed_before_cost_or_provider(
+    monkeypatch,
+) -> None:
+    first, second = uuid.uuid4(), uuid.uuid4()
+    model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted="",
+        label="Planning",
+        enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
+        max_output_tokens=2048,
+        max_input_tokens=64_000,
+    )
+    completion = AsyncMock()
+    resolve_key = AsyncMock()
+    cost_accounting = _cost_accounting()
+    state = _state((first, second))
+    state["lifecycle"]["planning_attempt_count"] = True  # type: ignore[typeddict-item]
+    monkeypatch.setattr(planning_module, "complete_llm_once", completion)
+    monkeypatch.setattr(planning_module, "resolve_model_key", resolve_key)
+
+    result = await PlanningModelService(
+        session_factory=_session_factory(model),  # type: ignore[arg-type]
+        completion=completion,
+        cost_accounting=cost_accounting,
+    ).complete_once(state, _context(model_id=model.id))
+
+    assert result.error_code == "planning_cost_context_invalid"
+    assert result.retryable is False
+    resolve_key.assert_not_awaited()
+    completion.assert_not_awaited()
+    cost_accounting.find_replay_or_raise.assert_not_awaited()
 
 
 @pytest.mark.asyncio

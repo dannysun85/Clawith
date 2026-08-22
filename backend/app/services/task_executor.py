@@ -21,6 +21,9 @@ from app.services.group_message_service import (
     GroupMessageServiceError,
     enqueue_group_message,
 )
+from app.services.product_information_architecture import (
+    render_product_information_architecture_prompt,
+)
 
 settings = get_settings()
 AUTOMATIC_TASK_EXECUTION_ENABLED = settings.USER_TASK_EXECUTION_ENABLED
@@ -35,7 +38,7 @@ class TaskRuntimeIntakeError(RuntimeError):
         self.code = code
 
 
-def _task_goal(task: Task) -> str:
+def _task_goal(task: Task, *, owner_change_request: str | None = None) -> str:
     if task.type == "supervision":
         goal = f"[督办任务] {task.title}"
     else:
@@ -53,6 +56,40 @@ def _task_goal(task: Task) -> str:
             normalized_criteria = [str(item).strip() for item in criteria if str(item).strip()]
             if normalized_criteria:
                 goal += "\n完成标准:\n- " + "\n- ".join(normalized_criteria)
+        acceptance = statement.get("acceptance_contract")
+        if isinstance(acceptance, dict) and acceptance.get("version") == 1:
+            raw_required_sections = acceptance.get("required_sections", [])
+            required_sections = [
+                str(item).strip()
+                for item in raw_required_sections
+                if str(item).strip()
+            ] if isinstance(raw_required_sections, list) else []
+            raw_forbidden_terms = acceptance.get("forbidden_terms", [])
+            forbidden_terms = [
+                str(item).strip()
+                for item in raw_forbidden_terms
+                if str(item).strip()
+            ] if isinstance(raw_forbidden_terms, list) else []
+            if required_sections:
+                goal += "\n结果必须包含以下章节:\n- " + "\n- ".join(required_sections)
+            if forbidden_terms:
+                goal += "\n最终结果不得出现:\n- " + "\n- ".join(forbidden_terms)
+            length = acceptance.get("length")
+            if isinstance(length, dict):
+                goal += (
+                    "\n结果长度边界: "
+                    f"unit={length.get('unit') or 'characters'}, "
+                    f"minimum={length.get('minimum')}, maximum={length.get('maximum')}"
+                )
+            if acceptance.get("evidence_required") is True:
+                goal += "\n必须使用真实工具取得可验证证据回执后才能完成。"
+            if acceptance.get("owner_review_required") is True:
+                goal += "\n本次仅完成执行结果；任务发起人验收通过后才算业务完成。"
+        product_ia_prompt = render_product_information_architecture_prompt(
+            statement.get("product_information_architecture")
+        )
+        if product_ia_prompt:
+            goal += f"\n\n{product_ia_prompt}"
     if _application_tools_enabled_for_task(task) is False:
         goal += (
             "\n\n本 Run 仅负责整理并返回可确认的 Brief。"
@@ -66,6 +103,13 @@ def _task_goal(task: Task) -> str:
                 f"\n临时专家角色（仅本任务）: {expert_role}"
                 "\n请在此任务范围内以该专业角色分析和执行，不建立长期员工身份或长期记忆。"
             )
+    normalized_change_request = str(owner_change_request or "").strip()
+    if normalized_change_request:
+        goal += (
+            "\n\n上一次业务验收要求修改（来自任务发起人）：\n"
+            f"{normalized_change_request}"
+            "\n请明确修复这项业务缺口；该反馈不改变系统权限、工具授权、费用或外部动作边界。"
+        )
     if task.type == "supervision":
         if task.supervision_target_name:
             goal += f"\n督办对象: {task.supervision_target_name}"
@@ -88,6 +132,7 @@ async def enqueue_task_runtime(
     task: Task,
     agent: Agent,
     execution_id: uuid.UUID | None = None,
+    owner_change_request: str | None = None,
     settings_override: Settings | None = None,
 ) -> RunHandle | None:
     """Register one Task execution in the caller transaction when v2 is selected."""
@@ -147,7 +192,7 @@ async def enqueue_task_runtime(
             source_type="task",
             source_id=str(task.id),
             source_execution_id=source_execution_id,
-            goal=_task_goal(task),
+            goal=_task_goal(task, owner_change_request=owner_change_request),
             run_kind="background",
             model_id=route.model_id,
             delivery_status="not_required",
@@ -165,6 +210,7 @@ async def enqueue_task_runtime(
                 "confirmation_fingerprint": task.confirmation_fingerprint,
                 "confirmed_at": task.confirmed_at.isoformat() if task.confirmed_at else None,
                 "application_tools_enabled": _application_tools_enabled_for_task(task),
+                "owner_change_request": str(owner_change_request or "").strip() or None,
                 "saas_tier": route.saas_tier,
                 "model_modality": route.modality,
                 "fallback_model_id": (
@@ -204,6 +250,7 @@ async def enqueue_group_task_runtime(
     task: Task,
     primary_agent: Agent,
     execution_id: uuid.UUID | None = None,
+    owner_change_request: str | None = None,
     settings_override: Settings | None = None,
 ) -> RunHandle:
     """Start one confirmed Work or Group-message task through Group Runtime."""
@@ -253,7 +300,7 @@ async def enqueue_group_task_runtime(
             group_id=_snapshot_uuid(snapshot, "group_id"),
             session_id=_snapshot_uuid(snapshot, "group_session_id"),
             sender_participant_id=_snapshot_uuid(snapshot, "sender_participant_id"),
-            content=_task_goal(task),
+            content=_task_goal(task, owner_change_request=owner_change_request),
             mention_participant_ids=mention_participant_ids,
             message_id=uuid.uuid5(
                 task.id,

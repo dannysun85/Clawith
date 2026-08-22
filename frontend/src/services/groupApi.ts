@@ -7,6 +7,7 @@ import type {
     GroupMemberCandidate,
     GroupMessage,
     GroupMessageIntake,
+    GroupPlanningReadiness,
     GroupRunState,
     GroupSession,
     GroupSessionSummary,
@@ -50,6 +51,9 @@ export const groupApi = {
     remove: (groupId: string) => fetchJson<void>(`/groups/${groupId}`, { method: 'DELETE' }),
 
     members: (groupId: string) => fetchJson<GroupMember[]>(`/groups/${groupId}/members`),
+
+    planningReadiness: (groupId: string) =>
+        fetchJson<GroupPlanningReadiness>(`/groups/${groupId}/planning-readiness`),
 
     tasks: (groupId: string, sessionId?: string) =>
         fetchJson<GroupTaskSummary[]>(

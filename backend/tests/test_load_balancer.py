@@ -101,6 +101,24 @@ async def test_pick_returns_top_priority_cred():
 
 
 @pytest.mark.asyncio
+async def test_planning_pick_requires_current_verification_for_text():
+    unverified = _cred(priority=10, capabilities=["text"])
+    unverified.last_verification_at = None
+    unverified.verification_receipt = None
+    verified = _cred(priority=0, capabilities=["text"])
+    sess, _ = _patch_session(execute_result=[unverified, verified])
+
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "text",
+            require_current_verification=True,
+        )
+
+    assert chosen.id == verified.id
+
+
+@pytest.mark.asyncio
 async def test_pick_skips_provider_cooldown_and_uses_independent_credential(monkeypatch):
     blocked = _cred(priority=10)
     fallback = _cred(priority=0)

@@ -30,7 +30,7 @@ from app.models.deliverable import (
 from app.models.gateway_message import GatewayMessage
 from app.models.media_generation import MediaGenerationTask
 from app.models.org import AgentAgentRelationship
-from app.models.task import Task
+from app.models.task import Task, TaskResultReviewReceipt
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.workforce_topology import (
@@ -47,7 +47,9 @@ from app.services.work_detail_projection import latest_runtime_lifecycle_event_b
 from app.services.work_projection import (
     TERMINAL_RUN_EVENTS,
     project_execution_status,
+    project_task_result_review_status,
     project_user_stage,
+    work_requires_owner_review,
 )
 
 
@@ -358,6 +360,37 @@ async def _load_topology_work_summaries(
                 continue
             run_by_task.setdefault(task_id, run)
 
+    reviewable_task_ids = [
+        task.id
+        for task in tasks
+        if task.status == "done"
+        and work_requires_owner_review(getattr(task, "work_statement", {}))
+    ]
+    result_review_by_task: dict[uuid.UUID, TaskResultReviewReceipt] = {}
+    if reviewable_task_ids:
+        result_reviews = list(
+            (
+                await db.execute(
+                    select(TaskResultReviewReceipt)
+                    .where(
+                        TaskResultReviewReceipt.tenant_id == tenant_id,
+                        TaskResultReviewReceipt.task_id.in_(reviewable_task_ids),
+                    )
+                    .order_by(
+                        TaskResultReviewReceipt.created_at.desc(),
+                        TaskResultReviewReceipt.id.desc(),
+                    )
+                    .limit(TOPOLOGY_MAX_SOURCE_ROWS)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for receipt in result_reviews:
+            latest_run = run_by_task.get(receipt.task_id)
+            if latest_run is not None and receipt.run_id == latest_run.id:
+                result_review_by_task.setdefault(receipt.task_id, receipt)
+
     terminal_event_by_run: dict[uuid.UUID, str] = {}
     run_ids = [run.id for run in run_by_task.values()]
     if run_ids:
@@ -461,6 +494,7 @@ async def _load_topology_work_summaries(
     for task in tasks:
         run = run_by_task.get(task.id)
         request = deliverable_by_task.get(task.id)
+        result_review = result_review_by_task.get(task.id)
         execution_status = project_execution_status(
             task_status=task.status,
             terminal_run_event=terminal_event_by_run.get(run.id) if run else None,
@@ -470,6 +504,12 @@ async def _load_topology_work_summaries(
         updated_at = max(
             task.updated_at,
             request.updated_at if request else task.updated_at,
+            result_review.created_at if result_review else task.updated_at,
+        )
+        task_result_review_status = project_task_result_review_status(
+            task_status=task.status,
+            work_statement=getattr(task, "work_statement", {}),
+            receipt_action=result_review.action if result_review else None,
         )
         candidates.append(
             _WorkCandidate(
@@ -483,6 +523,7 @@ async def _load_topology_work_summaries(
                     deliverable_status=request.status if request else None,
                     artifact_status=artifact_status,
                     review_status=review_status,
+                    task_result_review_status=task_result_review_status,
                 ),
                 deep_link=(
                     f"/groups/{task.group_id}/{task.executor_snapshot.get('group_session_id')}"

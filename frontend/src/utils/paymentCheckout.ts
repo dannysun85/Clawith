@@ -12,6 +12,17 @@ export function needsPaymentDomainRedirect(
     return normalizeHostname(currentHostname) !== normalizeHostname(paymentHost);
 }
 
+export function shouldRedirectToPaymentDomain(
+    nativePaymentEnabled: boolean | null | undefined,
+    paymentHost: string | null | undefined,
+    currentHostname: string,
+): boolean {
+    return Boolean(
+        nativePaymentEnabled
+        && needsPaymentDomainRedirect(paymentHost, currentHostname),
+    );
+}
+
 /** Carry the current path onto the payment origin, keeping the JWT in the hash. */
 export function buildPaymentDomainRedirectUrl(options: {
     paymentHost: string;

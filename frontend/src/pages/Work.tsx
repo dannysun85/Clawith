@@ -60,6 +60,16 @@ const EXPECTED_OUTPUT_LABELS: Record<string, { zh: string; en: string }> = {
     confirmed_document_brief: { zh: '经确认的报告 Brief', en: 'A confirmed document brief' },
 };
 
+const DEFAULT_ACCEPTANCE_CRITERIA = {
+    zh: '结果直接回应已确认目标，并能用于下一步业务决策或执行。',
+    en: 'The result directly addresses the confirmed objective and is usable for the next business action.',
+};
+
+const contractLines = (value: string) => value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
 const STAGE_LABELS: Record<string, { zh: string; en: string }> = {
     task: { zh: '任务已登记', en: 'Task registered' },
     execution: { zh: '执行中', en: 'In progress' },
@@ -80,8 +90,10 @@ function stageLabel(stage: string, isChinese: boolean) {
 function inboxActionLabel(action: WorkNextAction, isChinese: boolean) {
     const labels: Record<WorkNextAction['kind'], { zh: string; en: string }> = {
         quality_review: { zh: '提交质量检查', en: 'Submit quality review' },
+        task_result_review: { zh: '验收任务结果', en: 'Review task result' },
         runtime_approval: { zh: '处理运行期审批', en: 'Review Runtime approval' },
-        delivery_approval: { zh: '批准或要求修改', en: 'Approve or request changes' },
+        delivery_approval: { zh: '批准交付或要求修改', en: 'Approve or request changes' },
+        tool_reconciliation: { zh: '核对工具执行结果', en: 'Reconcile tool outcome' },
         task_recovery: { zh: '恢复失败任务', en: 'Recover failed task' },
         delivery_recovery: { zh: '处理交付阻塞', en: 'Resolve delivery issue' },
     };
@@ -226,6 +238,17 @@ export default function Work() {
     const [groupId, setGroupId] = useState(restoredDraft?.groupId || '');
     const [groupSessionId, setGroupSessionId] = useState(restoredDraft?.groupSessionId || '');
     const [groupAgentParticipantIds, setGroupAgentParticipantIds] = useState<string[]>(restoredDraft?.groupAgentParticipantIds || []);
+    const [acceptanceCriteria, setAcceptanceCriteria] = useState(
+        restoredDraft?.acceptanceCriteria || (isChinese ? DEFAULT_ACCEPTANCE_CRITERIA.zh : DEFAULT_ACCEPTANCE_CRITERIA.en),
+    );
+    const [requiredSections, setRequiredSections] = useState(restoredDraft?.requiredSections || '');
+    const [forbiddenTerms, setForbiddenTerms] = useState(restoredDraft?.forbiddenTerms || '');
+    const [minimumLength, setMinimumLength] = useState(restoredDraft?.minimumLength || '');
+    const [maximumLength, setMaximumLength] = useState(restoredDraft?.maximumLength || '');
+    const [lengthUnit, setLengthUnit] = useState<'characters' | 'cjk_characters' | 'words'>(
+        restoredDraft?.lengthUnit || (isChinese ? 'cjk_characters' : 'words'),
+    );
+    const [evidenceRequired, setEvidenceRequired] = useState(restoredDraft?.evidenceRequired || false);
     const [clientRequestId, setClientRequestId] = useState(restoredDraft?.clientRequestId || createRandomUUID());
     const [preflight, setPreflight] = useState<{
         draftKey: string;
@@ -254,6 +277,13 @@ export default function Work() {
         setGroupId(next?.groupId || '');
         setGroupSessionId(next?.groupSessionId || '');
         setGroupAgentParticipantIds(next?.groupAgentParticipantIds || []);
+        setAcceptanceCriteria(next?.acceptanceCriteria || (isChinese ? DEFAULT_ACCEPTANCE_CRITERIA.zh : DEFAULT_ACCEPTANCE_CRITERIA.en));
+        setRequiredSections(next?.requiredSections || '');
+        setForbiddenTerms(next?.forbiddenTerms || '');
+        setMinimumLength(next?.minimumLength || '');
+        setMaximumLength(next?.maximumLength || '');
+        setLengthUnit(next?.lengthUnit || (isChinese ? 'cjk_characters' : 'words'));
+        setEvidenceRequired(next?.evidenceRequired || false);
         setClientRequestId(next?.clientRequestId || createRandomUUID());
         setPreflight(null);
     }, [draftStorageKey]);
@@ -281,20 +311,34 @@ export default function Work() {
             groupId,
             groupSessionId,
             groupAgentParticipantIds,
+            acceptanceCriteria,
+            requiredSections,
+            forbiddenTerms,
+            minimumLength,
+            maximumLength,
+            lengthUnit,
+            evidenceRequired,
             clientRequestId,
         });
     }, [
         agentId,
+        acceptanceCriteria,
         clientRequestId,
         draftStorageKey,
         executorKind,
         expertRole,
+        evidenceRequired,
+        forbiddenTerms,
         groupAgentParticipantIds,
         groupId,
         groupSessionId,
         intent,
+        lengthUnit,
+        maximumLength,
+        minimumLength,
         priority,
         routingMode,
+        requiredSections,
         title,
         workType,
     ]);
@@ -359,6 +403,22 @@ export default function Work() {
         work_type: workType,
         priority,
         routing_mode: routingMode,
+        acceptance_contract: {
+            version: 1,
+            criteria: contractLines(acceptanceCriteria),
+            required_sections: contractLines(requiredSections),
+            forbidden_terms: contractLines(forbiddenTerms),
+            result_language: 'auto',
+            ...(minimumLength || maximumLength ? {
+                length: {
+                    unit: lengthUnit,
+                    ...(minimumLength ? { minimum: Number(minimumLength) } : {}),
+                    ...(maximumLength ? { maximum: Number(maximumLength) } : {}),
+                },
+            } : {}),
+            evidence_required: evidenceRequired,
+            owner_review_required: true,
+        },
         ...(routingMode === 'manual' ? {
             executor_kind: executorKind,
             ...(executorKind === 'agent_employee' ? { agent_id: agentId } : {}),
@@ -371,14 +431,21 @@ export default function Work() {
         } : {}),
     }), [
         agentId,
+        acceptanceCriteria,
         executorKind,
         expertRole,
+        evidenceRequired,
+        forbiddenTerms,
         groupAgentParticipantIds,
         groupId,
         groupSessionId,
         intent,
+        lengthUnit,
+        maximumLength,
+        minimumLength,
         priority,
         routingMode,
+        requiredSections,
         title,
         workType,
     ]);
@@ -418,6 +485,12 @@ export default function Work() {
             setRoutingMode('auto');
             setAdvancedExecutor(false);
             setExpertRole('');
+            setAcceptanceCriteria(isChinese ? DEFAULT_ACCEPTANCE_CRITERIA.zh : DEFAULT_ACCEPTANCE_CRITERIA.en);
+            setRequiredSections('');
+            setForbiddenTerms('');
+            setMinimumLength('');
+            setMaximumLength('');
+            setEvidenceRequired(false);
             setPreflight(null);
             setClientRequestId(createRandomUUID());
             await Promise.all([
@@ -438,6 +511,10 @@ export default function Work() {
     });
 
     const canPrepare = intent.trim().length >= 3
+        && contractLines(acceptanceCriteria).length > 0
+        && (!minimumLength || Number.isInteger(Number(minimumLength)))
+        && (!maximumLength || Number.isInteger(Number(maximumLength)))
+        && (!minimumLength || !maximumLength || Number(minimumLength) <= Number(maximumLength))
         && (routingMode === 'auto' || executorKind !== 'agent_employee' || !!agentId)
         && (routingMode === 'auto' || executorKind !== 'temporary_expert' || expertRole.trim().length >= 3)
         && (routingMode === 'auto' || executorKind !== 'group' || (
@@ -493,6 +570,71 @@ export default function Work() {
                         placeholder={isChinese ? '说清楚目标、受众、约束和期望交付物……' : 'Describe the goal, audience, constraints and expected output…'}
                         rows={5}
                     />
+                    <section className="work-acceptance-contract">
+                        <div className="work-acceptance-heading">
+                            <div>
+                                <strong>{isChinese ? '业务验收标准' : 'Business acceptance'}</strong>
+                                <span>{isChinese
+                                    ? '这些条件会进入工作说明；可机器检查的边界会阻止伪完成，执行结果仍需你最终验收。'
+                                    : 'These criteria become part of the work statement. Deterministic boundaries block false completion, and you still approve the business result.'}</span>
+                            </div>
+                            <span>{isChinese ? '必填' : 'Required'}</span>
+                        </div>
+                        <label>
+                            <span>{isChinese ? '验收条件（每行一条）' : 'Acceptance criteria (one per line)'}</span>
+                            <textarea
+                                value={acceptanceCriteria}
+                                onChange={(event) => setAcceptanceCriteria(event.target.value)}
+                                rows={3}
+                                maxLength={3600}
+                            />
+                        </label>
+                        <div className="work-acceptance-grid">
+                            <label>
+                                <span>{isChinese ? '必须包含的章节（每行一项）' : 'Required sections (one per line)'}</span>
+                                <textarea
+                                    value={requiredSections}
+                                    onChange={(event) => setRequiredSections(event.target.value)}
+                                    rows={2}
+                                    placeholder={isChinese ? '例如：结论\n30 天行动计划' : 'e.g. Conclusion\n30-day action plan'}
+                                />
+                            </label>
+                            <label>
+                                <span>{isChinese ? '不得出现的内容（每行一项）' : 'Forbidden content (one per line)'}</span>
+                                <textarea
+                                    value={forbiddenTerms}
+                                    onChange={(event) => setForbiddenTerms(event.target.value)}
+                                    rows={2}
+                                    placeholder={isChinese ? '例如：内部工具名称\n未经证实的数据' : 'e.g. Internal tool names\nUnverified claims'}
+                                />
+                            </label>
+                        </div>
+                        <div className="work-acceptance-length">
+                            <label>
+                                <span>{isChinese ? '计数方式' : 'Length unit'}</span>
+                                <select value={lengthUnit} onChange={(event) => setLengthUnit(event.target.value as typeof lengthUnit)}>
+                                    <option value="cjk_characters">{isChinese ? '中文字符' : 'CJK characters'}</option>
+                                    <option value="words">{isChinese ? '英文单词' : 'Words'}</option>
+                                    <option value="characters">{isChinese ? '全部字符' : 'Characters'}</option>
+                                </select>
+                            </label>
+                            <label>
+                                <span>{isChinese ? '最少' : 'Minimum'}</span>
+                                <input type="number" min="1" value={minimumLength} onChange={(event) => setMinimumLength(event.target.value)} placeholder={isChinese ? '可选' : 'Optional'} />
+                            </label>
+                            <label>
+                                <span>{isChinese ? '最多' : 'Maximum'}</span>
+                                <input type="number" min="1" value={maximumLength} onChange={(event) => setMaximumLength(event.target.value)} placeholder={isChinese ? '可选' : 'Optional'} />
+                            </label>
+                            <label className="work-acceptance-evidence">
+                                <input type="checkbox" checked={evidenceRequired} onChange={(event) => setEvidenceRequired(event.target.checked)} />
+                                <span>{isChinese ? '必须提供可验证证据' : 'Require verifiable evidence'}</span>
+                            </label>
+                        </div>
+                        <small>{isChinese
+                            ? '超长报告不要放在任务消息里：先选择“报告 Brief”，确认后进入正式交付流，生成可下载、可质检、可批准的产物。'
+                            : 'Do not squeeze long reports into a task message. Confirm a Report brief, then use the formal delivery workflow for a downloadable, reviewed, and approved artifact.'}</small>
+                    </section>
                     <div className="work-composer-controls">
                         <div className="work-routing-mode">
                             <span>{isChinese ? '执行方式' : 'Routing'}</span>
@@ -673,6 +815,23 @@ export default function Work() {
                                 <strong>{confirmedPreflight.work_statement.title}</strong>
                                 <p>{confirmedPreflight.work_statement.objective}</p>
                             </div>
+                            <div className="work-confirmation-acceptance">
+                                <strong>{isChinese ? '你将按以下标准验收' : 'You will review against'}</strong>
+                                <ul>
+                                    {confirmedPreflight.work_statement.acceptance_contract.criteria.map((criterion) => (
+                                        <li key={criterion}>{criterion}</li>
+                                    ))}
+                                </ul>
+                                {confirmedPreflight.work_statement.acceptance_contract.length && (
+                                    <small>
+                                        {isChinese ? '结果长度' : 'Result length'} · {
+                                            confirmedPreflight.work_statement.acceptance_contract.length.minimum || '—'
+                                        }–{
+                                            confirmedPreflight.work_statement.acceptance_contract.length.maximum || '—'
+                                        } {confirmedPreflight.work_statement.acceptance_contract.length.unit}
+                                    </small>
+                                )}
+                            </div>
                             <dl className="work-confirmation-grid">
                                 <div>
                                     <dt>{isChinese ? '交付边界' : 'Output boundary'}</dt>
@@ -706,7 +865,7 @@ export default function Work() {
                             {confirmedPreflight.work_statement.cost.formal_media_requires_separate_preflight && (
                                 <p className="work-confirmation-note">
                                     {isChinese
-                                        ? '当前确认的是 Brief/任务执行，不代表图片、视频或 PPT 已经生成。正式交付会绑定本任务，并继续经过能力、Credits、质量检查和业务批准。'
+                                        ? '当前确认的是 Brief/任务执行，不代表图片、视频或 PPT 已经生成。正式交付会绑定本任务，并继续经过能力、Credits、质量检查和正式交付批准。'
                                         : 'This confirms brief/task execution, not a finished creative artifact. Formal delivery will link back to this task and run its own capability, Credits, quality and approval gates.'}
                                 </p>
                             )}

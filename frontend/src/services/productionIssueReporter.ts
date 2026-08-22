@@ -1,4 +1,5 @@
 type ClientIssueCategory = 'api' | 'runtime' | 'websocket';
+type ClientIssueSignalKind = 'fetch_rejected' | 'http_response' | 'runtime_exception' | 'websocket_close';
 
 type ClientIssueReport = {
     category: ClientIssueCategory;
@@ -13,6 +14,7 @@ type ClientIssueReport = {
 const REPORT_URL = '/api/production-issues/client-report';
 const REPORT_DEDUPE_WINDOW_MS = 30_000;
 const MAX_RECENT_FINGERPRINTS = 200;
+const SAFE_ORIGIN_HOST = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 const recentReports = new Map<string, number>();
 let reportingInstalled = false;
 let pageLifecycleEnding = false;
@@ -60,6 +62,37 @@ function isPageLifecycleFetchTeardown(report: ClientIssueReport): boolean {
         && report.metadata?.status_code == null;
 }
 
+function signalKind(report: ClientIssueReport): ClientIssueSignalKind {
+    if (report.category === 'runtime') return 'runtime_exception';
+    if (report.category === 'websocket') return 'websocket_close';
+    return report.metadata?.status_code == null ? 'fetch_rejected' : 'http_response';
+}
+
+function browserDiagnosticContext(report: ClientIssueReport): Record<string, string | boolean> {
+    const rawHost = typeof window !== 'undefined' ? window.location?.host : undefined;
+    const originHost = rawHost
+        && rawHost.length <= 120
+        && SAFE_ORIGIN_HOST.test(rawHost)
+        ? rawHost
+        : undefined;
+    const rawVisibility = typeof document !== 'undefined' ? document.visibilityState : undefined;
+    const visibilityState = rawVisibility === 'visible'
+        || rawVisibility === 'hidden'
+        || rawVisibility === 'prerender'
+        ? rawVisibility
+        : 'unknown';
+    const releaseVersion = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'unknown';
+
+    return {
+        ...(originHost ? { origin_host: originHost } : {}),
+        visibility_state: visibilityState,
+        lifecycle_state: pageLifecycleEnding ? 'ending' : 'active',
+        online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+        signal_kind: signalKind(report),
+        release_version: releaseVersion,
+    };
+}
+
 export function reportClientIssue(report: ClientIssueReport): void {
     const token = localStorage.getItem('token');
     if (
@@ -71,6 +104,10 @@ export function reportClientIssue(report: ClientIssueReport): void {
     const payload = {
         ...report,
         route: report.route ? routeWithoutQuery(report.route) : undefined,
+        metadata: {
+            ...(report.metadata || {}),
+            ...browserDiagnosticContext(report),
+        },
     };
     void fetch(REPORT_URL, {
         method: 'POST',

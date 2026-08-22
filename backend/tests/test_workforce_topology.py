@@ -297,6 +297,89 @@ async def test_work_summary_queries_are_viewer_scoped_and_bounded_per_agent():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("review_receipts", "expected_stage"),
+    [
+        ([], "review"),
+        (["request_changes"], "blocked"),
+    ],
+)
+async def test_work_summary_projects_owner_result_review_into_company_topology(
+    review_receipts,
+    expected_stage,
+):
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    employee_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    task = SimpleNamespace(
+        id=task_id,
+        tenant_id=tenant_id,
+        agent_id=employee_id,
+        created_by=user_id,
+        title="Q4 launch decision",
+        intent="Produce a decision-ready launch recommendation",
+        status="done",
+        work_statement={
+            "version": 2,
+            "acceptance_contract": {
+                "version": 1,
+                "criteria": ["Recommendation is executable"],
+                "owner_review_required": True,
+            },
+        },
+        group_id=None,
+        executor_kind="agent_employee",
+        executor_snapshot={},
+        updated_at=now - timedelta(minutes=2),
+    )
+    run = SimpleNamespace(
+        id=run_id,
+        source_id=str(task_id),
+        correlation_id=f"work-task:{task_id}",
+    )
+    receipts = [
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            task_id=task_id,
+            run_id=run_id,
+            action=action,
+            created_at=now - timedelta(minutes=1),
+        )
+        for action in review_receipts
+    ]
+    terminal_event = SimpleNamespace(
+        id=uuid.uuid4(),
+        run_id=run_id,
+        event_type="run_completed",
+        created_at=now - timedelta(minutes=2),
+    )
+    db = _RecordingDb(
+        [
+            _Result(values=[task]),
+            _Result(values=[]),
+            _Result(values=[run]),
+            _Result(values=receipts),
+            _Result(values=[terminal_event]),
+        ]
+    )
+
+    result = await workforce_topology._load_topology_work_summaries(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        employee_ids={employee_id},
+        since=now - timedelta(hours=24),
+    )
+
+    assert result[employee_id].stage == expected_stage
+    assert result[employee_id].deep_link == f"/agents/{employee_id}/chat?task_id={task_id}"
+    assert "task_result_review_receipts" in str(db.statements[3])
+
+
+@pytest.mark.asyncio
 async def test_execution_summary_covers_company_runs_deliverables_and_media_without_leaking_chat_goal():
     tenant_id = uuid.uuid4()
     user_id = uuid.uuid4()

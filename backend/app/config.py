@@ -210,6 +210,19 @@ class Settings(BaseSettings):
     AGENT_RUNTIME_FALLBACK_CONTEXT_WINDOW_TOKENS: int = Field(default=131072, gt=0)
     MULTI_AGENT_COMPACT_MODEL_ID: uuid.UUID | None = None
     MULTI_AGENT_PLANNING_MODEL_ID: uuid.UUID | None = None
+    # Platform-funded Group Planning calls are isolated from customer Credits,
+    # but they still require a pre-call reservation and hard tenant/run caps.
+    # 1000 system-cost credits represent approximately USD 1 in the provider
+    # pricing helpers. These defaults are deliberately conservative and are
+    # copied into the production compose/release contract.
+    PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN: int = Field(default=3000, gt=0)
+    PLANNING_SYSTEM_COST_MAX_CREDITS_PER_TENANT_DAY: int = Field(default=20000, gt=0)
+    PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN: int = Field(default=5, gt=0, le=50)
+    PLANNING_SYSTEM_COST_MAX_CALLS_PER_TENANT_DAY: int = Field(default=100, gt=0)
+    PLANNING_SYSTEM_COST_UNPRICED_RESERVATION_CREDITS: int = Field(default=1000, gt=0)
+    PLANNING_SYSTEM_COST_INFLIGHT_STALE_SECONDS: int = Field(default=600, ge=60)
+    PLANNING_SYSTEM_COST_RECONCILIATION_SCAN_SECONDS: int = Field(default=60, ge=10)
+    PLANNING_SYSTEM_COST_RECONCILIATION_BATCH_SIZE: int = Field(default=100, gt=0, le=500)
     GROUP_CONTEXT_ANNOUNCEMENT_MAX_CHARS: int = Field(default=12000, gt=0)
     GROUP_CONTEXT_MEMORY_MAX_CHARS: int = Field(default=12000, gt=0)
     GROUP_CONTEXT_WORKSPACE_MAX_ENTRIES: int = Field(default=100, gt=0)
@@ -440,6 +453,20 @@ class Settings(BaseSettings):
             raise ValueError(
                 "AGENT_RUNTIME_COMMAND_CLAIM_RENEW_SECONDS must be less than "
                 "AGENT_RUNTIME_COMMAND_CLAIM_TTL_SECONDS"
+            )
+        if (
+            self.PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN
+            > self.PLANNING_SYSTEM_COST_MAX_CREDITS_PER_TENANT_DAY
+        ):
+            raise ValueError(
+                "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN must not exceed the tenant daily cap"
+            )
+        if (
+            self.PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN
+            > self.PLANNING_SYSTEM_COST_MAX_CALLS_PER_TENANT_DAY
+        ):
+            raise ValueError(
+                "PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN must not exceed the tenant daily call cap"
             )
         return self
 

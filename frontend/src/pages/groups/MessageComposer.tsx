@@ -14,6 +14,9 @@ import {
 
 interface MessageComposerProps {
     members: GroupMember[];
+    planningAvailable?: boolean;
+    planningReadinessLoading?: boolean;
+    planningUnavailableMessage?: string;
     disabled?: boolean;
     canCancel?: boolean;
     cancelling?: boolean;
@@ -39,6 +42,9 @@ function findMentionQuery(value: string, caret: number): MentionQuery | null {
 
 export default function MessageComposer({
     members,
+    planningAvailable,
+    planningReadinessLoading = false,
+    planningUnavailableMessage,
     disabled,
     canCancel = false,
     cancelling = false,
@@ -69,6 +75,10 @@ export default function MessageComposer({
     }, [members, query]);
 
     useEffect(() => setHighlighted(0), [query?.text]);
+
+    const agentCount = liveMentionedAgentCount(value, mentionBindings);
+    const multiAgentPlanningBlocked = agentCount > 1
+        && (planningReadinessLoading || planningAvailable !== true);
 
     // Auto-grow the textarea to fit its content (capped by max-height in CSS). Runs for typing,
     // mention insertion and the post-send clear alike, since they all flow through `value`.
@@ -124,7 +134,7 @@ export default function MessageComposer({
 
     const submit = async () => {
         const content = value.trim();
-        if (!content || sending || disabled) return;
+        if (!content || sending || disabled || multiAgentPlanningBlocked) return;
         const mentionParticipantIds = liveMentionParticipantIds(value, mentionBindings);
 
         setSending(true);
@@ -171,8 +181,6 @@ export default function MessageComposer({
             void submit();
         }
     };
-
-    const agentCount = liveMentionedAgentCount(value, mentionBindings);
 
     return (
         <div className="group-composer">
@@ -244,9 +252,20 @@ export default function MessageComposer({
                     />
                 </div>
                 <div className="chat-composer-toolbar">
-                    <span className="group-composer-hint">
-                        {agentCount > 1
-                            ? t('groups.planningHint', '@ 了多个智能体，系统会先做任务规划再分工执行')
+                    <span
+                        className={`group-composer-hint ${multiAgentPlanningBlocked ? 'is-warning' : ''}`}
+                        role={multiAgentPlanningBlocked ? 'status' : undefined}
+                    >
+                        {agentCount > 1 && planningReadinessLoading
+                            ? t('groups.planningReadinessChecking', '正在检查多 Agent 规划能力…')
+                            : agentCount > 1 && planningAvailable !== true
+                                ? planningUnavailableMessage
+                                    || t(
+                                        'groups.planningUnavailable',
+                                        '多 Agent 规划暂不可用。请联系平台运营管理员，或仅 @ 一名 Agent 继续。',
+                                    )
+                                : agentCount > 1
+                                    ? t('groups.planningHint', '@ 了多个智能体，系统会先做任务规划再分工执行')
                             : t('groups.sendHint', 'Enter 发送，Shift + Enter 换行')}
                     </span>
                     <div style={{ flex: 1 }} />
@@ -264,9 +283,11 @@ export default function MessageComposer({
                     <button
                         type="button"
                         className="btn btn-primary chat-composer-send"
-                        disabled={disabled || sending || !value.trim()}
+                        disabled={disabled || sending || !value.trim() || multiAgentPlanningBlocked}
                         onClick={() => void submit()}
-                        title={t('groups.send', '发送')}
+                        title={multiAgentPlanningBlocked
+                            ? t('groups.planningUnavailableShort', '多 Agent 规划不可用')
+                            : t('groups.send', '发送')}
                     >
                         <IconSend size={16} stroke={1.75} />
                     </button>

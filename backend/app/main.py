@@ -297,6 +297,9 @@ async def lifespan(app: FastAPI):
         start_sso_session_cleanup_daemon,
     )
     from app.services.outbound_email_service import start_outbound_email_daemon
+    from app.services.planning_cost_reconciliation import (
+        start_planning_cost_reconciliation_daemon,
+    )
     from app.services.tool_seeder import seed_builtin_tools
     from app.services.template_seeder import seed_agent_templates
     from app.services.feishu_ws import feishu_ws_manager
@@ -575,6 +578,10 @@ async def lifespan(app: FastAPI):
                 ("minimax_quota_monitor", start_minimax_quota_monitor_daemon()),
                 ("media_generation", start_media_generation_daemon()),
                 ("billing_reconciliation", start_billing_reconciliation_daemon()),
+                (
+                    "planning_cost_reconciliation",
+                    start_planning_cost_reconciliation_daemon(),
+                ),
                 ("approval_execution", start_approval_execution_daemon()),
                 ("sso_session_cleanup", start_sso_session_cleanup_daemon()),
                 ("outbound_email", start_outbound_email_daemon()),

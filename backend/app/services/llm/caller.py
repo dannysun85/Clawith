@@ -1036,6 +1036,7 @@ async def resolve_model_key(
     model: "LLMModel",
     *,
     capability_modality: str | None = None,
+    require_current_verification: bool = False,
 ) -> tuple[str, str | None, uuid.UUID | None]:
     """Resolve (api_key, base_url, credential_id) for a model.
 
@@ -1048,11 +1049,19 @@ async def resolve_model_key(
     if getattr(model, "tenant_id", None) is None:
         capability_modality = capability_modality or _llm_capability_modality(model)
         try:
-            cred = await pick_credential(
-                model.provider,
-                capability_modality,
-                quota_modality=_llm_quota_modality(model, capability_modality),
-            )
+            if require_current_verification:
+                cred = await pick_credential(
+                    model.provider,
+                    capability_modality,
+                    quota_modality=_llm_quota_modality(model, capability_modality),
+                    require_current_verification=True,
+                )
+            else:
+                cred = await pick_credential(
+                    model.provider,
+                    capability_modality,
+                    quota_modality=_llm_quota_modality(model, capability_modality),
+                )
         except NoCredentialAvailable:
             spec = get_provider_spec(model.provider)
             if spec and not spec.requires_api_key:
@@ -1232,8 +1241,9 @@ async def reserve_llm_round_credits(
     messages: list[LLMMessage],
     tools: list[dict] | None,
     max_tokens: int,
+    ref_id: uuid.UUID | None = None,
 ) -> uuid.UUID | None:
-    """Atomically hold the conservative cost of one provider request."""
+    """Atomically hold one provider request and retain its owning Run identity."""
     if not (tenant_id and agent_id and route_meta):
         return None
     amount = await _estimate_llm_round_credit_hold(
@@ -1254,6 +1264,7 @@ async def reserve_llm_round_credits(
         model=model.model,
         amount=amount,
         ref_type="llm_round",
+        ref_id=ref_id,
         initial_status="provider_inflight",
     )
     return reservation.id

@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "catalog_id": "astra-product-ia-1.12.0-r1",
+  "entries": [
+    {
+      "id": "work",
+      "route": "/work",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["工作台"], "en": ["Work"]}
+    },
+    {
+      "id": "work_detail",
+      "route": "/work/{task_id}",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["工作台", "任务详情"], "en": ["Work", "Task detail"]}
+    },
+    {
+      "id": "groups",
+      "route": "/groups",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["协作群组"], "en": ["Collaboration groups"]}
+    },
+    {
+      "id": "group_session",
+      "route": "/groups/{group_id}/{session_id}",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["协作群组", "群组会话"], "en": ["Collaboration groups", "Group session"]}
+    },
+    {
+      "id": "employees",
+      "route": "/employees",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["数字员工"], "en": ["Digital employees"]}
+    },
+    {
+      "id": "agent_chat",
+      "route": "/agents/{agent_id}/chat",
+      "access": "agent_use",
+      "breadcrumbs": {"zh-CN": ["数字员工", "员工消息"], "en": ["Digital employees", "Agent messages"]}
+    },
+    {
+      "id": "agent_settings",
+      "route": "/agents/{agent_id}/settings",
+      "access": "agent_manage",
+      "breadcrumbs": {"zh-CN": ["数字员工", "员工设置"], "en": ["Digital employees", "Agent settings"]}
+    },
+    {
+      "id": "dashboard",
+      "route": "/dashboard",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["公司概览"], "en": ["Company overview"]}
+    },
+    {
+      "id": "okr",
+      "route": "/okr",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["目标与复盘"], "en": ["Goals & reviews"]}
+    },
+    {
+      "id": "team_knowledge",
+      "route": "/plaza",
+      "access": "tenant_member",
+      "breadcrumbs": {"zh-CN": ["团队知识"], "en": ["Team knowledge"]}
+    },
+    {
+      "id": "company_admin",
+      "route": "/company-admin",
+      "access": "company_admin",
+      "breadcrumbs": {"zh-CN": ["公司管理"], "en": ["Company administration"]}
+    },
+    {
+      "id": "company_members",
+      "route": "/company-admin/members",
+      "access": "company_members_view",
+      "breadcrumbs": {"zh-CN": ["公司管理", "成员与邀请"], "en": ["Company administration", "Members & invitations"]}
+    },
+    {
+      "id": "company_agents",
+      "route": "/company-admin/agents",
+      "access": "company_agent_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "Agent 员工治理"], "en": ["Company administration", "Agent governance"]}
+    },
+    {
+      "id": "company_approvals",
+      "route": "/company-admin/approvals",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "权限与审批"], "en": ["Company administration", "Permissions & approvals"]}
+    },
+    {
+      "id": "company_integrations",
+      "route": "/company-admin/integrations/tools",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "企业知识与集成"], "en": ["Company administration", "Knowledge & integrations"]}
+    },
+    {
+      "id": "company_integration_tools",
+      "route": "/company-admin/integrations/tools",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "企业知识与集成", "工具与 MCP"], "en": ["Company administration", "Knowledge & integrations", "Tools & MCP"]}
+    },
+    {
+      "id": "company_integration_skills",
+      "route": "/company-admin/integrations/skills",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "企业知识与集成", "技能库"], "en": ["Company administration", "Knowledge & integrations", "Skills"]}
+    },
+    {
+      "id": "company_integration_org",
+      "route": "/company-admin/integrations/org",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "企业知识与集成", "组织同步"], "en": ["Company administration", "Knowledge & integrations", "Organization sync"]}
+    },
+    {
+      "id": "company_integration_accounts",
+      "route": "/company-admin/integrations/douyin",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "企业知识与集成", "外部账号"], "en": ["Company administration", "Knowledge & integrations", "External accounts"]}
+    },
+    {
+      "id": "company_billing",
+      "route": "/company-admin/billing",
+      "access": "company_billing_view",
+      "breadcrumbs": {"zh-CN": ["公司管理", "套餐、账单与用量"], "en": ["Company administration", "Plan, billing & usage"]}
+    },
+    {
+      "id": "company_market",
+      "route": "/company-admin/market",
+      "access": "company_billing_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "购买套餐与额度"], "en": ["Company administration", "Buy plans & credits"]}
+    },
+    {
+      "id": "company_audit",
+      "route": "/company-admin/audit",
+      "access": "company_audit_view",
+      "breadcrumbs": {"zh-CN": ["公司管理", "审计日志"], "en": ["Company administration", "Audit log"]}
+    },
+    {
+      "id": "company_settings",
+      "route": "/company-admin/settings",
+      "access": "company_settings_manage",
+      "breadcrumbs": {"zh-CN": ["公司管理", "公司设置"], "en": ["Company administration", "Company settings"]}
+    },
+    {
+      "id": "company_okr_ceo_settings",
+      "route": "/company-admin/settings/okr",
+      "access": "company_settings_manage_feature_gated",
+      "breadcrumbs": {"zh-CN": ["公司管理", "公司设置", "目标、复盘与公司 CEO"], "en": ["Company administration", "Company settings", "Objectives, reviews, and Company CEO"]}
+    },
+    {
+      "id": "company_ownership",
+      "route": "/company-admin/ownership",
+      "access": "company_owner",
+      "breadcrumbs": {"zh-CN": ["公司管理", "所有权与删除"], "en": ["Company administration", "Ownership & deletion"]}
+    },
+    {
+      "id": "account_companies",
+      "route": "/account/companies",
+      "access": "authenticated_user",
+      "breadcrumbs": {"zh-CN": ["账户", "公司与邀请"], "en": ["Account", "Companies & invitations"]}
+    },
+    {
+      "id": "account_security",
+      "route": "/account/security",
+      "access": "authenticated_user",
+      "breadcrumbs": {"zh-CN": ["账户", "账号安全"], "en": ["Account", "Account security"]}
+    }
+  ]
+}

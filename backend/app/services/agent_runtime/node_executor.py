@@ -21,6 +21,7 @@ from app.services.agent_runtime.state import (
     RuntimeStateUpdate,
     runtime_messages_as_json,
 )
+from app.services.agent_runtime.work_acceptance import evaluate_work_acceptance
 from app.services.llm.caller import (
     WRITE_FILE_PROTOCOL_FAILURE_MESSAGE,
     WRITE_FILE_PROTOCOL_REPAIR_COUNTER_KEY,
@@ -31,6 +32,9 @@ from app.services.llm.multimodal_content import parse_multimodal_content
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _WAITING_STATUSES = frozenset({"waiting_user", "waiting_external", "waiting_agent"})
+_INCOMPLETE_OUTPUT_CONTINUATION_LIMIT = 3
+_INCOMPLETE_OUTPUT_MAX_CHARS = 256_000
+_INCOMPLETE_OUTPUT_MIN_OVERLAP_CHARS = 24
 
 ModelIntent = Literal["tool_calls", "wait", "finish", "text", "error"]
 VerificationOutcome = Literal["pass", "repair", "fail"]
@@ -217,9 +221,25 @@ class DeterministicRuntimeVerifier:
                 reason="pending tool calls remain",
                 details={"code": "pending_tools"},
             )
+        acceptance = evaluate_work_acceptance(state, candidate)
+        if not acceptance.valid:
+            return VerificationResult(
+                outcome="fail",
+                reason="server-owned Work acceptance contract is malformed",
+                details=acceptance.details,
+            )
+        if not acceptance.passed:
+            return VerificationResult(
+                outcome="repair",
+                reason=acceptance.repair_reason,
+                details=acceptance.details,
+            )
         return VerificationResult(
             outcome="pass",
-            details={"code": "deterministic_checks_passed"},
+            details={
+                "code": "deterministic_checks_passed",
+                "work_acceptance": acceptance.details,
+            },
         )
 
 
@@ -349,6 +369,44 @@ def _model_protocol_repairs(lifecycle: RuntimeLifecycle) -> dict[str, int]:
             )
         repairs[code] = count
     return repairs
+
+
+def _incomplete_output_buffer(lifecycle: RuntimeLifecycle) -> str:
+    raw = lifecycle.get("incomplete_output_buffer", "")
+    if not isinstance(raw, str):
+        raise RuntimeNodeTransitionError(
+            "invalid_incomplete_output_buffer",
+            "checkpoint incomplete_output_buffer must be text",
+        )
+    return raw
+
+
+def _append_output_continuation(current: str, continuation: str) -> str | None:
+    """Join bounded provider continuations without duplicating an exact overlap."""
+    if not current:
+        merged = continuation
+    elif not continuation:
+        merged = current
+    else:
+        overlap = 0
+        if current.endswith(continuation):
+            overlap = len(continuation)
+        elif continuation.startswith(current):
+            overlap = len(current)
+        else:
+            max_overlap = min(len(current), len(continuation), 8192)
+            for length in range(
+                max_overlap,
+                _INCOMPLETE_OUTPUT_MIN_OVERLAP_CHARS - 1,
+                -1,
+            ):
+                if current.endswith(continuation[:length]):
+                    overlap = length
+                    break
+        merged = f"{current}{continuation[overlap:]}"
+    if len(merged) > _INCOMPLETE_OUTPUT_MAX_CHARS:
+        return None
+    return merged
 
 
 def _messages(state: RuntimeGraphState) -> list[JsonObject]:
@@ -687,6 +745,36 @@ class DeterministicRuntimeNodeExecutor:
                     "invalid_model_intent",
                     "finish intent requires non-empty content",
                 )
+            final_answer = _append_output_continuation(
+                _incomplete_output_buffer(lifecycle),
+                result.finish_content,
+            )
+            if final_answer is None:
+                lifecycle.pop("pending_group_at", None)
+                lifecycle.update(
+                    {
+                        "status": "failed",
+                        "next_route": "terminal",
+                        "reason": "model_incomplete_output",
+                        "pending_tool_calls": [],
+                        "error": _error(
+                            "model_incomplete_output",
+                            "The bounded output continuation exceeded the safe storage limit.",
+                        ),
+                    }
+                )
+                update: RuntimeStateUpdate = {
+                    "lifecycle": cast(RuntimeLifecycle, lifecycle),
+                }
+                if new_messages:
+                    update["messages"] = [
+                        _message_for_channel(message) for message in new_messages
+                    ]
+                return update
+            # The graph wrapper merges nested lifecycle updates. An explicit
+            # empty value is required here so a verification repair cannot
+            # resurrect and prepend the completed continuation buffer.
+            lifecycle["incomplete_output_buffer"] = ""
             finish_delivery_intent = result.finish_delivery_intent
             if finish_delivery_intent is not None and not isinstance(
                 finish_delivery_intent,
@@ -700,7 +788,7 @@ class DeterministicRuntimeNodeExecutor:
                 {
                     "status": "verifying",
                     "next_route": "verify",
-                    "final_answer": result.finish_content,
+                    "final_answer": final_answer,
                     "finish_delivery_intent": (
                         dict(finish_delivery_intent)
                         if finish_delivery_intent is not None
@@ -725,6 +813,8 @@ class DeterministicRuntimeNodeExecutor:
                 repair_limit = (
                     WRITE_FILE_PROTOCOL_REPAIR_LIMIT
                     if is_write_file_repair
+                    else _INCOMPLETE_OUTPUT_CONTINUATION_LIMIT
+                    if repair_code == "incomplete_output"
                     else 1
                 )
                 repair_counter_key = (
@@ -742,7 +832,8 @@ class DeterministicRuntimeNodeExecutor:
                         error_message = WRITE_FILE_PROTOCOL_FAILURE_MESSAGE
                     elif repair_code == "incomplete_output":
                         error_message = (
-                            "The model output remained truncated after one bounded repair."
+                            "The model output remained truncated after "
+                            f"{repair_limit} bounded continuation attempts."
                         )
                     elif repair_code == "empty_output":
                         error_message = (
@@ -768,6 +859,49 @@ class DeterministicRuntimeNodeExecutor:
                         }
                     )
                 else:
+                    if repair_code == "incomplete_output":
+                        raw_fragment = (
+                            result.assistant_message.get("content")
+                            if result.assistant_message is not None
+                            else ""
+                        )
+                        fragment = (
+                            raw_fragment
+                            if isinstance(raw_fragment, str)
+                            and raw_fragment.strip()
+                            else ""
+                        )
+                        combined = _append_output_continuation(
+                            _incomplete_output_buffer(lifecycle),
+                            fragment,
+                        )
+                        if combined is None:
+                            lifecycle.pop("pending_group_at", None)
+                            lifecycle.update(
+                                {
+                                    "status": "failed",
+                                    "next_route": "terminal",
+                                    "reason": "model_incomplete_output",
+                                    "pending_tool_calls": [],
+                                    "error": _error(
+                                        "model_incomplete_output",
+                                        (
+                                            "The bounded output continuation exceeded "
+                                            "the safe storage limit."
+                                        ),
+                                    ),
+                                }
+                            )
+                            update = {
+                                "lifecycle": cast(RuntimeLifecycle, lifecycle),
+                            }
+                            if new_messages:
+                                update["messages"] = [
+                                    _message_for_channel(message)
+                                    for message in new_messages
+                                ]
+                            return update
+                        lifecycle["incomplete_output_buffer"] = combined
                     repairs[repair_counter_key] = (
                         repairs.get(repair_counter_key, 0) + 1
                     )

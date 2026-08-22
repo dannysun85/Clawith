@@ -22,6 +22,7 @@ from app.services.agent_runtime.tool_result_store import (
     ToolResultStore,
     ToolResultStoreError,
 )
+from app.services.agent_runtime.work_acceptance import evaluate_work_acceptance
 from app.services.storage import agent_storage_key, get_storage_backend
 from app.services.storage_runtime.base import StorageBackend
 from app.services.workspace_collaboration import normalize_workspace_path
@@ -30,6 +31,20 @@ from app.services.workspace_collaboration import normalize_workspace_path
 ReferenceExists = Callable[[str, uuid.UUID, uuid.UUID], Awaitable[bool]]
 _STABLE_REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DELIVERABLE_WORKSPACE_PATH_RE = re.compile(
+    r"workspace/deliverables/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/"
+    r"[\w./-]+",
+    flags=re.IGNORECASE,
+)
+_ARTIFACT_COMPLETION_CLAIM_RE = re.compile(
+    r"(?:"
+    r"已(?:由|经|通过)?.{0,40}?(?:生成|创建|写入|转换|导出|制作)"
+    r"|(?:has\s+been|was|is\s+now|successfully)\s+"
+    r"(?:generated|created|written|converted|rendered|exported)"
+    r")",
+    flags=re.IGNORECASE,
+)
 _HTTP_EVIDENCE_TOOL_NAMES = frozenset(
     {"read_webpage", "upload_image", "publish_page"}
 )
@@ -44,6 +59,37 @@ def _refs(metadata: object, field: str) -> tuple[str, ...] | None:
     if any(not isinstance(item, str) or not item.strip() for item in value):
         return None
     return tuple(str(item).strip() for item in value)
+
+
+def _unverified_deliverable_completion_paths(
+    candidate: str,
+    artifact_refs: Sequence[str],
+) -> tuple[str, ...]:
+    """Find positive file-creation claims not backed by this Run's receipts.
+
+    Historical chat can contain an earlier ``DELIVERABLE_REQUEST`` and Tool
+    transcript. A later ordinary chat turn must not reuse that history to
+    claim that the same file was generated again. Only artifact references
+    emitted by successful Tool executions in the current Run can substantiate
+    a positive creation or conversion claim.
+    """
+
+    if _ARTIFACT_COMPLETION_CLAIM_RE.search(candidate) is None:
+        return ()
+    claimed_paths = tuple(
+        dict.fromkeys(
+            match.group(0).rstrip(".,;:!?，。；：！？)]}")
+            for match in _DELIVERABLE_WORKSPACE_PATH_RE.finditer(candidate)
+        )
+    )
+    if not claimed_paths:
+        return ()
+    normalized_refs = tuple(reference.casefold() for reference in artifact_refs)
+    return tuple(
+        path
+        for path in claimed_paths
+        if not any(path.casefold() in reference for reference in normalized_refs)
+    )
 
 
 def _delivery_receipts(
@@ -771,6 +817,26 @@ class ToolLedgerRuntimeVerifier:
 
         artifact_refs = list(dict.fromkeys(artifact_refs))
         evidence_refs = list(dict.fromkeys(evidence_refs))
+        unverified_completion_paths = _unverified_deliverable_completion_paths(
+            candidate,
+            artifact_refs,
+        )
+        if unverified_completion_paths:
+            return VerificationResult(
+                outcome="repair",
+                reason=(
+                    "Do not claim that a deliverable was generated, converted, or written "
+                    "unless this Run has a successful Tool artifact receipt for the exact "
+                    "workspace path. If the file belongs to an archived request, explain "
+                    "that a new formal Deliverable Request is required."
+                ),
+                details={
+                    "code": "deliverable_completion_receipt_missing",
+                    "claimed_paths": list(unverified_completion_paths),
+                    "artifact_refs": artifact_refs,
+                    "tool_receipts": tool_receipts,
+                },
+            )
         if delegation_contract is not None:
             succeeded_tools = {
                 execution.tool_name
@@ -866,6 +932,30 @@ class ToolLedgerRuntimeVerifier:
                         },
                     )
 
+        acceptance = evaluate_work_acceptance(
+            state,
+            candidate,
+            evidence_refs=evidence_refs,
+        )
+        if not acceptance.valid:
+            return VerificationResult(
+                outcome="fail",
+                reason="server-owned Work acceptance contract is malformed",
+                details=acceptance.details,
+            )
+        if not acceptance.passed:
+            return VerificationResult(
+                outcome="repair",
+                reason=acceptance.repair_reason,
+                details={
+                    **acceptance.details,
+                    "artifact_refs": artifact_refs,
+                    "evidence_refs": evidence_refs,
+                    "tool_receipts": tool_receipts,
+                    "delivery_receipts": delivery_receipts,
+                },
+            )
+
         return VerificationResult(
             outcome="pass",
             details={
@@ -879,6 +969,7 @@ class ToolLedgerRuntimeVerifier:
                     if delegation_contract is not None
                     else None
                 ),
+                "work_acceptance": acceptance.details,
             },
         )
 

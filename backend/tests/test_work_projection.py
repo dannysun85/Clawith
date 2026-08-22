@@ -1,9 +1,11 @@
+from datetime import UTC, datetime
 import uuid
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
+from app.api import work as work_api
 from app.api.work import (
     _build_work_statement,
     _confirmation_fingerprint,
@@ -11,9 +13,31 @@ from app.api.work import (
     get_work_task,
 )
 from app.core.permissions import is_agent_executable
-from app.schemas.work import WorkTaskCreate, WorkTaskPreflight
-from app.services.work_projection import project_execution_status, project_user_stage
+from app.schemas.work import WorkTaskCreate, WorkTaskPreflight, WorkTaskResultReview
+from app.services.work_projection import (
+    project_execution_status,
+    project_task_result_review_status,
+    project_user_stage,
+)
 from app.services.work_deliverable_contract import work_task_deliverable_contract
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
+class _SingleQueryDb:
+    def __init__(self, value):
+        self.value = value
+        self.query_count = 0
+
+    async def execute(self, _statement):
+        self.query_count += 1
+        return _ScalarResult(self.value)
 
 
 def test_task_done_is_completed_work_not_formal_delivery() -> None:
@@ -27,6 +51,62 @@ def test_task_done_is_completed_work_not_formal_delivery() -> None:
         artifact_status=None,
         review_status=None,
     ) == "completed"
+
+
+@pytest.mark.asyncio
+async def test_result_review_idempotency_survives_a_later_retry_state(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    request = WorkTaskResultReview(
+        run_id=run_id,
+        action="request_changes",
+        comment="补充可量化上线门槛",
+        client_request_id=uuid.uuid4(),
+    )
+    task = SimpleNamespace(
+        id=task_id,
+        tenant_id=tenant_id,
+        created_by=user_id,
+        status="doing",
+        work_statement={
+            "acceptance_contract": {
+                "version": 1,
+                "criteria": ["方案可执行"],
+                "owner_review_required": True,
+            }
+        },
+    )
+    receipt = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        run_id=run_id,
+        actor_user_id=user_id,
+        request_fingerprint=work_api._task_result_review_fingerprint(request),
+        action="request_changes",
+        comment="补充可量化上线门槛",
+        created_at=datetime.now(UTC),
+    )
+    db = _SingleQueryDb(receipt)
+
+    async def owned_task(*_args, **_kwargs):
+        return task
+
+    monkeypatch.setattr(work_api, "_owned_work_task", owned_task)
+
+    result = await work_api.review_work_task_result(
+        task_id,
+        request,
+        current_user=SimpleNamespace(id=user_id, tenant_id=tenant_id),
+        db=db,  # type: ignore[arg-type]
+    )
+
+    assert result.created is False
+    assert result.receipt.run_id == run_id
+    assert db.query_count == 1
 
 
 def test_formal_delivery_requires_succeeded_request_and_approved_artifact() -> None:
@@ -324,6 +404,50 @@ def test_creative_work_statement_preserves_task_only_boundary() -> None:
     assert statement["delivery_mode"] == "task_only"
     assert statement["expected_output"] == "confirmed_video_brief"
     assert statement["cost"]["formal_media_requires_separate_preflight"] is True
+
+
+def test_completed_work_requires_owner_approval_before_business_completion() -> None:
+    statement = {
+        "acceptance_contract": {
+            "version": 1,
+            "owner_review_required": True,
+        }
+    }
+    pending = project_task_result_review_status(
+        task_status="done",
+        work_statement=statement,
+        receipt_action=None,
+    )
+    approved = project_task_result_review_status(
+        task_status="done",
+        work_statement=statement,
+        receipt_action="approve",
+    )
+    changes = project_task_result_review_status(
+        task_status="done",
+        work_statement=statement,
+        receipt_action="request_changes",
+    )
+
+    assert pending == "pending"
+    assert approved == "approved"
+    assert changes == "request_changes"
+    assert project_user_stage(
+        task_status="done",
+        execution_status="completed",
+        deliverable_status=None,
+        artifact_status=None,
+        review_status=None,
+        task_result_review_status=pending,
+    ) == "review"
+    assert project_user_stage(
+        task_status="done",
+        execution_status="completed",
+        deliverable_status=None,
+        artifact_status=None,
+        review_status=None,
+        task_result_review_status=changes,
+    ) == "blocked"
 
 
 def test_idle_native_agent_is_available_for_workbench_execution() -> None:

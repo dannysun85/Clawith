@@ -38,6 +38,13 @@ const draft: PersistedWorkDraft = {
     groupId: 'group-1',
     groupSessionId: 'session-1',
     groupAgentParticipantIds: ['participant-1', 'participant-2'],
+    acceptanceCriteria: 'The brief is decision-ready.',
+    requiredSections: 'Recommendation',
+    forbiddenTerms: '',
+    minimumLength: '300',
+    maximumLength: '900',
+    lengthUnit: 'words',
+    evidenceRequired: true,
     clientRequestId: 'c3f0fcd5-f85c-4b03-9bb7-275cd5f2f2b4',
 };
 

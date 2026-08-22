@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
@@ -21,7 +21,7 @@ const AXIS_LABELS: Record<keyof WorkStatusAxes, { zh: string; en: string }> = {
     artifact: { zh: '产物版本', en: 'Artifact' },
     quality: { zh: '质量检查', en: 'Quality' },
     runtime_approval: { zh: '运行期审批', en: 'Runtime approval' },
-    delivery_approval: { zh: '业务批准', en: 'Delivery approval' },
+    delivery_approval: { zh: '正式交付批准', en: 'Delivery approval' },
     delivery: { zh: '正式交付', en: 'Delivery' },
 };
 
@@ -87,8 +87,10 @@ function outcomeNotificationLabel(status: string, isChinese: boolean) {
 function actionLabel(action: WorkNextAction, isChinese: boolean) {
     const labels: Record<WorkNextAction['kind'], { zh: string; en: string }> = {
         quality_review: { zh: '提交质量检查', en: 'Submit quality review' },
+        task_result_review: { zh: '验收任务结果', en: 'Review task result' },
         runtime_approval: { zh: '处理运行期审批', en: 'Review Runtime approval' },
-        delivery_approval: { zh: '批准或要求修改', en: 'Approve or request changes' },
+        delivery_approval: { zh: '批准交付或要求修改', en: 'Approve or request changes' },
+        tool_reconciliation: { zh: '核对工具执行结果', en: 'Reconcile tool outcome' },
         task_recovery: { zh: '重试任务', en: 'Retry task' },
         delivery_recovery: { zh: '处理交付阻塞', en: 'Resolve delivery issue' },
     };
@@ -104,6 +106,10 @@ export default function WorkDetail() {
     const queryClient = useQueryClient();
     const toast = useToast();
     const retryRequestId = useRef(createRandomUUID());
+    const reviewRequestId = useRef(createRandomUUID());
+    const reconciliationRequestId = useRef(createRandomUUID());
+    const [reviewComment, setReviewComment] = useState('');
+    const [reconciliationNotes, setReconciliationNotes] = useState<Record<string, string>>({});
     const detailQuery = useQuery({
         queryKey: ['work-detail', user?.id, user?.tenant_id, taskId],
         queryFn: () => workApi.getTaskDetail(taskId!),
@@ -129,6 +135,64 @@ export default function WorkDetail() {
         },
         onError: (error: any) => {
             toast.error(isChinese ? '任务重试失败' : 'Could not retry the task', {
+                details: error?.message || String(error),
+            });
+        },
+    });
+    const reviewTaskResult = useMutation({
+        mutationFn: ({ runId, action }: { runId: string; action: 'approve' | 'request_changes' }) => workApi.reviewTaskResult(taskId!, {
+            run_id: runId,
+            action,
+            ...(reviewComment.trim() ? { comment: reviewComment.trim() } : {}),
+            client_request_id: reviewRequestId.current,
+        }),
+        onSuccess: async ({ receipt }) => {
+            reviewRequestId.current = createRandomUUID();
+            setReviewComment('');
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['work-detail'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-index'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-inbox'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-inbox-count'] }),
+            ]);
+            toast.success(receipt.action === 'approve'
+                ? (isChinese ? '业务验收已通过' : 'Business result approved')
+                : (isChinese ? '修改要求已记录，可发起新的执行尝试' : 'Changes recorded; a new attempt can be started'));
+        },
+        onError: (error: any) => {
+            toast.error(isChinese ? '无法提交业务验收' : 'Could not submit the business review', {
+                details: error?.message || String(error),
+            });
+        },
+    });
+    const reconcileToolExecution = useMutation({
+        mutationFn: ({ action, outcome }: {
+            action: WorkNextAction;
+            outcome: 'applied' | 'not_applied';
+        }) => workApi.reconcileToolExecution(taskId!, action.source_id, {
+            outcome,
+            note: (reconciliationNotes[action.id] || '').trim(),
+            client_request_id: reconciliationRequestId.current,
+        }),
+        onSuccess: async ({ execution_status }, { action }) => {
+            reconciliationRequestId.current = createRandomUUID();
+            setReconciliationNotes((current) => {
+                const next = { ...current };
+                delete next[action.id];
+                return next;
+            });
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['work-detail'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-index'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-inbox'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-inbox-count'] }),
+            ]);
+            toast.success(execution_status === 'succeeded'
+                ? (isChinese ? '已确认工具操作生效，任务将继续且不会重复执行' : 'Outcome confirmed; the task will continue without repeating the operation')
+                : (isChinese ? '已确认工具操作未生效，任务将依据失败事实继续' : 'Not-applied outcome recorded; the task will continue from the failed fact'));
+        },
+        onError: (error: any) => {
+            toast.error(isChinese ? '无法提交工具结果核对' : 'Could not reconcile the tool outcome', {
                 details: error?.message || String(error),
             });
         },
@@ -159,6 +223,21 @@ export default function WorkDetail() {
             return;
         }
         navigate(action.action_url);
+    };
+    const submitToolReconciliation = (
+        action: WorkNextAction,
+        outcome: 'applied' | 'not_applied',
+    ) => {
+        const note = (reconciliationNotes[action.id] || '').trim();
+        if (!note) return;
+        const confirmed = window.confirm(outcome === 'applied'
+            ? (isChinese
+                ? '确认该工具操作已经生效？提交后任务会继续，并禁止重复执行这次操作。'
+                : 'Confirm that this operation took effect? The task will continue without repeating it.')
+            : (isChinese
+                ? '确认该工具操作没有生效？提交后任务会记录失败事实并继续判断是否需要新操作。'
+                : 'Confirm that this operation did not take effect? The task will continue from the failed fact.'));
+        if (confirmed) reconcileToolExecution.mutate({ action, outcome });
     };
 
     return (
@@ -222,18 +301,89 @@ export default function WorkDetail() {
                     </div>
                     <div className="work-action-list">
                         {detail.next_actions.map((action) => (
-                            <button
-                                type="button"
-                                key={action.id}
-                                onClick={() => runAction(action)}
-                                disabled={action.kind === 'task_recovery' && retryTask.isPending}
-                            >
-                                <div>
-                                    <strong>{actionLabel(action, isChinese)}</strong>
-                                    <span>{action.reason_code}</span>
+                            action.kind === 'task_result_review' ? (
+                                <div className="work-result-review" key={action.id}>
+                                    <div>
+                                        <strong>{actionLabel(action, isChinese)}</strong>
+                                        <span>{isChinese
+                                            ? '请对照创建任务时确认的验收标准检查真实结果。通过后才算业务完成；不符合时必须说明修改要求。'
+                                            : 'Check the real result against the criteria confirmed at creation. It is only business-complete after approval; explain any requested changes.'}</span>
+                                    </div>
+                                    <textarea
+                                        value={reviewComment}
+                                        onChange={(event) => setReviewComment(event.target.value)}
+                                        placeholder={isChinese ? '修改说明（要求修改时必填）' : 'Change instructions (required when requesting changes)'}
+                                        maxLength={2000}
+                                        rows={3}
+                                    />
+                                    <div className="work-result-review-actions">
+                                        <button
+                                            type="button"
+                                            onClick={() => reviewTaskResult.mutate({ runId: action.source_id, action: 'request_changes' })}
+                                            disabled={!reviewComment.trim() || reviewTaskResult.isPending}
+                                        >
+                                            {isChinese ? '要求修改' : 'Request changes'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className="is-primary"
+                                            onClick={() => reviewTaskResult.mutate({ runId: action.source_id, action: 'approve' })}
+                                            disabled={reviewTaskResult.isPending}
+                                        >
+                                            {isChinese ? '验收通过' : 'Approve result'}
+                                        </button>
+                                    </div>
                                 </div>
-                                <IconArrowRight size={17} />
-                            </button>
+                            ) : action.kind === 'tool_reconciliation' ? (
+                                <div className="work-result-review" key={action.id}>
+                                    <div>
+                                        <strong>{actionLabel(action, isChinese)}</strong>
+                                        <span>{isChinese
+                                            ? '系统无法确定一个有副作用的工具操作是否真正生效。请先到目标系统核对，再明确选择；在你确认前不会重复执行。'
+                                            : 'The system cannot prove whether a side-effecting operation took effect. Check the target system first; it will not be repeated before your decision.'}</span>
+                                    </div>
+                                    <textarea
+                                        value={reconciliationNotes[action.id] || ''}
+                                        onChange={(event) => setReconciliationNotes((current) => ({
+                                            ...current,
+                                            [action.id]: event.target.value,
+                                        }))}
+                                        placeholder={isChinese ? '填写你在目标系统中核对到的事实（必填）' : 'Describe the fact you verified in the target system (required)'}
+                                        maxLength={2000}
+                                        rows={3}
+                                    />
+                                    <div className="work-result-review-actions">
+                                        <button
+                                            type="button"
+                                            onClick={() => submitToolReconciliation(action, 'not_applied')}
+                                            disabled={!(reconciliationNotes[action.id] || '').trim() || reconcileToolExecution.isPending}
+                                        >
+                                            {isChinese ? '确认未生效，可继续' : 'Not applied; continue'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className="is-primary"
+                                            onClick={() => submitToolReconciliation(action, 'applied')}
+                                            disabled={!(reconciliationNotes[action.id] || '').trim() || reconcileToolExecution.isPending}
+                                        >
+                                            {isChinese ? '确认已生效，继续' : 'Applied; continue'}
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : (
+                                <button
+                                    type="button"
+                                    key={action.id}
+                                    onClick={() => runAction(action)}
+                                    disabled={action.kind === 'task_recovery' && retryTask.isPending}
+                                >
+                                    <div>
+                                        <strong>{actionLabel(action, isChinese)}</strong>
+                                        <span>{action.reason_code}</span>
+                                    </div>
+                                    <IconArrowRight size={17} />
+                                </button>
+                            )
                         ))}
                     </div>
                 </section>

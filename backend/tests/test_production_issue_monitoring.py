@@ -58,6 +58,12 @@ def test_monitor_metadata_is_allowlisted_and_credentials_are_redacted():
             "api_key": "should-not-survive",
             "token": "should-not-survive",
             "status_code": 503,
+            "origin_host": "opc.rama-server.com",
+            "visibility_state": "visible",
+            "lifecycle_state": "active",
+            "online": True,
+            "signal_kind": "http_response",
+            "release_version": "1.12.0+20260822.1245",
         }
     )
 
@@ -67,6 +73,12 @@ def test_monitor_metadata_is_allowlisted_and_credentials_are_redacted():
         "error_type": "[redacted]",
         "model": "[redacted]",
         "status_code": 503,
+        "origin_host": "opc.rama-server.com",
+        "visibility_state": "visible",
+        "lifecycle_state": "active",
+        "online": True,
+        "signal_kind": "http_response",
+        "release_version": "1.12.0+20260822.1245",
     }
 
 
@@ -106,11 +118,51 @@ def test_client_report_contract_rejects_message_and_identity_fields():
             "error_code": "http_500",
             "route": "/api/customer private prompt",
         },
+        {
+            "category": "api",
+            "error_code": "TypeError",
+            "metadata": {"origin_host": "https://example.com/private/path"},
+        },
+        {
+            "category": "api",
+            "error_code": "TypeError",
+            "metadata": {"visibility_state": "visible customer private prompt"},
+        },
     ],
 )
 def test_client_report_contract_rejects_free_form_diagnostic_text(payload):
     with pytest.raises(ValidationError):
         ClientIssueReportIn.model_validate(payload)
+
+
+def test_client_report_contract_accepts_bounded_browser_context():
+    report = ClientIssueReportIn.model_validate(
+        {
+            "category": "api",
+            "error_code": "TypeError",
+            "route": "/api/auth/me",
+            "operation": "GET",
+            "metadata": {
+                "component": "fetch",
+                "origin_host": "opc.rama-server.com",
+                "visibility_state": "hidden",
+                "lifecycle_state": "active",
+                "online": False,
+                "signal_kind": "fetch_rejected",
+                "release_version": "1.12.0+20260822.1245",
+            },
+        }
+    )
+
+    assert report.metadata.model_dump(exclude_none=True) == {
+        "component": "fetch",
+        "release_version": "1.12.0+20260822.1245",
+        "origin_host": "opc.rama-server.com",
+        "visibility_state": "hidden",
+        "lifecycle_state": "active",
+        "online": False,
+        "signal_kind": "fetch_rejected",
+    }
 
 
 def test_client_report_contract_accepts_agent_context_but_not_tenant_override():

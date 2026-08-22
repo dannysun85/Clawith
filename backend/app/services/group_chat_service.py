@@ -195,8 +195,16 @@ async def _invitable_participant(
     tenant_id: uuid.UUID,
     actor: Participant,
     participant_id: uuid.UUID,
+    allow_system_agent: bool = False,
 ) -> Participant:
-    """Validate an invite target, including Agent visibility for the inviter."""
+    """Validate an invite target, including Agent visibility for the inviter.
+
+    Ordinary user-managed Groups accept employee Agents only.  System Agents
+    are platform roles and do not consume employee seats, so exposing them here
+    would let a tenant appear to bypass the commercial seat boundary.  The CEO
+    meeting-room service is the sole current internal caller that explicitly
+    opts into a governed system-Agent Group.
+    """
     target = await _valid_participant(
         db,
         tenant_id=tenant_id,
@@ -217,7 +225,17 @@ async def _invitable_participant(
         )
     )
     target_agent = target_agent_result.scalar_one_or_none()
-    if target_agent is None or not await can_use_agent(db, actor_user, target_agent):
+    if target_agent is None:
+        raise GroupChatServiceError(
+            "group_participant_invalid",
+            "Agent is not visible to the inviting member",
+        )
+    if target_agent.is_system and not allow_system_agent:
+        raise GroupChatServiceError(
+            "group_participant_invalid",
+            "System Agents cannot join an ordinary group",
+        )
+    if not await can_use_agent(db, actor_user, target_agent):
         raise GroupChatServiceError(
             "group_participant_invalid",
             "Agent is not visible to the inviting member",
@@ -383,6 +401,7 @@ async def create_group(
     name: str,
     description: str | None = None,
     member_participant_ids: Sequence[uuid.UUID] = (),
+    allow_system_agents: bool = False,
 ) -> Group:
     """Create a group and its initial manager without owning the transaction."""
     normalized_name = _required_text(
@@ -413,6 +432,7 @@ async def create_group(
             tenant_id=tenant_id,
             actor=creator,
             participant_id=participant_id,
+            allow_system_agent=allow_system_agents,
         )
 
     now = _now()
@@ -692,6 +712,7 @@ async def _member_candidates(
             actor_user,
             tenant_id=tenant_id,
         ).where(
+            Agent.is_system.is_(False),
             Agent.access_mode != "private",
             Agent.status.in_(_ACTIVE_AGENT_STATUSES),
             Agent.is_expired.is_(False),

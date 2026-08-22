@@ -138,6 +138,6 @@ def test_migration_keeps_a_single_alembic_head() -> None:
         for parent in ((down,) if isinstance(down, str) else (down or ()))
     }
     heads = sorted(set(revisions) - referenced)
-    assert heads == ["manual_order_decisions"], (
+    assert heads == ["planning_cost_controls"], (
         f"expected a single head, found {heads}"
     )

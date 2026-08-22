@@ -1084,6 +1084,47 @@ print("candidate_closed_feature_contract=ok")
 '
 }
 
+inspect_candidate_planning_cost_contract() {
+    local backend_id="$1"
+
+    docker inspect -f \
+        '{{range .Config.Env}}{{if or (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_TENANT_DAY") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_MAX_CALLS_PER_TENANT_DAY") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_UNPRICED_RESERVATION_CREDITS") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_INFLIGHT_STALE_SECONDS") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_RECONCILIATION_SCAN_SECONDS") (eq (index (split . "=") 0) "PLANNING_SYSTEM_COST_RECONCILIATION_BATCH_SIZE")}}{{println .}}{{end}}{{end}}' \
+        "$backend_id" | python3 -c '
+import sys
+
+expected = {
+    "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN": "3000",
+    "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_TENANT_DAY": "20000",
+    "PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN": "5",
+    "PLANNING_SYSTEM_COST_MAX_CALLS_PER_TENANT_DAY": "100",
+    "PLANNING_SYSTEM_COST_UNPRICED_RESERVATION_CREDITS": "1000",
+    "PLANNING_SYSTEM_COST_INFLIGHT_STALE_SECONDS": "600",
+    "PLANNING_SYSTEM_COST_RECONCILIATION_SCAN_SECONDS": "60",
+    "PLANNING_SYSTEM_COST_RECONCILIATION_BATCH_SIZE": "100",
+}
+raw = sys.stdin.read(8_193)
+if len(raw) > 8_192:
+    raise SystemExit("candidate Planning cost contract output is too large")
+actual = {key: [] for key in expected}
+for line in raw.splitlines():
+    key, separator, value = line.partition("=")
+    if separator and key in actual:
+        actual[key].append(value)
+if any(len(values) != 1 for values in actual.values()):
+    raise SystemExit("candidate Planning cost contract is missing or duplicated")
+drift = {
+    key: values[0]
+    for key, values in actual.items()
+    if values[0] != expected[key]
+}
+if drift:
+    raise SystemExit(
+        "candidate Planning cost contract drifted: " + ",".join(sorted(drift))
+    )
+print("candidate_planning_cost_contract=ok")
+'
+}
+
 inspect_rollback_worker_runtime_identity() {
     local worker_id="$1"
 
@@ -5104,6 +5145,14 @@ updates = {
     "AGENT_RUNTIME_V2_AGENT_IDS": "",
     "AGENT_RUNTIME_V2_SOURCE_TYPES": "",
     "AGENT_RUNTIME_COMMAND_CONCURRENCY": "10",
+    "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_RUN": "3000",
+    "PLANNING_SYSTEM_COST_MAX_CREDITS_PER_TENANT_DAY": "20000",
+    "PLANNING_SYSTEM_COST_MAX_CALLS_PER_RUN": "5",
+    "PLANNING_SYSTEM_COST_MAX_CALLS_PER_TENANT_DAY": "100",
+    "PLANNING_SYSTEM_COST_UNPRICED_RESERVATION_CREDITS": "1000",
+    "PLANNING_SYSTEM_COST_INFLIGHT_STALE_SECONDS": "600",
+    "PLANNING_SYSTEM_COST_RECONCILIATION_SCAN_SECONDS": "60",
+    "PLANNING_SYSTEM_COST_RECONCILIATION_BATCH_SIZE": "100",
     "CEO_ORCHESTRATOR_ENABLED": "false",
     "CEO_ORCHESTRATOR_TENANT_IDS": "",
     "CEO_ORCHESTRATOR_AGENT_IDS": "",
@@ -5676,6 +5725,10 @@ test "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{
 echo "[remote] verifying candidate closed-feature contract"
 if ! inspect_candidate_closed_feature_contract "$CANDIDATE_BACKEND_ID"; then
     abort_release "candidate CEO or Creative V2 rollout contract is not closed"
+fi
+echo "[remote] verifying candidate Planning system-cost contract"
+if ! inspect_candidate_planning_cost_contract "$CANDIDATE_BACKEND_ID"; then
+    abort_release "candidate Planning system-cost contract drifted"
 fi
 echo "[remote] recording identity-free production governance inventory"
 GOVERNANCE_INVENTORY_TEMP="$(

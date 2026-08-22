@@ -912,6 +912,63 @@ async def test_verifier_uses_invocation_context_without_checkpoint_registry() ->
     assert passed.details["code"] == "deterministic_checks_passed"
 
 
+@pytest.mark.asyncio
+async def test_verifier_blocks_stale_deliverable_completion_claim_without_current_receipt() -> None:
+    tenant_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    path = f"workspace/deliverables/{request_id}/result.pptx"
+    verifier = ToolLedgerRuntimeVerifier(
+        session_factory=_factory(_ManyResult([])),
+    )
+
+    blocked = await verifier.verify(
+        _state(tenant_id, run_id),
+        _context(tenant_id, run_id),
+        f"本地正式交付文件已由内置转换工具生成：{path}。请以 Astra 的产物校验为准。",
+    )
+
+    assert blocked.outcome == "repair"
+    assert blocked.details == {
+        "code": "deliverable_completion_receipt_missing",
+        "claimed_paths": [path],
+        "artifact_refs": [],
+        "tool_receipts": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_verifier_accepts_deliverable_completion_claim_with_exact_current_receipt() -> None:
+    tenant_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    path = f"workspace/deliverables/{request_id}/result.pptx"
+    execution = _execution(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        status="succeeded",
+        tool_name="convert_html_to_pptx",
+    )
+    execution.result_metadata = {
+        "artifact_refs": [f"workspace://{agent_id}/{path}"],
+        "evidence_refs": [],
+    }
+    verifier = ToolLedgerRuntimeVerifier(
+        session_factory=_factory(_ManyResult([execution])),
+        reference_exists=lambda ref, tenant, run: _true_reference(ref, tenant, run),
+    )
+
+    passed = await verifier.verify(
+        _state(tenant_id, run_id),
+        _context(tenant_id, run_id),
+        f"本地正式交付文件已由内置转换工具生成：{path}。",
+    )
+
+    assert passed.outcome == "pass"
+    assert passed.details["artifact_refs"] == [f"workspace://{agent_id}/{path}"]
+
+
 def _server_delegation_contract(
     *,
     source_agent_id: uuid.UUID,

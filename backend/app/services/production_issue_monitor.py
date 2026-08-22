@@ -71,6 +71,11 @@ _ALLOWED_METADATA_KEYS = {
     "column",
     "close_code",
     "release_version",
+    "origin_host",
+    "visibility_state",
+    "lifecycle_state",
+    "online",
+    "signal_kind",
     "active_credentials",
     "credentials_with_provider_evidence",
 }
