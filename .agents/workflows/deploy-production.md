@@ -23,7 +23,11 @@
 3. 锁定 Python `dev` extra 后运行后端全量 pytest，前端先 `npm ci` 再运行测试与
    `npm run build`；部署契约测试、Ruff Git
    基线差异检查（不得新增 violation）和 `git diff --check` 全部通过。历史存量
-   Ruff 告警不作为本次伪失败，但新增文件或新增问题必须阻断发布。
+   Ruff 告警不作为本次伪失败，但新增文件或新增问题必须阻断发布。测试结论必须
+   以发布前当次实测为准：pytest `lastfailed`、`.pytest_cache` 等缓存记录可能
+   含有已重命名/已删除用例的"幽灵失败"（用例 ID 在当前代码树中不存在），
+   不得作为发布判断依据；发现缓存记录与实测矛盾时，先清除缓存再实测，并以
+   实测结果为准。多 worktree、多 pytest 版本混跑后必须清理 `.pytest_cache`。
 4. 至少完成一次独立 code review 和 architecture review；存在 `REQUEST CHANGES`
    或 `BLOCKED` 时禁止打发布标签或部署。
 5. 本地 Git 保存候选提交和证据；本项目不要求把代码上传 GitHub。
