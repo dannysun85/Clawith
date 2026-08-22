@@ -28,6 +28,10 @@ const login = readFileSync(new URL('../src/pages/Login.tsx', import.meta.url), '
 const enterpriseSettings = readFileSync(new URL('../src/pages/EnterpriseSettings.tsx', import.meta.url), 'utf8');
 const channelConfig = readFileSync(new URL('../src/components/ChannelConfig.tsx', import.meta.url), 'utf8');
 const saasAdmin = readFileSync(new URL('../src/pages/SaasAdmin.tsx', import.meta.url), 'utf8');
+const subscriptionDetail = readFileSync(
+  new URL('../src/pages/SubscriptionDetail.tsx', import.meta.url),
+  'utf8',
+);
 const ceoCard = readFileSync(
   new URL('../src/pages/enterprise-settings/tabs/CeoCard.tsx', import.meta.url),
   'utf8',
@@ -62,6 +66,11 @@ test('subscription copy preserves yearly credit and period-end downgrade semanti
   assert.doesNotMatch(subscriptionTab, /price_cents\s*\*\s*10/);
   assert.doesNotMatch(subscriptionTab, /随时可切换/);
   assert.doesNotMatch(subscriptionTab, /首年 · 按年计费/);
+});
+
+test('tenant order history localizes every settled order status', () => {
+  assert.match(subscriptionDetail, /refunded:\s*'已退款'/);
+  assert.match(subscriptionDetail, /partially_refunded:\s*'部分退款'/);
 });
 
 test('disabled OKR and heartbeat automation remain visible but read-only', () => {

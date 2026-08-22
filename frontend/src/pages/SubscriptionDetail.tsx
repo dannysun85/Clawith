@@ -126,6 +126,7 @@ const orderStatusLabel = (order: PaymentOrder) => {
         failed: '失败',
         canceled: '已取消',
         refunded: '已退款',
+        partially_refunded: '部分退款',
     };
     return labels[order.status] || order.status || '-';
 };
