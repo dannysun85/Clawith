@@ -103,7 +103,7 @@ test('legacy schedule UI state is absent from the Agent detail page', () => {
   assert.doesNotMatch(agentDetail, /showScheduleForm/);
 });
 
-test('v1.12.0 release notes distinguish packaged code from released capabilities', () => {
+test('v1.12.x release notes distinguish packaged code from released capabilities', () => {
   const section = releaseNotes.split('# v1.11.42')[0];
   assert.match(section, /Packaged code and database schema do\s+not make any of them a released customer feature/);
   assert.match(section, /CEO orchestration, creative v2 pipelines, Code\/AgentBay execution, Heartbeat/);

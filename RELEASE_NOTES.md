@@ -1,3 +1,44 @@
+# v1.12.1 — Integrated Work Acceptance and Release Identity
+
+## Integrated local candidate
+
+- This patch release freezes the single local `main` lineage after every local
+  development branch was confirmed as an ancestor of the candidate. It does
+  not import the divergent upstream product line or overwrite historical tags.
+- Work tasks now carry a confirmed acceptance contract, deterministic runtime
+  checks, and immutable owner review receipts. A generated result is not marked
+  accepted merely because an Agent Run reached a terminal state.
+- Group Planning remains platform-funded, but every accepted model call now has
+  a durable system-cost receipt, tenant/run caps, and an explicit reconciliation
+  path for stale or acceptance-unknown Provider outcomes.
+- Product-navigation claims are checked against the version-bound information
+  architecture catalog, and collaboration groups fail closed when the member
+  mix or Planning readiness does not satisfy the commercial contract.
+- Tenant order history now localizes `partially_refunded` instead of exposing
+  the raw backend status value.
+
+## Release boundary
+
+- v1.12.1 inherits the v1.12.0 customer-availability contract. CEO autonomous
+  coordination, creative deliverables v2, Code/AgentBay, Heartbeat, automatic
+  OKR collection, legacy schedules, Douyin direct publishing, and the managed
+  three-reviewer quality gate remain off unless their independent platform and
+  tenant gates are deliberately enabled and verified.
+- The version bump does not prove or enable WeChat Pay. Local development may
+  remain on `BILLING_PROVIDER=manual`; a production payment claim still requires
+  active configuration, Provider receipts, exactly-once settlement, and a real
+  transaction acceptance record.
+- Release completion requires the same immutable commit to pass fresh backend,
+  frontend, PostgreSQL migration, deployment-contract, public identity, and
+  browser business-flow gates. Earlier cached results are not release evidence.
+- The pre-cutover production baseline captured on 2026-08-23 is
+  `v1.12.0 / 0b1b04cded6893d70502930b57fd25a97e95b519`; the historical
+  `astra-v1.12.0` tag points to the later recovery commit `4c2eb209`. This
+  release must therefore record and use the captured active release as its
+  rollback target instead of inferring rollback identity from the old tag.
+  The new `astra-v1.12.1` tag must point to the exact sealed and deployed
+  commit.
+
 # v1.12.0 — Product Truth, Runtime Safety, and Release Readiness
 
 ## Customer-visible availability contract

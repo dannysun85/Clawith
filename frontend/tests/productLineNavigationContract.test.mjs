@@ -193,7 +193,7 @@ test('knowledge and integrations keeps every governed secondary capability reach
 
 test('the runtime product catalog stays aligned with public navigation and has no invented report center', () => {
   assert.equal(productIa.version, 1);
-  assert.equal(productIa.catalog_id, 'astra-product-ia-1.12.0-r1');
+  assert.equal(productIa.catalog_id, 'astra-product-ia-1.12.1-r1');
   assert.match(productIa.catalog_id, new RegExp(`-${backendVersion.replaceAll('.', '\\.')}-`));
   const entries = new Map(productIa.entries.map((entry) => [entry.id, entry]));
   const expected = {

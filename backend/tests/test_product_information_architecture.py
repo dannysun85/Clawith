@@ -18,7 +18,7 @@ def test_catalog_is_version_bound_and_contains_only_real_product_routes() -> Non
     snapshot = product_information_architecture_snapshot()
 
     assert snapshot["version"] == 1
-    assert snapshot["catalog_id"] == "astra-product-ia-1.12.0-r1"
+    assert snapshot["catalog_id"] == "astra-product-ia-1.12.1-r1"
     assert len(snapshot["catalog_sha256"]) == 64
     routes = {entry["route"] for entry in snapshot["entries"]}
     assert {

@@ -170,7 +170,7 @@ async def test_mutation_requires_apply_production_and_operation_id(tmp_path: Pat
         "credentials_file": path,
         "confirm_environment": "production",
         "confirm_tenant_id": _payload()["SMOKE_TENANT_ID"],
-        "release_version": "1.12.0",
+        "release_version": "1.12.1",
         "operation_id": str(uuid.uuid4()),
         "apply": False,
     }

@@ -625,7 +625,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--credentials-file", type=Path, required=True)
     parser.add_argument("--confirm-environment", choices=("development", "test", "production"), required=True)
     parser.add_argument("--confirm-tenant-id", required=True)
-    parser.add_argument("--release-version", default="1.12.0")
+    parser.add_argument("--release-version", default="1.12.1")
     parser.add_argument("--operation-id")
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args()
@@ -635,7 +635,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     production = args.confirm_environment == "production"
     credentials = load_credentials_file(args.credentials_file, production=production)
     _require(str(credentials.tenant_id) == args.confirm_tenant_id, "confirmed_tenant_id_mismatch")
-    _require(args.release_version == "1.12.0", "release_version_mismatch")
+    _require(args.release_version == "1.12.1", "release_version_mismatch")
     if args.action == "inventory":
         _require(not args.apply, "inventory_must_be_read_only")
         _require(args.operation_id is None, "inventory_operation_id_forbidden")
