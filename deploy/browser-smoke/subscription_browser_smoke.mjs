@@ -123,7 +123,7 @@ function classifyConsoleError(message) {
 }
 
 
-function consoleErrorEvidence(message) {
+async function consoleErrorEvidence(message) {
   const text = message.text();
   const location = message.location();
   const assetName = (() => {
@@ -148,6 +148,42 @@ function consoleErrorEvidence(message) {
   else if (/Maximum update depth/.test(text)) failureShape = 'maximum_update_depth';
   else if (/Objects are not valid as a React child/.test(text)) failureShape = 'invalid_react_child';
   else if (/An error occurred in the <.+> component/.test(text)) failureShape = 'component_render_failed';
+  const argumentEvidence = await Promise.all(message.args().map(async (handle) => {
+    try {
+      return await handle.evaluate((value) => {
+        const safeFrame = (raw) => {
+          const match = String(raw).match(/\/assets\/([A-Za-z0-9_.-]+\.js):(\d+):(\d+)/);
+          return match
+            ? { asset: match[1], line: Number(match[2]), column: Number(match[3]) }
+            : null;
+        };
+        if (value instanceof Error) {
+          const messageText = String(value.message || '');
+          const stackLines = String(value.stack || '').split('\n').slice(1, 12);
+          return {
+            kind: 'error',
+            name: /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(value.name) ? value.name : null,
+            failure_shape: /is not a function/.test(messageText) ? 'not_a_function' : null,
+            not_function_target: messageText.match(/^([A-Za-z_$][A-Za-z0-9_$]{0,63}) is not a function$/)?.[1] || null,
+            stack_frames: stackLines.map(safeFrame).filter(Boolean),
+          };
+        }
+        if (value && typeof value === 'object' && typeof value.componentStack === 'string') {
+          const stackLines = value.componentStack.split('\n').slice(0, 12);
+          return {
+            kind: 'react_error_info',
+            components: stackLines
+              .map((line) => line.match(/^\s*at ([A-Za-z_$][A-Za-z0-9_$]{0,63})\b/)?.[1] || null)
+              .filter(Boolean),
+            stack_frames: stackLines.map(safeFrame).filter(Boolean),
+          };
+        }
+        return { kind: typeof value };
+      });
+    } catch {
+      return { kind: 'unavailable' };
+    }
+  }));
   return {
     category: classifyConsoleError(message),
     error_type: errorType,
@@ -158,6 +194,7 @@ function consoleErrorEvidence(message) {
     source_asset: assetName,
     source_line: Number.isInteger(location.lineNumber) ? location.lineNumber : null,
     source_column: Number.isInteger(location.columnNumber) ? location.columnNumber : null,
+    arguments: argumentEvidence,
   };
 }
 
@@ -275,6 +312,7 @@ async function run() {
     const serverErrors = [];
     const httpErrors = [];
     const consoleErrors = [];
+    const consoleErrorCaptures = [];
     const pageErrors = [];
     page.on('response', (response) => {
       if (response.url().startsWith(frontendUrl) && response.status() >= 400) {
@@ -285,7 +323,12 @@ async function run() {
       }
     });
     page.on('console', (message) => {
-      if (message.type() === 'error') consoleErrors.push(consoleErrorEvidence(message));
+      if (message.type() === 'error') {
+        const capture = consoleErrorEvidence(message)
+          .then((evidence) => consoleErrors.push(evidence))
+          .catch(() => consoleErrors.push({ category: 'capture_failed' }));
+        consoleErrorCaptures.push(capture);
+      }
     });
     page.on('pageerror', (error) => {
       pageErrors.push(error?.name || 'Error');
@@ -503,6 +546,7 @@ async function run() {
       const routeDiagnostics = await page.evaluate(() => {
         const detailPage = document.querySelector('.agent-detail-page');
         const root = document.querySelector('#root');
+        const bodyText = document.body.innerText;
         return {
           document_ready_state: document.readyState,
           location_hash_present: window.location.hash.length > 0,
@@ -516,8 +560,10 @@ async function run() {
           role_alert_count: document.querySelectorAll('[role="alert"]').length,
           root_child_count: root?.childNodes.length ?? null,
           root_element_child_count: root?.children.length ?? null,
+          not_function_target: bodyText.match(/\b([A-Za-z_$][A-Za-z0-9_$]{0,63}) is not a function\b/)?.[1] || null,
         };
       });
+      await Promise.allSettled(consoleErrorCaptures);
       fail('ui_direct_chat_shell', {
         current_path: new URL(page.url()).pathname,
         locator_count: shellDiagnostics.length,
@@ -633,6 +679,7 @@ async function run() {
     requireCondition(new URL(page.url()).pathname === '/account/subscription', 'ui_final_url', {
       path: new URL(page.url()).pathname,
     });
+    await Promise.allSettled(consoleErrorCaptures);
     requireCondition(serverErrors.length === 0, 'ui_server_responses', serverErrors.slice(0, 10));
     requireCondition(consoleErrors.length === 0 && pageErrors.length === 0, 'ui_console_errors', {
       console_error_count: consoleErrors.length,
