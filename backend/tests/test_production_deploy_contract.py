@@ -1629,6 +1629,9 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert '"body": body' not in api_runner
     assert "body[:200]" not in api_runner
     assert '(cd deploy/browser-smoke && npm test)' in script
+    assert script.count(
+        '--env XDG_CONFIG_HOME=/tmp/astra-browser-smoke-config'
+    ) == 2
     assert 'BROWSER_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"' in script
     assert 'mktemp -d "$BROWSER_SMOKE_RUNTIME_ROOT/.candidate-smoke.XXXXXX"' in script
     assert 'mktemp -d "$target_backup/.candidate-smoke.XXXXXX"' not in script
