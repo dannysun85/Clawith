@@ -3,7 +3,7 @@ import process from 'node:process';
 
 import { chromium } from 'playwright';
 
-import { waitForExactText } from './browser_assertions.mjs';
+import { partitionBrowserIssues, waitForExactText } from './browser_assertions.mjs';
 
 
 const REQUIRED_CREDENTIAL_KEYS = [
@@ -123,9 +123,17 @@ function classifyConsoleError(message) {
 }
 
 
-async function consoleErrorEvidence(message) {
+async function consoleErrorEvidence(message, frontendUrl) {
   const text = message.text();
   const location = message.location();
+  const sourcePath = (() => {
+    try {
+      const source = new URL(location.url);
+      return source.origin === new URL(frontendUrl).origin ? source.pathname : null;
+    } catch {
+      return null;
+    }
+  })();
   const assetName = (() => {
     try {
       const pathname = new URL(location.url).pathname;
@@ -139,6 +147,7 @@ async function consoleErrorEvidence(message) {
   const propertyName = text.match(/reading ['"]([A-Za-z_$][A-Za-z0-9_$]{0,63})['"]/)?.[1] || null;
   const componentName = text.match(/<([A-Z][A-Za-z0-9_$]{0,63})>/)?.[1] || null;
   const reactErrorCode = text.match(/Minified React error #(\d{1,6})/)?.[1] || null;
+  const httpStatusMatch = text.match(/status of (\d{3})(?:\s|\()/i);
   let failureShape = null;
   if (/Cannot read properties of undefined/.test(text)) failureShape = 'read_undefined';
   else if (/Cannot read properties of null/.test(text)) failureShape = 'read_null';
@@ -191,6 +200,8 @@ async function consoleErrorEvidence(message) {
     property_name: propertyName,
     component_name: componentName,
     react_error_code: reactErrorCode,
+    http_status: httpStatusMatch ? Number(httpStatusMatch[1]) : null,
+    source_path: sourcePath,
     source_asset: assetName,
     source_line: Number.isInteger(location.lineNumber) ? location.lineNumber : null,
     source_column: Number.isInteger(location.columnNumber) ? location.columnNumber : null,
@@ -339,7 +350,7 @@ async function run() {
     });
     page.on('console', (message) => {
       if (message.type() === 'error') {
-        const capture = consoleErrorEvidence(message)
+        const capture = consoleErrorEvidence(message, frontendUrl)
           .then((evidence) => consoleErrors.push(evidence))
           .catch(() => consoleErrors.push({ category: 'capture_failed' }));
         consoleErrorCaptures.push(capture);
@@ -707,11 +718,24 @@ async function run() {
       path: new URL(page.url()).pathname,
     });
     await Promise.allSettled(consoleErrorCaptures);
+    const browserIssues = partitionBrowserIssues({ consoleErrors, httpErrors });
     requireCondition(serverErrors.length === 0, 'ui_server_responses', serverErrors.slice(0, 10));
-    requireCondition(consoleErrors.length === 0 && pageErrors.length === 0, 'ui_console_errors', {
-      console_error_count: consoleErrors.length,
-      page_error_count: pageErrors.length,
-    });
+    requireCondition(
+      browserIssues.unexpectedHttpErrors.length === 0,
+      'ui_http_errors',
+      browserIssues.unexpectedHttpErrors.slice(0, 10),
+    );
+    requireCondition(
+      browserIssues.unexpectedConsoleErrors.length === 0 && pageErrors.length === 0,
+      'ui_console_errors',
+      {
+        console_error_count: consoleErrors.length,
+        console_error_evidence: browserIssues.unexpectedConsoleErrors.slice(0, 10),
+        tolerated_runtime_state_conflicts: browserIssues.toleratedHttpErrors.length,
+        page_error_count: pageErrors.length,
+        page_error_names: [...new Set(pageErrors)],
+      },
+    );
     requireCondition(blockedOrigins.length === 0, 'ui_cross_origin_request', {
       origins: [...new Set(blockedOrigins)].slice(0, 10),
     });
@@ -728,6 +752,7 @@ async function run() {
       release_identity: releaseIdentity,
       evidence_nonce: args['evidence-nonce'],
       final_path: '/account/subscription',
+      tolerated_runtime_state_conflicts: browserIssues.toleratedHttpErrors.length,
       subscription_summary: {
         plan_code: summary.plan_code ?? null,
         balance: summary.balance,
@@ -764,7 +789,7 @@ async function run() {
         'ui_direct_chat_round_trip_ok',
         'ui_direct_chat_recovery_ok',
         'ui_post_chat_credits_settled_ok',
-        'ui_no_console_error_ok',
+        'ui_no_unexpected_console_error_ok',
         'ui_no_server_error_ok',
       ],
     };

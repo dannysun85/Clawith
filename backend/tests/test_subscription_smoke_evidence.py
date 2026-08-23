@@ -178,6 +178,7 @@ def _ui_evidence(commit: str, release_id: str, nonce: str) -> dict:
         },
         "evidence_nonce": nonce,
         "final_path": "/account/subscription",
+        "tolerated_runtime_state_conflicts": 1,
         "checks": [
             "ui_release_identity_ok",
             "ui_tenant_login_ok",
@@ -191,7 +192,7 @@ def _ui_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "ui_direct_chat_round_trip_ok",
             "ui_direct_chat_recovery_ok",
             "ui_post_chat_credits_settled_ok",
-            "ui_no_console_error_ok",
+            "ui_no_unexpected_console_error_ok",
             "ui_no_server_error_ok",
         ],
         "subscription_summary": {
@@ -279,6 +280,7 @@ def test_composite_smoke_evidence_requires_matching_api_and_browser_proof(tmp_pa
         "package_sha256": "4" * 64,
     }
     assert combined["ui"]["final_path"] == "/account/subscription"
+    assert combined["ui"]["tolerated_runtime_state_conflicts"] == 1
     assert combined["saas_ledger_reconciliation"] == {
         "checked_tenants": 4,
         "issue_count": 0,

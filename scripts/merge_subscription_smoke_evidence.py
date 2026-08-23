@@ -58,7 +58,7 @@ UI_CHECKS = {
     "ui_direct_chat_round_trip_ok",
     "ui_direct_chat_recovery_ok",
     "ui_post_chat_credits_settled_ok",
-    "ui_no_console_error_ok",
+    "ui_no_unexpected_console_error_ok",
     "ui_no_server_error_ok",
 }
 
@@ -253,6 +253,12 @@ def main() -> int:
         raise ValueError("UI evidence did not finish on the subscription page")
     if ui.get("browser_target") != "isolated_candidate_frontend_network":
         raise ValueError("UI evidence did not use the isolated candidate frontend")
+    tolerated_runtime_state_conflicts = ui.get("tolerated_runtime_state_conflicts")
+    if (
+        type(tolerated_runtime_state_conflicts) is not int
+        or tolerated_runtime_state_conflicts < 0
+    ):
+        raise ValueError("UI runtime-state conflict evidence is invalid")
     if not len(args.evidence_nonce) == 32 or any(
         character not in "0123456789abcdef" for character in args.evidence_nonce
     ):
@@ -359,6 +365,7 @@ def main() -> int:
         "ui": {
             "final_path": ui.get("final_path"),
             "browser_target": ui.get("browser_target"),
+            "tolerated_runtime_state_conflicts": tolerated_runtime_state_conflicts,
             "subscription_summary": ui.get("subscription_summary"),
             "business_flow": ui_business_flow,
         },

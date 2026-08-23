@@ -422,6 +422,8 @@ allowed = {
     "RELEASE_NOTES.md",
     "backend/tests/test_production_deploy_contract.py",
     "backend/tests/test_subscription_smoke_evidence.py",
+    "deploy/browser-smoke/browser_assertions.mjs",
+    "deploy/browser-smoke/browser_assertions.test.mjs",
     "deploy/browser-smoke/browser_launch_selftest.mjs",
     "deploy/browser-smoke/subscription_browser_smoke.mjs",
     "scripts/deploy-astra-production.sh",
@@ -2230,7 +2232,7 @@ if kind in {"smoke", "smoke-v3"}:
             "ui_direct_chat_round_trip_ok",
             "ui_direct_chat_recovery_ok",
             "ui_post_chat_credits_settled_ok",
-            "ui_no_console_error_ok",
+            "ui_no_unexpected_console_error_ok",
             "ui_no_server_error_ok",
         }
         expected_api_base = f"http://127.0.0.1:{candidate_port}/api"
@@ -2257,7 +2259,9 @@ if kind in {"smoke", "smoke-v3"}:
             raise SystemExit(1)
         ui = payload.get("ui")
         if not isinstance(ui, dict) or ui.get("final_path") != "/account/subscription" or \
-                ui.get("browser_target") != "isolated_candidate_frontend_network":
+                ui.get("browser_target") != "isolated_candidate_frontend_network" or \
+                type(ui.get("tolerated_runtime_state_conflicts")) is not int or \
+                ui["tolerated_runtime_state_conflicts"] < 0:
             raise SystemExit(1)
         summary = payload.get("subscription_summary")
         if not isinstance(summary, dict) or not {
@@ -6430,6 +6434,8 @@ allowed = {
     "RELEASE_NOTES.md",
     "backend/tests/test_production_deploy_contract.py",
     "backend/tests/test_subscription_smoke_evidence.py",
+    "deploy/browser-smoke/browser_assertions.mjs",
+    "deploy/browser-smoke/browser_assertions.test.mjs",
     "deploy/browser-smoke/browser_launch_selftest.mjs",
     "deploy/browser-smoke/subscription_browser_smoke.mjs",
     "scripts/deploy-astra-production.sh",

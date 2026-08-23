@@ -1413,7 +1413,7 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
         "ui_direct_chat_round_trip_ok",
         "ui_direct_chat_recovery_ok",
         "ui_post_chat_credits_settled_ok",
-        "ui_no_console_error_ok",
+        "ui_no_unexpected_console_error_ok",
         "ui_no_server_error_ok",
     ]
     payload = {
@@ -1523,6 +1523,7 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
         "ui": {
             "final_path": "/account/subscription",
             "browser_target": "isolated_candidate_frontend_network",
+            "tolerated_runtime_state_conflicts": 1,
         },
     }
     backup = tmp_path / "backups" / release_id
