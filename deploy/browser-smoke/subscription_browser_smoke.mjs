@@ -270,7 +270,7 @@ async function run() {
   const evidenceFrontendUrl = args['evidence-frontend-url'].replace(/\/+$/, '');
   const frontendOrigin = new URL(frontendUrl).origin;
   requireCondition(
-    frontendOrigin === 'http://candidate-frontend:3000',
+    frontendOrigin === 'http://localhost-candidate:3000',
     'arguments',
     { frontend_origin: 'isolated_candidate_required' },
   );
@@ -280,9 +280,11 @@ async function run() {
     evidence_nonce: 'invalid',
   });
 
-  // The candidate is reachable only on an internal Docker network over HTTP,
-  // while production is HTTPS-only. Scope Chromium's secure-context parity to
-  // that exact isolated origin so secure Web APIs behave as they do publicly.
+  // The localhost-prefixed alias keeps the platform login flow from treating
+  // this internal QA host as a customer SSO domain. The candidate is still
+  // reachable only on an internal Docker network over HTTP, while production
+  // is HTTPS-only. Scope Chromium's secure-context parity to that exact
+  // isolated origin so secure Web APIs behave as they do publicly.
   const browser = await chromium.launch({
     channel: 'chromium',
     headless: true,

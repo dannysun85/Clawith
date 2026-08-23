@@ -2004,7 +2004,7 @@ PY_BROWSER_CREDENTIALS
         return 1
     }
     docker network connect \
-        --alias candidate-frontend \
+        --alias localhost-candidate \
         "$BROWSER_SMOKE_NETWORK" "$frontend_id" || {
         cleanup_browser_smoke_runtime
         return 1
@@ -2032,7 +2032,7 @@ PY_BROWSER_CREDENTIALS
         --mount \
             "type=bind,src=$browser_credentials,dst=/run/secrets/smoke-credentials.json,readonly" \
         "$image" \
-        --frontend-url "http://candidate-frontend:3000" \
+        --frontend-url "http://localhost-candidate:3000" \
         --evidence-frontend-url "$canonical_frontend_url" \
         --credentials-file /run/secrets/smoke-credentials.json \
         --expected-version "$target_version" \

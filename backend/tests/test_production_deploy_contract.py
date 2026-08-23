@@ -817,7 +817,8 @@ def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
     assert "remote-smoke-break-glass.nonce-sha256" in script
     assert 'python3 "$RELEASE/scripts/subscription_production_smoke.py"' in script
     assert 'python3 "$RELEASE/scripts/merge_subscription_smoke_evidence.py"' in script
-    assert '"$image" \\\n        --frontend-url "http://candidate-frontend:3000"' in script
+    assert '--alias localhost-candidate' in script
+    assert '"$image" \\\n        --frontend-url "http://localhost-candidate:3000"' in script
     assert 'source "$SMOKE_ENV_FILE"' not in script
     assert '--credentials-file "$SMOKE_ENV_FILE"' in script
     candidate_worker = script.index('write_cutover_state candidate_services_ready "$CANDIDATE_SLOT" "$RELEASE_ID"')
@@ -1588,7 +1589,7 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert "SMOKE_PLATFORM_ADMIN" not in browser_runner
     assert "credentials.SMOKE_TENANT_PASSWORD" in browser_runner
     assert "credentials.SMOKE_TENANT_ID" in browser_runner
-    assert "frontendOrigin === 'http://candidate-frontend:3000'" in browser_runner
+    assert "frontendOrigin === 'http://localhost-candidate:3000'" in browser_runner
     assert "channel: 'chromium'" in browser_runner
     assert "channel: 'chromium'" in browser_selftest
     assert '--unsafely-treat-insecure-origin-as-secure=${frontendOrigin}' in browser_runner
