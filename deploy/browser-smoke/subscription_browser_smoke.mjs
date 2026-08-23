@@ -233,8 +233,8 @@ async function run() {
     page.on('console', (message) => {
       if (message.type() === 'error') consoleErrors.push(true);
     });
-    page.on('pageerror', () => {
-      pageErrors.push(true);
+    page.on('pageerror', (error) => {
+      pageErrors.push(error?.name || 'Error');
     });
 
     const versionResponse = await context.request.get(`${frontendUrl}/api/version`, { timeout: 30_000 });
@@ -429,7 +429,36 @@ async function run() {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
     });
-    await page.getByTestId('direct-chat-shell').waitFor({ state: 'visible', timeout: 30_000 });
+    const directChatShell = page.getByTestId('direct-chat-shell');
+    try {
+      await directChatShell.waitFor({ state: 'visible', timeout: 30_000 });
+    } catch {
+      const agentResult = await pageApi(page, `/api/agents/${assistantAgentId}`);
+      const shellDiagnostics = await directChatShell.evaluateAll((nodes) => nodes.map((node) => {
+        const element = /** @type {HTMLElement} */ (node);
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return {
+          display: style.display,
+          visibility: style.visibility,
+          opacity: style.opacity,
+          width_positive: rect.width > 0,
+          height_positive: rect.height > 0,
+        };
+      }));
+      fail('ui_direct_chat_shell', {
+        current_path: new URL(page.url()).pathname,
+        locator_count: shellDiagnostics.length,
+        shell_diagnostics: shellDiagnostics,
+        agent_status: agentResult.status,
+        agent_access_level: typeof agentResult.body?.access_level === 'string'
+          ? agentResult.body.access_level
+          : null,
+        console_error_count: consoleErrors.length,
+        page_error_count: pageErrors.length,
+        page_error_names: [...new Set(pageErrors)],
+      });
+    }
     const sessionResponsePromise = page.waitForResponse(
       (response) => sameOriginPath(response.url(), frontendUrl, `/api/agents/${assistantAgentId}/sessions`)
         && response.request().method() === 'POST',
