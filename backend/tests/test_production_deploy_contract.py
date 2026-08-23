@@ -1449,11 +1449,17 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     api_runner = (ROOT / "scripts/subscription_production_smoke.py").read_text(encoding="utf-8")
     dockerfile = (ROOT / "deploy/browser-smoke/Dockerfile").read_text(encoding="utf-8")
+    evidence_schema = (ROOT / "deploy/browser-smoke/EVIDENCE_SCHEMA").read_text(
+        encoding="utf-8"
+    ).strip()
     browser_runner = (ROOT / "deploy/browser-smoke/subscription_browser_smoke.mjs").read_text(encoding="utf-8")
 
     assert "@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48" in dockerfile
     assert "USER pwuser" in dockerfile
-    assert 'browser-smoke-schema="3"' in dockerfile
+    assert evidence_schema == "3"
+    assert f'browser-smoke-schema="{evidence_schema}"' in dockerfile
+    assert 'tr -d \'[:space:]\' < "$target_release/deploy/browser-smoke/EVIDENCE_SCHEMA"' in script
+    assert '[ "$label" = "$expected_schema" ]' in script
     for contract in (
         "--internal",
         "--read-only",

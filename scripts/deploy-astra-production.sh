@@ -843,6 +843,7 @@ ensure_browser_smoke_image() {
     local host_uid
     local host_gid
     local label
+    local expected_schema
 
     browser_smoke_requires_v3 "$target_release" || return 1
     browser_smoke_bundle_digest "$target_release" >/dev/null || return 1
@@ -859,7 +860,13 @@ ensure_browser_smoke_image() {
             --format '{{ index .Config.Labels "ai.reeftotem.astra.browser-smoke-schema" }}' \
             "$image" 2>/dev/null
     )" || return 1
-    [ "$label" = "2" ] || return 1
+    expected_schema="$(
+        tr -d '[:space:]' < "$target_release/deploy/browser-smoke/EVIDENCE_SCHEMA"
+    )" || return 1
+    [ "$label" = "$expected_schema" ] || {
+        echo "browser smoke image schema does not match the candidate bundle" >&2
+        return 1
+    }
 
     safe_id="$(printf '%s' "$target_release_id" | sha256sum | cut -c1-16)" || return 1
     BROWSER_SMOKE_NETWORK="astra-browser-preflight-${safe_id}"
