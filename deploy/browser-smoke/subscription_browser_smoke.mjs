@@ -112,6 +112,17 @@ function sleep(milliseconds) {
 }
 
 
+function classifyConsoleError(message) {
+  const text = message.text();
+  if (/websocket/i.test(text)) return 'websocket';
+  if (/failed to load resource/i.test(text)) return 'failed_resource';
+  if (/cross-origin|cors/i.test(text)) return 'cross_origin';
+  if (/react/i.test(text)) return 'react';
+  if (/network|err_/i.test(text)) return 'network';
+  return 'other';
+}
+
+
 async function pageApi(page, path, options = {}) {
   return page.evaluate(async ({ requestPath, requestOptions }) => {
     const token = window.localStorage.getItem('token');
@@ -223,15 +234,19 @@ async function run() {
       if (openedPage !== page) unexpectedPageCount += 1;
     });
     const serverErrors = [];
+    const httpErrors = [];
     const consoleErrors = [];
     const pageErrors = [];
     page.on('response', (response) => {
+      if (response.url().startsWith(frontendUrl) && response.status() >= 400) {
+        httpErrors.push({ path: new URL(response.url()).pathname, status: response.status() });
+      }
       if (response.url().startsWith(frontendUrl) && response.status() >= 500) {
         serverErrors.push({ path: new URL(response.url()).pathname, status: response.status() });
       }
     });
     page.on('console', (message) => {
-      if (message.type() === 'error') consoleErrors.push(true);
+      if (message.type() === 'error') consoleErrors.push(classifyConsoleError(message));
     });
     page.on('pageerror', (error) => {
       pageErrors.push(error?.name || 'Error');
@@ -446,15 +461,36 @@ async function run() {
           height_positive: rect.height > 0,
         };
       }));
+      const routeDiagnostics = await page.evaluate(() => {
+        const detailPage = document.querySelector('.agent-detail-page');
+        const root = document.querySelector('#root');
+        return {
+          document_ready_state: document.readyState,
+          location_hash_present: window.location.hash.length > 0,
+          location_search_present: window.location.search.length > 0,
+          detail_page_count: document.querySelectorAll('.agent-detail-page').length,
+          detail_page_class: detailPage?.getAttribute('class') || null,
+          chat_page_count: document.querySelectorAll('.agent-detail-page--chat').length,
+          settings_page_count: document.querySelectorAll('.agent-detail-page--settings').length,
+          detail_header_count: document.querySelectorAll('.agent-detail-header').length,
+          settings_tabs_count: document.querySelectorAll('.agent-detail-page .tabs').length,
+          role_alert_count: document.querySelectorAll('[role="alert"]').length,
+          root_child_count: root?.childNodes.length ?? null,
+          root_element_child_count: root?.children.length ?? null,
+        };
+      });
       fail('ui_direct_chat_shell', {
         current_path: new URL(page.url()).pathname,
         locator_count: shellDiagnostics.length,
         shell_diagnostics: shellDiagnostics,
+        route_diagnostics: routeDiagnostics,
         agent_status: agentResult.status,
         agent_access_level: typeof agentResult.body?.access_level === 'string'
           ? agentResult.body.access_level
           : null,
         console_error_count: consoleErrors.length,
+        console_error_categories: [...new Set(consoleErrors)],
+        http_errors: httpErrors.slice(-10),
         page_error_count: pageErrors.length,
         page_error_names: [...new Set(pageErrors)],
       });
