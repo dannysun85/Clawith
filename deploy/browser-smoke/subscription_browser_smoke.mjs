@@ -123,6 +123,45 @@ function classifyConsoleError(message) {
 }
 
 
+function consoleErrorEvidence(message) {
+  const text = message.text();
+  const location = message.location();
+  const assetName = (() => {
+    try {
+      const pathname = new URL(location.url).pathname;
+      const candidate = pathname.split('/').pop() || '';
+      return /^[A-Za-z0-9_.-]+\.js$/.test(candidate) ? candidate : null;
+    } catch {
+      return null;
+    }
+  })();
+  const errorType = text.match(/\b(TypeError|RangeError|ReferenceError|SyntaxError|Error)\b/)?.[1] || null;
+  const propertyName = text.match(/reading ['"]([A-Za-z_$][A-Za-z0-9_$]{0,63})['"]/)?.[1] || null;
+  const componentName = text.match(/<([A-Z][A-Za-z0-9_$]{0,63})>/)?.[1] || null;
+  const reactErrorCode = text.match(/Minified React error #(\d{1,6})/)?.[1] || null;
+  let failureShape = null;
+  if (/Cannot read properties of undefined/.test(text)) failureShape = 'read_undefined';
+  else if (/Cannot read properties of null/.test(text)) failureShape = 'read_null';
+  else if (/is not a function/.test(text)) failureShape = 'not_a_function';
+  else if (/is not iterable/.test(text)) failureShape = 'not_iterable';
+  else if (/Rendered (more|fewer) hooks/.test(text)) failureShape = 'hook_count_changed';
+  else if (/Maximum update depth/.test(text)) failureShape = 'maximum_update_depth';
+  else if (/Objects are not valid as a React child/.test(text)) failureShape = 'invalid_react_child';
+  else if (/An error occurred in the <.+> component/.test(text)) failureShape = 'component_render_failed';
+  return {
+    category: classifyConsoleError(message),
+    error_type: errorType,
+    failure_shape: failureShape,
+    property_name: propertyName,
+    component_name: componentName,
+    react_error_code: reactErrorCode,
+    source_asset: assetName,
+    source_line: Number.isInteger(location.lineNumber) ? location.lineNumber : null,
+    source_column: Number.isInteger(location.columnNumber) ? location.columnNumber : null,
+  };
+}
+
+
 async function pageApi(page, path, options = {}) {
   return page.evaluate(async ({ requestPath, requestOptions }) => {
     const token = window.localStorage.getItem('token');
@@ -246,7 +285,7 @@ async function run() {
       }
     });
     page.on('console', (message) => {
-      if (message.type() === 'error') consoleErrors.push(classifyConsoleError(message));
+      if (message.type() === 'error') consoleErrors.push(consoleErrorEvidence(message));
     });
     page.on('pageerror', (error) => {
       pageErrors.push(error?.name || 'Error');
@@ -489,7 +528,7 @@ async function run() {
           ? agentResult.body.access_level
           : null,
         console_error_count: consoleErrors.length,
-        console_error_categories: [...new Set(consoleErrors)],
+        console_error_evidence: consoleErrors,
         http_errors: httpErrors.slice(-10),
         page_error_count: pageErrors.length,
         page_error_names: [...new Set(pageErrors)],
