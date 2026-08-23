@@ -268,13 +268,25 @@ async function run() {
   );
   const frontendUrl = args['frontend-url'].replace(/\/+$/, '');
   const evidenceFrontendUrl = args['evidence-frontend-url'].replace(/\/+$/, '');
+  const frontendOrigin = new URL(frontendUrl).origin;
+  requireCondition(
+    frontendOrigin === 'http://candidate-frontend:3000',
+    'arguments',
+    { frontend_origin: 'isolated_candidate_required' },
+  );
   const expectedCommit = args['expected-commit'];
   requireCondition(/^[0-9a-f]{40}$/.test(expectedCommit), 'arguments', { expected_commit: 'invalid' });
   requireCondition(/^[0-9a-f]{32}$/.test(args['evidence-nonce']), 'arguments', {
     evidence_nonce: 'invalid',
   });
 
-  const browser = await chromium.launch({ headless: true });
+  // The candidate is reachable only on an internal Docker network over HTTP,
+  // while production is HTTPS-only. Scope Chromium's secure-context parity to
+  // that exact isolated origin so secure Web APIs behave as they do publicly.
+  const browser = await chromium.launch({
+    headless: true,
+    args: [`--unsafely-treat-insecure-origin-as-secure=${frontendOrigin}`],
+  });
   try {
     const context = await browser.newContext({
       ignoreHTTPSErrors: false,
@@ -355,6 +367,18 @@ async function run() {
     requireCondition(new URL(page.url()).origin === new URL(frontendUrl).origin, 'ui_login_origin', {
       origin: new URL(page.url()).origin,
     });
+    const secureContextParity = await page.evaluate(() => ({
+      is_secure_context: window.isSecureContext,
+      random_uuid_available: typeof globalThis.crypto?.randomUUID === 'function',
+      random_values_available: typeof globalThis.crypto?.getRandomValues === 'function',
+    }));
+    requireCondition(
+      secureContextParity.is_secure_context === true
+        && secureContextParity.random_uuid_available === true
+        && secureContextParity.random_values_available === true,
+      'ui_secure_context_parity',
+      secureContextParity,
+    );
     await page.locator('input[type="email"]').fill(credentials.SMOKE_TENANT_EMAIL);
     await page.locator('input[type="password"]').fill(credentials.SMOKE_TENANT_PASSWORD);
     const loginResponsePromise = page.waitForResponse(
@@ -725,6 +749,7 @@ async function run() {
       },
       checks: [
         'ui_release_identity_ok',
+        'ui_secure_context_parity_ok',
         'ui_tenant_login_ok',
         'ui_tenant_scope_ok',
         'ui_subscription_summary_api_ok',
