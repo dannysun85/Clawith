@@ -339,6 +339,101 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     --compose-project "$COMPOSE_PROJECT" \
     < "$ROOT_DIR/scripts/assert_production_data_plane_dns.py"
 
+echo "[local] binding any nonterminal recovery to a tooling-only diff"
+RECOVERY_QA_TOOLING_BASE_COMMIT="$(
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+        env -u BASH_ENV -u BASHOPTS -u SHELLOPTS python3 - "$APP_ROOT" <<'PY_RECOVERY_QA_BASE'
+from pathlib import Path
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+state_path = root / "cutover-state"
+if not state_path.exists() and not state_path.is_symlink():
+    print("none")
+    raise SystemExit(0)
+metadata = state_path.lstat()
+if not stat.S_ISREG(metadata.st_mode) or state_path.is_symlink() or not 0 < metadata.st_size <= 512:
+    raise SystemExit("unsafe production cutover state")
+state = state_path.read_text(encoding="utf-8").strip()
+match = re.fullmatch(
+    r"([a-z_]+) slot=(a|b|legacy) release=([A-Za-z0-9._-]+)",
+    state,
+)
+if match is None:
+    raise SystemExit("invalid production cutover state")
+phase, slot, release_id = match.groups()
+if phase in {"complete", "rollback_complete", "recovery_complete"}:
+    print("none")
+    raise SystemExit(0)
+nonterminal = {
+    "maintenance_enabled",
+    "migration_started",
+    "schema_forward_only",
+    "candidate_services_ready",
+    "candidate_alert_canary_verified",
+    "candidate_business_verified",
+    "candidate_ready",
+    "nginx_reloaded",
+    "public_verified",
+    "traffic_and_worker_committed",
+    "rollback_started",
+    "rollback_incomplete",
+    "rollback_partial",
+    "rollback_recovering_candidate",
+    "recovery_started",
+    "recovery_incomplete",
+    "recovery_started_alert_proof",
+    "recovery_incomplete_alert_proof",
+    "recovery_started_business_proof",
+    "recovery_incomplete_business_proof",
+}
+if phase not in nonterminal:
+    raise SystemExit("unknown production cutover phase")
+journal = root / f"slot-{slot}-release"
+journal_metadata = journal.lstat()
+if not stat.S_ISREG(journal_metadata.st_mode) or journal.is_symlink() or not 0 < journal_metadata.st_size <= 4096:
+    raise SystemExit("unsafe recovery slot journal")
+release = Path(journal.read_text(encoding="utf-8").strip())
+expected_release = root / "releases" / release_id
+if release != expected_release or not release.is_dir() or release.is_symlink():
+    raise SystemExit("recovery slot journal does not identify the cutover release")
+commit_path = release / "COMMIT"
+commit_metadata = commit_path.lstat()
+if not stat.S_ISREG(commit_metadata.st_mode) or commit_path.is_symlink() or not 0 < commit_metadata.st_size <= 128:
+    raise SystemExit("unsafe recovery candidate commit")
+commit = commit_path.read_text(encoding="utf-8").strip()
+if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit("invalid recovery candidate commit")
+print(commit)
+PY_RECOVERY_QA_BASE
+)"
+if [ "$RECOVERY_QA_TOOLING_BASE_COMMIT" != "none" ]; then
+    git cat-file -e "${RECOVERY_QA_TOOLING_BASE_COMMIT}^{commit}"
+    git merge-base --is-ancestor "$RECOVERY_QA_TOOLING_BASE_COMMIT" "$COMMIT"
+    RECOVERY_QA_TOOLING_DIFF="$(
+        git diff --name-only "$RECOVERY_QA_TOOLING_BASE_COMMIT" "$COMMIT"
+    )"
+    python3 - "$RECOVERY_QA_TOOLING_DIFF" <<'PY_RECOVERY_QA_TOOLING_DIFF'
+import sys
+
+allowed = {
+    "RELEASE_NOTES.md",
+    "backend/tests/test_production_deploy_contract.py",
+    "backend/tests/test_subscription_smoke_evidence.py",
+    "scripts/deploy-astra-production.sh",
+    "scripts/merge_subscription_smoke_evidence.py",
+    "scripts/subscription_production_smoke.py",
+}
+changed = {line for line in sys.argv[1].splitlines() if line}
+if changed and not changed.issubset(allowed):
+    raise SystemExit(
+        "nonterminal recovery candidate differs outside reviewed QA tooling"
+    )
+PY_RECOVERY_QA_TOOLING_DIFF
+fi
+
 echo "[local] checking Alembic heads"
 ALEMBIC_HEADS="$(cd backend && uv run --frozen alembic heads)"
 ALEMBIC_HEAD_COUNT="$(printf '%s\n' "$ALEMBIC_HEADS" | grep -c '(head)')"
@@ -520,7 +615,8 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     "$PREPARE_REMOTE_SMOKE_PRINCIPALS" \
     "$SMOKE_PRINCIPAL_CONFIRM_TENANT_ID" \
     "$SMOKE_PRINCIPAL_PROVISION_OPERATION_ID" \
-    "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" <<'REMOTE_LOADER'
+    "$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" \
+    "$RECOVERY_QA_TOOLING_BASE_COMMIT" <<'REMOTE_LOADER'
 { set +x; } 2>/dev/null
 set -euo pipefail
 ORIGINAL_UMASK="$(umask)"
@@ -555,6 +651,20 @@ PREPARE_REMOTE_SMOKE_PRINCIPALS="${17}"
 SMOKE_PRINCIPAL_CONFIRM_TENANT_ID="${18}"
 SMOKE_PRINCIPAL_PROVISION_OPERATION_ID="${19}"
 SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID="${20}"
+RECOVERY_QA_TOOLING_BASE_COMMIT="${21}"
+
+if [ "$RECOVERY_QA_TOOLING_BASE_COMMIT" != "none" ]; then
+    case "$RECOVERY_QA_TOOLING_BASE_COMMIT" in
+        ''|*[!0-9a-f]*)
+            echo "recovery QA tooling base commit is invalid" >&2
+            exit 1
+            ;;
+    esac
+    [ "${#RECOVERY_QA_TOOLING_BASE_COMMIT}" = "40" ] || {
+        echo "recovery QA tooling base commit must contain 40 hexadecimal characters" >&2
+        exit 1
+    }
+fi
 
 CURRENT="$APP_ROOT/current"
 CURRENT_TARGET=""
@@ -1789,8 +1899,8 @@ run_candidate_business_smoke() {
     [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || return 1
     for runner in \
         subscription_production_smoke.py merge_subscription_smoke_evidence.py; do
-        [ -f "$target_release/scripts/$runner" ] && \
-            [ ! -L "$target_release/scripts/$runner" ] || return 1
+        [ -f "$RELEASE/scripts/$runner" ] && \
+            [ ! -L "$RELEASE/scripts/$runner" ] || return 1
     done
     runner_bundle_digest="$(browser_smoke_bundle_digest "$target_release")" || return 1
     browser_image_id="$(docker image inspect --format '{{.Id}}' "$image")" || return 1
@@ -1864,7 +1974,7 @@ with os.fdopen(fd, "w", encoding="utf-8") as handle:
     os.fsync(handle.fileno())
 PY_BROWSER_CREDENTIALS
 
-    if ! python3 "$target_release/scripts/subscription_production_smoke.py" \
+    if ! python3 "$RELEASE/scripts/subscription_production_smoke.py" \
         --credentials-file "$SMOKE_ENV_FILE" \
         --api-base "$canonical_api_base" \
         --frontend-url "$canonical_frontend_url" \
@@ -1927,7 +2037,7 @@ PY_BROWSER_CREDENTIALS
         return 1
     fi
     cleanup_browser_smoke_runtime 0
-    if ! python3 "$target_release/scripts/merge_subscription_smoke_evidence.py" \
+    if ! python3 "$RELEASE/scripts/merge_subscription_smoke_evidence.py" \
         --api-evidence "$api_evidence" \
         --ui-evidence "$ui_evidence" \
         --api-base "$canonical_api_base" \
@@ -1938,6 +2048,9 @@ PY_BROWSER_CREDENTIALS
         --evidence-nonce "$evidence_nonce" \
         --runner-bundle-sha256 "$runner_bundle_digest" \
         --browser-image-id "$browser_image_id" \
+        --qa-tooling-release-id "$RELEASE_ID" \
+        --qa-tooling-commit "$COMMIT" \
+        --qa-tooling-package-sha256 "$PACKAGE_SHA256" \
         > "$output"; then
         cleanup_browser_smoke_runtime
         rm -f "$output"
@@ -1953,6 +2066,9 @@ candidate_business_evidence_valid() {
     local target_release="$APP_ROOT/releases/$release_id"
     local evidence_mode="legacy"
     local runner_bundle_sha256="none"
+    local qa_tooling_release_id="${RELEASE_ID:-none}"
+    local qa_tooling_commit="${COMMIT:-none}"
+    local qa_tooling_package_sha256="${PACKAGE_SHA256:-none}"
 
     [ -d "$target_release" ] && [ ! -L "$target_release" ] || return 1
     if browser_smoke_requires_v3 "$target_release"; then
@@ -1961,7 +2077,9 @@ candidate_business_evidence_valid() {
     fi
     python3 - \
         "$APP_ROOT" "$release_id" "$candidate_port" "$evidence_mode" \
-        "$runner_bundle_sha256" <<'PY_CANDIDATE_EVIDENCE'
+        "$runner_bundle_sha256" "$qa_tooling_release_id" \
+        "$qa_tooling_commit" "$qa_tooling_package_sha256" \
+        <<'PY_CANDIDATE_EVIDENCE'
 import hashlib
 import json
 from pathlib import Path
@@ -1973,8 +2091,12 @@ release_id = sys.argv[2]
 candidate_port = sys.argv[3]
 evidence_mode = sys.argv[4]
 runner_bundle_sha256 = sys.argv[5]
+qa_tooling_release_id = sys.argv[6]
+qa_tooling_commit = sys.argv[7]
+qa_tooling_package_sha256 = sys.argv[8]
 backup = app_root / "backups" / release_id
 release = app_root / "releases" / release_id
+qa_tooling_release = app_root / "releases" / qa_tooling_release_id
 marker = backup / "candidate-business-verification"
 
 if not release.is_dir() or release.is_symlink() or not backup.is_dir() or backup.is_symlink():
@@ -1994,6 +2116,26 @@ version = version_path.read_text(encoding="utf-8").strip()
 commit = commit_path.read_text(encoding="utf-8").strip()
 if not version or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
     raise SystemExit(1)
+if evidence_mode == "v3":
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", qa_tooling_release_id) is None
+        or re.fullmatch(r"[0-9a-f]{40}", qa_tooling_commit) is None
+        or re.fullmatch(r"[0-9a-f]{64}", qa_tooling_package_sha256) is None
+        or not qa_tooling_release.is_dir()
+        or qa_tooling_release.is_symlink()
+    ):
+        raise SystemExit(1)
+    qa_commit_path = qa_tooling_release / "COMMIT"
+    qa_package_path = qa_tooling_release / "PACKAGE_SHA256"
+    if (
+        not qa_commit_path.is_file()
+        or qa_commit_path.is_symlink()
+        or not qa_package_path.is_file()
+        or qa_package_path.is_symlink()
+        or qa_commit_path.read_text(encoding="utf-8").strip() != qa_tooling_commit
+        or qa_package_path.read_text(encoding="utf-8").strip() != qa_tooling_package_sha256
+    ):
+        raise SystemExit(1)
 value = marker.read_text(encoding="utf-8").strip()
 kind, separator, digest = value.partition(":")
 if separator != ":" or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -2008,6 +2150,35 @@ if kind in {"smoke", "smoke-v3"}:
         raise SystemExit(1)
     payload = json.loads(raw)
     if evidence_mode == "v3":
+        qa_identity = payload.get("qa_tooling_identity")
+        if (
+            not isinstance(qa_identity, dict)
+            or set(qa_identity) != {"release_id", "commit", "package_sha256"}
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}",
+                str(qa_identity.get("release_id", "")),
+            )
+            is None
+            or qa_identity.get("commit") != qa_tooling_commit
+            or qa_identity.get("package_sha256") != qa_tooling_package_sha256
+        ):
+            raise SystemExit(1)
+        recorded_qa_release = app_root / "releases" / qa_identity["release_id"]
+        recorded_qa_commit = recorded_qa_release / "COMMIT"
+        recorded_qa_package = recorded_qa_release / "PACKAGE_SHA256"
+        if (
+            not recorded_qa_release.is_dir()
+            or recorded_qa_release.is_symlink()
+            or not recorded_qa_commit.is_file()
+            or recorded_qa_commit.is_symlink()
+            or not recorded_qa_package.is_file()
+            or recorded_qa_package.is_symlink()
+            or recorded_qa_commit.read_text(encoding="utf-8").strip()
+            != qa_tooling_commit
+            or recorded_qa_package.read_text(encoding="utf-8").strip()
+            != qa_tooling_package_sha256
+        ):
+            raise SystemExit(1)
         required_checks = {
             "candidate_release_identity_ok",
             "tenant_login_ok",
@@ -2020,6 +2191,9 @@ if kind in {"smoke", "smoke-v3"}:
             "client_credit_transactions_ok",
             "client_orders_ok",
             "client_credit_packs_ok",
+            "personal_assistant_preflight_ok",
+            "agent_employee_ready_ok",
+            "agent_employee_preflight_ok",
             "work_executor_preflight_ok",
             "work_task_executed_ok",
             "work_task_output_marker_ok",
@@ -2086,9 +2260,23 @@ if kind in {"smoke", "smoke-v3"}:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise SystemExit(1)
         if payload.get("work_executor_preflight") != {
-            "capability_status": "available",
-            "reason_count": 0,
+            "personal_assistant": {
+                "capability_status": "available",
+                "reason_count": 0,
+            },
+            "agent_employee": {
+                "capability_status": "available",
+                "reason_count": 0,
+            },
         }:
+            raise SystemExit(1)
+        agent_employee = payload.get("agent_employee")
+        if (
+            not isinstance(agent_employee, dict)
+            or set(agent_employee) != {"created_for_release_qa", "ready"}
+            or type(agent_employee.get("created_for_release_qa")) is not bool
+            or agent_employee.get("ready") is not True
+        ):
             raise SystemExit(1)
         if payload.get("billing_mode") != {
             "provider": "manual",
@@ -2104,6 +2292,7 @@ if kind in {"smoke", "smoke-v3"}:
         if not isinstance(api_flow, dict) or not isinstance(ui_flow, dict):
             raise SystemExit(1)
         if api_flow.get("work") != {
+            "executor_kind": "agent_employee",
             "execution_status": "completed",
             "output_marker_verified": True,
             "create_replayed": True,
@@ -2123,7 +2312,7 @@ if kind in {"smoke", "smoke-v3"}:
             or api_group.get("member_visibility") is not True
             or api_group.get("message_replayed") is not True
             or not isinstance(api_topology, dict)
-            or api_topology.get("assistant_visible") is not True
+            or api_topology.get("employee_visible") is not True
             or api_topology.get("completed_work_visible") is not True
             or not isinstance(api_topology.get("node_count"), int)
             or isinstance(api_topology.get("node_count"), bool)
@@ -5070,6 +5259,32 @@ select_recovery_target || {
     echo "cannot select a safe cutover recovery target" >&2
     exit 1
 }
+if [ "$RECOVERY_QA_TOOLING_BASE_COMMIT" != "none" ]; then
+    [ "$RECOVERY_REQUIRED" = "1" ] && [ "$CUTOVER_NONTERMINAL" = "1" ] || {
+        echo "recovery QA tooling authorization is stale or no longer required" >&2
+        exit 1
+    }
+    RECOVERY_QA_TARGET_RELEASE="$(release_for_slot "$RECOVERY_TARGET_SLOT")" || {
+        echo "cannot resolve the QA-tooling recovery target" >&2
+        exit 1
+    }
+    RECOVERY_QA_TARGET_COMMIT="$(
+        tr -d '[:space:]' < "$RECOVERY_QA_TARGET_RELEASE/COMMIT"
+    )" || exit 1
+    [ "$RECOVERY_QA_TARGET_COMMIT" = "$RECOVERY_QA_TOOLING_BASE_COMMIT" ] || {
+        echo "recovery candidate changed after the local QA tooling diff gate" >&2
+        exit 1
+    }
+elif [ "$RECOVERY_REQUIRED" = "1" ] && [ "$CUTOVER_NONTERMINAL" = "1" ]; then
+    RECOVERY_QA_TARGET_RELEASE="$(release_for_slot "$RECOVERY_TARGET_SLOT")" || exit 1
+    RECOVERY_QA_TARGET_COMMIT="$(
+        tr -d '[:space:]' < "$RECOVERY_QA_TARGET_RELEASE/COMMIT"
+    )" || exit 1
+    [ "$RECOVERY_QA_TARGET_COMMIT" = "$COMMIT" ] || {
+        echo "nonterminal recovery needs a locally verified QA-tooling diff" >&2
+        exit 1
+    }
+fi
 if [ "$RECOVERY_REQUIRED" = "1" ] && [ "$RUN_REMOTE_SMOKE" = "1" ]; then
     RECOVERY_BROWSER_RELEASE="$(release_for_slot "$RECOVERY_TARGET_SLOT")" || {
         echo "cannot resolve the browser-gated recovery release" >&2
@@ -6073,8 +6288,12 @@ PY_RECOVERED_RELEASE_RESULT
 import sys
 
 allowed = {
+    "RELEASE_NOTES.md",
     "backend/tests/test_production_deploy_contract.py",
+    "backend/tests/test_subscription_smoke_evidence.py",
     "scripts/deploy-astra-production.sh",
+    "scripts/merge_subscription_smoke_evidence.py",
+    "scripts/subscription_production_smoke.py",
 }
 changed = {line for line in sys.argv[1].splitlines() if line}
 if changed and not changed.issubset(allowed):

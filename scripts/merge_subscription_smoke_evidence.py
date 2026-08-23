@@ -26,6 +26,9 @@ API_CHECKS = {
     "client_credit_transactions_ok",
     "client_orders_ok",
     "client_credit_packs_ok",
+    "personal_assistant_preflight_ok",
+    "agent_employee_ready_ok",
+    "agent_employee_preflight_ok",
     "work_executor_preflight_ok",
     "work_task_executed_ok",
     "work_task_output_marker_ok",
@@ -101,6 +104,7 @@ def read_api_business_flow(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(flow, dict) or set(flow) != {"work", "group", "topology", "credits"}:
         raise ValueError("unsafe API business-flow evidence")
     expected_work = {
+        "executor_kind": "agent_employee",
         "execution_status": "completed",
         "output_marker_verified": True,
         "create_replayed": True,
@@ -125,10 +129,10 @@ def read_api_business_flow(payload: dict[str, Any]) -> dict[str, Any]:
     topology = flow.get("topology")
     if (
         not isinstance(topology, dict)
-        or set(topology) != {"node_count", "assistant_visible", "completed_work_visible"}
+        or set(topology) != {"node_count", "employee_visible", "completed_work_visible"}
         or type(topology.get("node_count")) is not int
         or topology["node_count"] < 1
-        or topology.get("assistant_visible") is not True
+        or topology.get("employee_visible") is not True
         or topology.get("completed_work_visible") is not True
     ):
         raise ValueError("topology business-flow evidence is incomplete")
@@ -223,6 +227,9 @@ def main() -> int:
     parser.add_argument("--evidence-nonce", required=True)
     parser.add_argument("--runner-bundle-sha256", required=True)
     parser.add_argument("--browser-image-id", required=True)
+    parser.add_argument("--qa-tooling-release-id", required=True)
+    parser.add_argument("--qa-tooling-commit", required=True)
+    parser.add_argument("--qa-tooling-package-sha256", required=True)
     args = parser.parse_args()
 
     api = read_evidence(args.api_evidence, "release_business_api")
@@ -258,6 +265,12 @@ def main() -> int:
         raise ValueError("invalid runner bundle digest")
     if re.fullmatch(r"sha256:[0-9a-f]{64}", args.browser_image_id) is None:
         raise ValueError("invalid browser image ID")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", args.qa_tooling_release_id) is None:
+        raise ValueError("invalid QA tooling release ID")
+    if re.fullmatch(r"[0-9a-f]{40}", args.qa_tooling_commit) is None:
+        raise ValueError("invalid QA tooling commit")
+    if re.fullmatch(r"[0-9a-f]{64}", args.qa_tooling_package_sha256) is None:
+        raise ValueError("invalid QA tooling package digest")
     api_checks = set(api.get("checks") or [])
     ui_checks = set(ui.get("checks") or [])
     if not API_CHECKS.issubset(api_checks):
@@ -278,11 +291,26 @@ def main() -> int:
     ui_business_flow = read_ui_business_flow(ui)
 
     work_executor_preflight = api.get("work_executor_preflight")
-    if work_executor_preflight != {
-        "capability_status": "available",
-        "reason_count": 0,
-    }:
+    expected_executor_preflight = {
+        "personal_assistant": {
+            "capability_status": "available",
+            "reason_count": 0,
+        },
+        "agent_employee": {
+            "capability_status": "available",
+            "reason_count": 0,
+        },
+    }
+    if work_executor_preflight != expected_executor_preflight:
         raise ValueError("Work executor preflight evidence is unavailable")
+    agent_employee = api.get("agent_employee")
+    if (
+        not isinstance(agent_employee, dict)
+        or set(agent_employee) != {"created_for_release_qa", "ready"}
+        or type(agent_employee.get("created_for_release_qa")) is not bool
+        or agent_employee.get("ready") is not True
+    ):
+        raise ValueError("Release QA Agent employee evidence is incomplete")
 
     api_summary = api.get("subscription_summary")
     ui_summary = ui.get("subscription_summary")
@@ -309,6 +337,11 @@ def main() -> int:
         "api_base": args.api_base.rstrip("/"),
         "frontend_url": args.frontend_url.rstrip("/"),
         "release_identity": expected_identity,
+        "qa_tooling_identity": {
+            "release_id": args.qa_tooling_release_id,
+            "commit": args.qa_tooling_commit,
+            "package_sha256": args.qa_tooling_package_sha256,
+        },
         "evidence_nonce": args.evidence_nonce,
         "browser_gate": {
             "runner_bundle_sha256": args.runner_bundle_sha256,
@@ -321,7 +354,8 @@ def main() -> int:
             "api": api_business_flow,
             "ui": ui_business_flow,
         },
-        "work_executor_preflight": work_executor_preflight,
+        "work_executor_preflight": expected_executor_preflight,
+        "agent_employee": dict(agent_employee),
         "ui": {
             "final_path": ui.get("final_path"),
             "browser_target": ui.get("browser_target"),

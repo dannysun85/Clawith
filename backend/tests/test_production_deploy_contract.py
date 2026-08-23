@@ -698,7 +698,11 @@ def test_production_identity_preflight_runs_before_maintenance_and_redacts_value
     assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in script
     assert 'gzip -n -c "$PACKAGE_TAR" > "$PACKAGE"' in script
     assert '"$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" \\' in script
-    assert '"$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" <<\'REMOTE_LOADER\'' in script
+    assert (
+        '"$SMOKE_PRINCIPAL_DEACTIVATE_OPERATION_ID" \\\n'
+        '    "$RECOVERY_QA_TOOLING_BASE_COMMIT" <<\'REMOTE_LOADER\''
+        in script
+    )
     assert 'cat > "$REMOTE_SCRIPT_FILE" <<\'REMOTE_SCRIPT\'' in script
     assert 'bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null' in script
     assert '" > "$raw_path" < /dev/null; then' in function
@@ -811,7 +815,8 @@ def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
     assert "remote-smoke-break-glass.approval" in script
     assert "remote-smoke-break-glass.sha256" in script
     assert "remote-smoke-break-glass.nonce-sha256" in script
-    assert 'python3 "$target_release/scripts/subscription_production_smoke.py"' in script
+    assert 'python3 "$RELEASE/scripts/subscription_production_smoke.py"' in script
+    assert 'python3 "$RELEASE/scripts/merge_subscription_smoke_evidence.py"' in script
     assert '"$image" \\\n        --frontend-url "http://candidate-frontend:3000"' in script
     assert 'source "$SMOKE_ENV_FILE"' not in script
     assert '--credentials-file "$SMOKE_ENV_FILE"' in script
@@ -1003,8 +1008,12 @@ def test_recovered_release_result_is_identity_bound_and_checks_runtime_equivalen
     assert 'git merge-base --is-ancestor "$EXPECTED_COMMIT" "$COMMIT"' in script
     assert 'stat -c \'%a\' "$result_file"' in script
     assert 'stat -c \'%s\' "$result_file"' in script
+    assert '"RELEASE_NOTES.md"' in script
     assert '"backend/tests/test_production_deploy_contract.py"' in script
     assert '"scripts/deploy-astra-production.sh"' in script
+    assert '"scripts/subscription_production_smoke.py"' in script
+    assert '"scripts/merge_subscription_smoke_evidence.py"' in script
+    assert '"backend/tests/test_subscription_smoke_evidence.py"' in script
 
 
 @pytest.mark.parametrize(
@@ -1043,8 +1052,17 @@ def test_recovered_release_result_parser_accepts_identity_bound_payload():
         ("", 0),
         ("scripts/deploy-astra-production.sh", 0),
         (
+            "RELEASE_NOTES.md\n"
             "scripts/deploy-astra-production.sh\n"
             "backend/tests/test_production_deploy_contract.py",
+            0,
+        ),
+        (
+            "RELEASE_NOTES.md\n"
+            "scripts/deploy-astra-production.sh\n"
+            "scripts/subscription_production_smoke.py\n"
+            "scripts/merge_subscription_smoke_evidence.py\n"
+            "backend/tests/test_subscription_smoke_evidence.py",
             0,
         ),
         ("backend/app/main.py", 1),
@@ -1054,6 +1072,37 @@ def test_recovered_release_result_parser_accepts_identity_bound_payload():
 def test_recovered_candidate_diff_guard_is_fail_closed(changed_files, expected_status):
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     guard = _heredoc_source(script, "PY_RECOVERED_RELEASE_DIFF")
+
+    result = _run_embedded_python(guard, changed_files)
+
+    assert (result.returncode == 0) is (expected_status == 0), result.stderr
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "expected_status"),
+    [
+        ("", 0),
+        ("RELEASE_NOTES.md", 0),
+        ("scripts/subscription_production_smoke.py", 0),
+        (
+            "RELEASE_NOTES.md\n"
+            "scripts/deploy-astra-production.sh\n"
+            "scripts/subscription_production_smoke.py\n"
+            "scripts/merge_subscription_smoke_evidence.py\n"
+            "backend/tests/test_production_deploy_contract.py\n"
+            "backend/tests/test_subscription_smoke_evidence.py",
+            0,
+        ),
+        ("backend/app/main.py", 1),
+        ("scripts/subscription_production_smoke.py\nfrontend/src/App.tsx", 1),
+    ],
+)
+def test_nonterminal_recovery_qa_tooling_diff_guard_is_fail_closed(
+    changed_files,
+    expected_status,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    guard = _heredoc_source(script, "PY_RECOVERY_QA_TOOLING_DIFF")
 
     result = _run_embedded_python(guard, changed_files)
 
@@ -1211,7 +1260,18 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
     )
     release_id = "candidate-release-v3"
     commit = "b" * 40
+    package_sha256 = "c" * 64
     release = _write_test_release(tmp_path, release_id, commit=commit)
+    (release / "PACKAGE_SHA256").write_text(f"{package_sha256}\n", encoding="utf-8")
+    prior_qa_release = _write_test_release(
+        tmp_path,
+        "prior-qa-tooling-release",
+        commit=commit,
+    )
+    (prior_qa_release / "PACKAGE_SHA256").write_text(
+        f"{package_sha256}\n",
+        encoding="utf-8",
+    )
     browser_dir = release / "deploy/browser-smoke"
     browser_dir.mkdir(parents=True)
     bundle_names = (
@@ -1249,6 +1309,9 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
         "client_credit_transactions_ok",
         "client_orders_ok",
         "client_credit_packs_ok",
+        "personal_assistant_preflight_ok",
+        "agent_employee_ready_ok",
+        "agent_employee_preflight_ok",
         "work_executor_preflight_ok",
         "work_task_executed_ok",
         "work_task_output_marker_ok",
@@ -1290,6 +1353,11 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
             "commit": commit,
             "release_id": release_id,
         },
+        "qa_tooling_identity": {
+            "release_id": release_id,
+            "commit": commit,
+            "package_sha256": package_sha256,
+        },
         "evidence_nonce": "1" * 32,
         "browser_gate": {
             "runner_bundle_sha256": runner_digest,
@@ -1303,8 +1371,18 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
             "reserved": 10,
         },
         "work_executor_preflight": {
-            "capability_status": "available",
-            "reason_count": 0,
+            "personal_assistant": {
+                "capability_status": "available",
+                "reason_count": 0,
+            },
+            "agent_employee": {
+                "capability_status": "available",
+                "reason_count": 0,
+            },
+        },
+        "agent_employee": {
+            "created_for_release_qa": False,
+            "ready": True,
         },
         "billing_mode": {
             "provider": "manual",
@@ -1316,6 +1394,7 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
         "business_flow": {
             "api": {
                 "work": {
+                    "executor_kind": "agent_employee",
                     "execution_status": "completed",
                     "output_marker_verified": True,
                     "create_replayed": True,
@@ -1330,7 +1409,7 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
                 },
                 "topology": {
                     "node_count": 1,
-                    "assistant_visible": True,
+                    "employee_visible": True,
                     "completed_work_visible": True,
                 },
                 "credits": {
@@ -1389,6 +1468,9 @@ def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_pa
     }
     harness = f"""set -e
 APP_ROOT={shlex.quote(str(tmp_path))}
+RELEASE_ID={release_id}
+COMMIT={commit}
+PACKAGE_SHA256={package_sha256}
 {browser_helpers}
 {verifier}
 candidate_business_evidence_valid {release_id} 3009
@@ -1405,19 +1487,40 @@ candidate_business_evidence_valid {release_id} 3009
         )
 
     assert verify().returncode == 0
+    write_evidence(
+        {
+            **payload,
+            "qa_tooling_identity": {
+                **payload["qa_tooling_identity"],
+                "release_id": "prior-qa-tooling-release",
+            },
+        }
+    )
+    assert verify().returncode == 0
+    write_evidence(payload)
     invalid_payloads = [
         {**payload, "frontend_url": "http://127.0.0.1:3008"},
         {**payload, "checks": required_checks[:-1]},
         {
             **payload,
             "work_executor_preflight": {
-                "capability_status": "unavailable",
-                "reason_count": 1,
+                **payload["work_executor_preflight"],
+                "agent_employee": {
+                    "capability_status": "unavailable",
+                    "reason_count": 1,
+                },
             },
         },
         {
             **payload,
             "release_identity": {**payload["release_identity"], "release_id": "other"},
+        },
+        {
+            **payload,
+            "qa_tooling_identity": {
+                **payload["qa_tooling_identity"],
+                "commit": "d" * 40,
+            },
         },
         {
             **payload,
@@ -1488,6 +1591,19 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert "ui_direct_chat_recovery_ok" in browser_runner
     assert "ui_group_persistence_ok" in browser_runner
     assert "ui_workforce_topology_ok" in browser_runner
+    assert '"executor_kind": "agent_employee"' in api_runner
+    assert '"executor_kind": "personal_assistant"' in api_runner
+    assert '"employee_visible": True' in api_runner
+    assert '"assistant_visible": True' not in api_runner
+    assert '"$RECOVERY_QA_TOOLING_BASE_COMMIT"' in script
+    recovery_guard = script.index(
+        'recovery candidate changed after the local QA tooling diff gate'
+    )
+    recovery_browser = script.index(
+        'ensure_browser_smoke_image \\\n'
+        '            "$RECOVERY_BROWSER_RELEASE" "$RECOVERY_TARGET_RELEASE_ID"'
+    )
+    assert recovery_guard < recovery_browser
     assert "await Promise.all" in browser_runner
     assert '"body": body' not in api_runner
     assert "body[:200]" not in api_runner

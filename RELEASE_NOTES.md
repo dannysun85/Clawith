@@ -5,9 +5,9 @@
 - The formal blue-green deployment now executes a real, synthetic Release QA
   commercial workflow on the isolated candidate before public traffic moves:
   owner/member permission boundaries, manual billing truth, a personal-assistant
-  Work task, immutable owner review, collaboration Group persistence, employee
-  topology refresh, and a browser-driven Direct Chat round trip with reload
-  recovery.
+  route preflight and Direct Chat round trip, a real agent-employee Work task
+  with immutable owner review and topology refresh, and collaboration Group
+  persistence with browser reload recovery.
 - Work creation and result review are replayed with the same client request IDs.
   The gate rejects a duplicate Task, duplicate review, additional Credits
   transaction, changed balance, or unsettled reservation.
@@ -16,6 +16,10 @@
   task failure, missing output marker, topology mismatch, Group visibility
   failure, chat timeout, browser console error, 5xx response, or Credits drift
   aborts before cutover.
+- Recovery evidence records the application candidate and QA-tooling identities
+  separately. A nonterminal cutover accepts only the reviewed release notes,
+  deployment gate, smoke runners, and their regression tests as a tooling-only
+  delta; application or frontend changes fail closed.
 - The workflow runs only in the dedicated synthetic Release QA tenant. Evidence
   contains counts, booleans, hashes, and release identity; it excludes account
   passwords, user/Agent IDs, message bodies, and provider secrets.

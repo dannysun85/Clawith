@@ -52,6 +52,7 @@ REQUIRED_CREDENTIAL_KEYS = {
     "SMOKE_PLATFORM_ADMIN_EMAIL",
     "SMOKE_PLATFORM_ADMIN_PASSWORD",
 }
+RELEASE_QA_EMPLOYEE_NAME = "Release QA 商业验收数字员工"
 
 
 class SmokeFailure(RuntimeError):
@@ -148,8 +149,12 @@ def summarize_reconciliation(
     return {checked_field: checked, "issue_count": 0}
 
 
-def summarize_work_executor_preflight(payload: Any) -> dict[str, Any]:
-    """Require the real tenant's personal assistant to pass Work intake.
+def summarize_work_executor_preflight(
+    payload: Any,
+    *,
+    executor_kind: str,
+) -> dict[str, Any]:
+    """Require one explicit executor route to pass Work intake.
 
     The evidence intentionally excludes Agent IDs, names, and route details.
     This is a read-only preflight: it neither creates a Task nor calls a model.
@@ -167,7 +172,7 @@ def summarize_work_executor_preflight(payload: Any) -> dict[str, Any]:
         capability_status == "available" and reasons == [],
         "work_executor_preflight",
         {
-            "code": "personal_assistant_route_unavailable",
+            "code": f"{executor_kind}_route_unavailable",
             "capability_status": capability_status,
             "reason_count": len(reasons) if isinstance(reasons, list) else None,
         },
@@ -179,6 +184,105 @@ def summarize_work_executor_preflight(payload: Any) -> dict[str, Any]:
         {"code": "invalid_confirmation_fingerprint"},
     )
     return {"capability_status": "available", "reason_count": 0}
+
+
+def _release_qa_employee_from_roster(payload: Any) -> dict[str, Any] | None:
+    """Find the one dedicated employee without leaking the rest of the roster."""
+
+    require(
+        isinstance(payload, list),
+        "agent_employee_roster",
+        {"code": "invalid_agent_roster"},
+    )
+    named = [
+        item
+        for item in payload
+        if isinstance(item, dict) and item.get("name") == RELEASE_QA_EMPLOYEE_NAME
+    ]
+    require(
+        len(named) <= 1,
+        "agent_employee_roster",
+        {"code": "duplicate_release_qa_employees", "count": len(named)},
+    )
+    if not named:
+        return None
+    employee = named[0]
+    require(
+        employee.get("product_role") == "agent_employee",
+        "agent_employee_roster",
+        {"code": "release_qa_employee_has_wrong_product_role"},
+    )
+    _uuid_text(employee.get("id"), "agent_employee_roster")
+    return employee
+
+
+def _ensure_release_qa_employee(
+    api_base: str,
+    token: str,
+    *,
+    timeout_seconds: int = 180,
+) -> tuple[str, bool]:
+    """Idempotently recruit one real employee in the dedicated Release QA tenant."""
+
+    status, roster = call_api("GET", api_base, "/agents/", token=token)
+    require(status == 200, "agent_employee_roster", {"status": status})
+    employee = _release_qa_employee_from_roster(roster)
+    created = False
+    if employee is None:
+        status, employee = call_api(
+            "POST",
+            api_base,
+            "/agents/",
+            {
+                "name": RELEASE_QA_EMPLOYEE_NAME,
+                "agent_type": "native",
+                "role_description": "执行 Release QA 商业工作流并验证数字员工任务拓扑。",
+                "bio": "仅用于专用 Release QA 公司，不代表客户或生产运营员工。",
+                "personality": "准确、简洁、严格遵守任务验收条件。",
+                "boundaries": "不得读取或输出凭据、客户数据或其他租户信息。",
+                "permission_scope_type": "company",
+                "permission_access_level": "manage",
+                "preferred_modality": "text",
+            },
+            token=token,
+        )
+        require(
+            status == 201 and isinstance(employee, dict),
+            "agent_employee_create",
+            {"code": "employee_not_created", "status": status},
+        )
+        created = True
+
+    employee_id = _uuid_text(employee.get("id"), "agent_employee_ready")
+    deadline = time.monotonic() + timeout_seconds
+    last_status = str(employee.get("status") or "unknown")
+    while time.monotonic() < deadline:
+        status, detail = call_api(
+            "GET",
+            api_base,
+            f"/agents/{employee_id}",
+            token=token,
+        )
+        require(
+            status == 200 and isinstance(detail, dict),
+            "agent_employee_ready",
+            {"code": "employee_detail_unavailable", "status": status},
+        )
+        require(
+            detail.get("product_role") == "agent_employee",
+            "agent_employee_ready",
+            {"code": "release_qa_employee_has_wrong_product_role"},
+        )
+        last_status = str(detail.get("status") or "unknown")
+        if last_status in {"running", "idle"}:
+            return employee_id, created
+        if last_status in {"error", "stopped"}:
+            break
+        time.sleep(1)
+    raise SmokeFailure(
+        "agent_employee_ready",
+        {"code": "release_qa_employee_not_executable", "status": last_status},
+    )
 
 
 def summarize_manual_billing_config(payload: Any) -> dict[str, Any]:
@@ -363,7 +467,7 @@ def _poll_topology(
                 "analytics": "governor_or_managed",
             }
         ):
-            return {"node_count": len(nodes), "assistant_visible": True, "completed_work_visible": True}
+            return {"node_count": len(nodes), "employee_visible": True, "completed_work_visible": True}
         time.sleep(1)
     raise SmokeFailure(
         "workforce_topology",
@@ -657,6 +761,51 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
     work_marker = f"{evidence_prefix}-WORK"
     task_title = f"{work_marker} 商业发布验收"
+    personal_assistant_draft = {
+        "title": f"{evidence_prefix}-PA-PREFLIGHT 私人助理路由验收",
+        "intent": "验证私人助理可以接收普通文本任务，但本预检不创建任务。",
+        "work_type": "general",
+        "priority": "low",
+        "routing_mode": "manual",
+        "executor_kind": "personal_assistant",
+        "acceptance_contract": {
+            "version": 1,
+            "criteria": ["私人助理文本路由可用"],
+            "required_sections": [],
+            "forbidden_terms": [],
+            "result_language": "zh-CN",
+            "length": {"unit": "cjk_characters", "maximum": 100},
+            "evidence_required": False,
+            "owner_review_required": False,
+        },
+    }
+    status, personal_assistant_preflight = call_api(
+        "POST",
+        api_base,
+        "/work/tasks/preflight",
+        personal_assistant_draft,
+        token=tenant_token,
+    )
+    require(
+        status == 200,
+        "personal_assistant_preflight",
+        {"code": "unexpected_http_status", "status": status},
+    )
+    personal_assistant_summary = summarize_work_executor_preflight(
+        personal_assistant_preflight,
+        executor_kind="personal_assistant",
+    )
+    summary["checks"].append("personal_assistant_preflight_ok")
+
+    employee_agent_id, employee_created = _ensure_release_qa_employee(
+        api_base,
+        tenant_token,
+    )
+    summary["agent_employee"] = {
+        "created_for_release_qa": employee_created,
+        "ready": True,
+    }
+    summary["checks"].append("agent_employee_ready_ok")
     task_draft = {
         "title": task_title,
         "intent": (
@@ -666,7 +815,8 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "work_type": "general",
         "priority": "low",
         "routing_mode": "manual",
-        "executor_kind": "personal_assistant",
+        "executor_kind": "agent_employee",
+        "agent_id": employee_agent_id,
         "acceptance_contract": {
             "version": 1,
             "criteria": [
@@ -704,12 +854,26 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "work_executor_preflight",
         {"code": "unexpected_http_status", "status": status},
     )
-    summary["work_executor_preflight"] = summarize_work_executor_preflight(body)
-    summary["checks"].append("work_executor_preflight_ok")
+    employee_preflight_summary = summarize_work_executor_preflight(
+        body,
+        executor_kind="agent_employee",
+    )
+    summary["work_executor_preflight"] = {
+        "personal_assistant": personal_assistant_summary,
+        "agent_employee": employee_preflight_summary,
+    }
+    summary["checks"].extend(
+        ["agent_employee_preflight_ok", "work_executor_preflight_ok"]
+    )
     require(isinstance(body, dict), "work_executor_preflight", {"code": "invalid_response"})
     proposal = body.get("executor_proposal")
     require(isinstance(proposal, dict), "work_executor_preflight", {"code": "missing_proposal"})
-    assistant_agent_id = _uuid_text(proposal.get("agent_id"), "work_executor_preflight")
+    proposed_employee_id = _uuid_text(proposal.get("agent_id"), "work_executor_preflight")
+    require(
+        proposed_employee_id == employee_agent_id,
+        "work_executor_preflight",
+        {"code": "unexpected_agent_employee_route"},
+    )
     confirmation_fingerprint = str(body.get("confirmation_fingerprint") or "")
 
     work_request_id = str(uuid.uuid5(evidence_namespace, "release-work-task"))
@@ -837,7 +1001,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     topology_summary = _poll_topology(
         api_base,
         tenant_token,
-        agent_id=assistant_agent_id,
+        agent_id=employee_agent_id,
         task_title=task_title,
     )
     summary["checks"].append("workforce_topology_refresh_ok")
@@ -983,6 +1147,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     }
     summary["business_flow"] = {
         "work": {
+            "executor_kind": "agent_employee",
             "execution_status": "completed",
             "output_marker_verified": True,
             "create_replayed": True,
