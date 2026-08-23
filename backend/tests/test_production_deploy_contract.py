@@ -1061,6 +1061,7 @@ def test_recovered_release_result_parser_accepts_identity_bound_payload():
         (
             "RELEASE_NOTES.md\n"
             "scripts/deploy-astra-production.sh\n"
+            "deploy/browser-smoke/browser_launch_selftest.mjs\n"
             "deploy/browser-smoke/subscription_browser_smoke.mjs\n"
             "scripts/subscription_production_smoke.py\n"
             "scripts/merge_subscription_smoke_evidence.py\n"
@@ -1089,6 +1090,7 @@ def test_recovered_candidate_diff_guard_is_fail_closed(changed_files, expected_s
         (
             "RELEASE_NOTES.md\n"
             "scripts/deploy-astra-production.sh\n"
+            "deploy/browser-smoke/browser_launch_selftest.mjs\n"
             "deploy/browser-smoke/subscription_browser_smoke.mjs\n"
             "scripts/subscription_production_smoke.py\n"
             "scripts/merge_subscription_smoke_evidence.py\n"
