@@ -1016,6 +1016,7 @@ ensure_browser_smoke_image() {
         --tmpfs /tmp:rw,nosuid,nodev,size=256m \
         --tmpfs /home/pwuser:rw,nosuid,nodev,size=64m \
         --env HOME=/home/pwuser \
+        --env XDG_CONFIG_HOME=/tmp/astra-browser-smoke-config \
         --network "$BROWSER_SMOKE_NETWORK" \
         --entrypoint node \
         "$image" \
@@ -2026,6 +2027,7 @@ PY_BROWSER_CREDENTIALS
         --tmpfs /tmp:rw,nosuid,nodev,size=256m \
         --tmpfs /home/pwuser:rw,nosuid,nodev,size=64m \
         --env HOME=/home/pwuser \
+        --env XDG_CONFIG_HOME=/tmp/astra-browser-smoke-config \
         --network "$BROWSER_SMOKE_NETWORK" \
         --mount \
             "type=bind,src=$browser_credentials,dst=/run/secrets/smoke-credentials.json,readonly" \
