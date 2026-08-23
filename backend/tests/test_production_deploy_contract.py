@@ -1583,6 +1583,11 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert "SMOKE_PLATFORM_ADMIN" not in browser_runner
     assert "credentials.SMOKE_TENANT_PASSWORD" in browser_runner
     assert "credentials.SMOKE_TENANT_ID" in browser_runner
+    assert "frontendOrigin === 'http://candidate-frontend:3000'" in browser_runner
+    assert '--unsafely-treat-insecure-origin-as-secure=${frontendOrigin}' in browser_runner
+    assert "secureContextParity.is_secure_context === true" in browser_runner
+    assert "secureContextParity.random_uuid_available === true" in browser_runner
+    assert "ui_secure_context_parity_ok" in browser_runner
     assert "requires_tenant_selection" in browser_runner
     assert "target_tenant_not_available" in browser_runner
     assert "isolated_candidate_frontend_network" in browser_runner
