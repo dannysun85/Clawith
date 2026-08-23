@@ -1621,6 +1621,13 @@ candidate_business_evidence_valid {release_id} 3009
                 },
             },
         },
+        {
+            **payload,
+            "ui": {
+                **payload["ui"],
+                "tolerated_runtime_state_conflicts": 2,
+            },
+        },
     ]
     for invalid in invalid_payloads:
         write_evidence(invalid)

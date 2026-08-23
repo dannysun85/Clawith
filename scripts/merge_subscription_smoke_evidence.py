@@ -257,6 +257,7 @@ def main() -> int:
     if (
         type(tolerated_runtime_state_conflicts) is not int
         or tolerated_runtime_state_conflicts < 0
+        or tolerated_runtime_state_conflicts > 1
     ):
         raise ValueError("UI runtime-state conflict evidence is invalid")
     if not len(args.evidence_nonce) == 32 or any(

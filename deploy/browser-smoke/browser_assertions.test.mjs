@@ -54,6 +54,53 @@ test('partitionBrowserIssues tolerates only a correlated direct-runtime 409', ()
 });
 
 
+test('partitionBrowserIssues rejects an HTTP-only runtime conflict', () => {
+  const path = '/api/agents/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/sessions/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runtime-state';
+  const result = partitionBrowserIssues({
+    httpErrors: [{ path, status: 409 }],
+    consoleErrors: [],
+  });
+
+  assert.deepEqual(result.toleratedHttpErrors, []);
+  assert.deepEqual(result.toleratedConsoleErrors, []);
+  assert.deepEqual(result.unexpectedHttpErrors, [{ path, status: 409 }]);
+  assert.deepEqual(result.unexpectedConsoleErrors, []);
+});
+
+
+test('partitionBrowserIssues rejects a console-only runtime conflict', () => {
+  const path = '/api/agents/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/sessions/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runtime-state';
+  const consoleIssue = { category: 'failed_resource', http_status: 409, source_path: path };
+  const result = partitionBrowserIssues({
+    httpErrors: [],
+    consoleErrors: [consoleIssue],
+  });
+
+  assert.deepEqual(result.toleratedHttpErrors, []);
+  assert.deepEqual(result.toleratedConsoleErrors, []);
+  assert.deepEqual(result.unexpectedHttpErrors, []);
+  assert.deepEqual(result.unexpectedConsoleErrors, [consoleIssue]);
+});
+
+
+test('partitionBrowserIssues requires an exact path and status match', () => {
+  const path = '/api/agents/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/sessions/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runtime-state';
+  const otherPath = '/api/agents/cccccccc-cccc-4ccc-8ccc-cccccccccccc/sessions/dddddddd-dddd-4ddd-8ddd-dddddddddddd/runtime-state';
+  const httpIssue = { path, status: 409 };
+  const pathMismatch = { category: 'failed_resource', http_status: 409, source_path: otherPath };
+  const statusMismatch = { category: 'failed_resource', http_status: 404, source_path: path };
+  const result = partitionBrowserIssues({
+    httpErrors: [httpIssue],
+    consoleErrors: [pathMismatch, statusMismatch],
+  });
+
+  assert.deepEqual(result.toleratedHttpErrors, []);
+  assert.deepEqual(result.toleratedConsoleErrors, []);
+  assert.deepEqual(result.unexpectedHttpErrors, [httpIssue]);
+  assert.deepEqual(result.unexpectedConsoleErrors, [pathMismatch, statusMismatch]);
+});
+
+
 test('partitionBrowserIssues never hides unrelated or uncorrelated browser failures', () => {
   const path = '/api/agents/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/sessions/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/runtime-state';
   const result = partitionBrowserIssues({
@@ -74,6 +121,7 @@ test('partitionBrowserIssues never hides unrelated or uncorrelated browser failu
     { path, status: 409 },
     { path: '/assets/missing.js', status: 404 },
   ]);
+  assert.equal(result.toleratedHttpErrors.length, 1);
   assert.equal(result.toleratedConsoleErrors.length, 1);
   assert.equal(result.unexpectedConsoleErrors.length, 3);
 });

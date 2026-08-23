@@ -30,42 +30,39 @@ const DIRECT_RUNTIME_STATE_PATH = new RegExp(
 
 
 export function partitionBrowserIssues({ consoleErrors, httpErrors }) {
-  const runtimeConflictBudget = new Map();
-  const toleratedHttpErrors = [];
-  const unexpectedHttpErrors = [];
+  let toleratedHttpIndex = -1;
+  let toleratedConsoleIndex = -1;
 
-  for (const issue of httpErrors) {
+  for (let httpIndex = 0; httpIndex < httpErrors.length; httpIndex += 1) {
+    const httpIssue = httpErrors[httpIndex];
     if (
-      toleratedHttpErrors.length === 0
-      && issue?.status === 409
-      && DIRECT_RUNTIME_STATE_PATH.test(issue?.path || '')
+      httpIssue?.status !== 409
+      || !DIRECT_RUNTIME_STATE_PATH.test(httpIssue?.path || '')
     ) {
-      toleratedHttpErrors.push(issue);
-      runtimeConflictBudget.set(
-        issue.path,
-        (runtimeConflictBudget.get(issue.path) || 0) + 1,
-      );
-    } else {
-      unexpectedHttpErrors.push(issue);
+      continue;
+    }
+
+    const consoleIndex = consoleErrors.findIndex((consoleIssue) => (
+      consoleIssue?.category === 'failed_resource'
+      && consoleIssue?.http_status === httpIssue.status
+      && consoleIssue?.source_path === httpIssue.path
+      && DIRECT_RUNTIME_STATE_PATH.test(consoleIssue.source_path)
+    ));
+    if (consoleIndex >= 0) {
+      toleratedHttpIndex = httpIndex;
+      toleratedConsoleIndex = consoleIndex;
+      break;
     }
   }
 
-  const toleratedConsoleErrors = [];
-  const unexpectedConsoleErrors = [];
-  for (const issue of consoleErrors) {
-    const remaining = runtimeConflictBudget.get(issue?.source_path) || 0;
-    if (
-      issue?.category === 'failed_resource'
-      && issue?.http_status === 409
-      && DIRECT_RUNTIME_STATE_PATH.test(issue?.source_path || '')
-      && remaining > 0
-    ) {
-      toleratedConsoleErrors.push(issue);
-      runtimeConflictBudget.set(issue.source_path, remaining - 1);
-    } else {
-      unexpectedConsoleErrors.push(issue);
-    }
-  }
+  const toleratedHttpErrors = httpErrors.filter((_, index) => index === toleratedHttpIndex);
+  const unexpectedHttpErrors = httpErrors.filter((_, index) => index !== toleratedHttpIndex);
+  const toleratedConsoleErrors = consoleErrors.filter(
+    (_, index) => index === toleratedConsoleIndex,
+  );
+  const unexpectedConsoleErrors = consoleErrors.filter(
+    (_, index) => index !== toleratedConsoleIndex,
+  );
 
   return {
     toleratedConsoleErrors,

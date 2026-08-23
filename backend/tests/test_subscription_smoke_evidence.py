@@ -315,6 +315,16 @@ def test_composite_smoke_evidence_requires_matching_api_and_browser_proof(tmp_pa
     assert mismatched_summary.returncode != 0
     malformed_bundle = _merge(tmp_path, api, ui, bundle="sha256:short")
     assert malformed_bundle.returncode != 0
+    for invalid_conflict_count in (None, True, -1, 2):
+        invalid_conflict_evidence = _merge(
+            tmp_path,
+            api,
+            {
+                **ui,
+                "tolerated_runtime_state_conflicts": invalid_conflict_count,
+            },
+        )
+        assert invalid_conflict_evidence.returncode != 0
     duplicate_credit_charge = _merge(
         tmp_path,
         {

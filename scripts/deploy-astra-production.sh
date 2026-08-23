@@ -2261,7 +2261,7 @@ if kind in {"smoke", "smoke-v3"}:
         if not isinstance(ui, dict) or ui.get("final_path") != "/account/subscription" or \
                 ui.get("browser_target") != "isolated_candidate_frontend_network" or \
                 type(ui.get("tolerated_runtime_state_conflicts")) is not int or \
-                ui["tolerated_runtime_state_conflicts"] < 0:
+                not 0 <= ui["tolerated_runtime_state_conflicts"] <= 1:
             raise SystemExit(1)
         summary = payload.get("subscription_summary")
         if not isinstance(summary, dict) or not {
