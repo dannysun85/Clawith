@@ -50,6 +50,46 @@ from app.services.platform_service import platform_service
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
 
+def _configured_platform_hosts(settings: object) -> set[str]:
+    """Return normalized hosts for every explicitly configured platform origin."""
+    raw_values = [str(getattr(settings, "PUBLIC_BASE_URL", "") or "").strip()]
+    raw_values.extend(
+        value.strip()
+        for value in str(
+            getattr(settings, "PUBLIC_BASE_URL_ALIASES", "") or ""
+        ).split(",")
+    )
+
+    hosts: set[str] = set()
+    for raw_value in raw_values:
+        if not raw_value:
+            continue
+        parsed = urlsplit(raw_value if "://" in raw_value else f"//{raw_value}")
+        if (
+            parsed.scheme.lower() not in {"", "http", "https"}
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or not parsed.hostname
+        ):
+            continue
+        try:
+            port = parsed.port
+        except ValueError:
+            continue
+        hostname = parsed.hostname.lower().rstrip(".")
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        if port is not None and not (
+            (parsed.scheme.lower() == "http" and port == 80)
+            or (parsed.scheme.lower() == "https" and port == 443)
+        ):
+            host = f"{host}:{port}"
+        hosts.add(host)
+    return hosts
+
+
 # ─── Schemas ────────────────────────────────────────────
 
 class TenantCreate(BaseModel):
@@ -832,12 +872,7 @@ async def resolve_tenant_by_domain(
     )
     if parsed_port is not None:
         normalized_domain = f"{normalized_domain}:{parsed_port}"
-    public_base_url = str(get_settings().PUBLIC_BASE_URL or "").strip()
-    parsed_public_url = urlsplit(
-        public_base_url if "://" in public_base_url else f"//{public_base_url}"
-    )
-    public_host = parsed_public_url.netloc.lower().rstrip(".")
-    if public_host and normalized_domain == public_host:
+    if normalized_domain in _configured_platform_hosts(get_settings()):
         # The platform root is intentionally tenant-neutral.  A successful
         # empty response avoids treating the expected fallback as a browser
         # network error while retaining 404 for unknown tenant-specific hosts.

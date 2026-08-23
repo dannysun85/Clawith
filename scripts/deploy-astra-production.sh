@@ -2716,6 +2716,53 @@ wait_for_public_release() {
     return 1
 }
 
+platform_root_resolution_is_neutral() {
+    local api_base="$1"
+    local domain
+    local response
+    domain="$(python3 - "$PUBLIC_URL" <<'PY_PLATFORM_ROOT_DOMAIN'
+import sys
+from urllib.parse import urlsplit
+
+parsed = urlsplit(sys.argv[1])
+if (
+    parsed.scheme.lower() not in {"http", "https"}
+    or parsed.username
+    or parsed.password
+    or not parsed.hostname
+    or parsed.path not in {"", "/"}
+    or parsed.query
+    or parsed.fragment
+):
+    raise SystemExit(1)
+try:
+    port = parsed.port
+except ValueError as exc:
+    raise SystemExit(1) from exc
+hostname = parsed.hostname.lower().rstrip(".")
+domain = f"[{hostname}]" if ":" in hostname else hostname
+if port is not None and not (
+    (parsed.scheme.lower() == "http" and port == 80)
+    or (parsed.scheme.lower() == "https" and port == 443)
+):
+    domain = f"{domain}:{port}"
+print(domain)
+PY_PLATFORM_ROOT_DOMAIN
+    )" || return 1
+    response="$(
+        curl -fsS -G \
+            --data-urlencode "domain=$domain" \
+            "${api_base%/}/tenants/resolve-by-domain"
+    )" || return 1
+    python3 - "$response" <<'PY_PLATFORM_ROOT_RESPONSE'
+import json
+import sys
+
+if json.loads(sys.argv[1]) is not None:
+    raise SystemExit(1)
+PY_PLATFORM_ROOT_RESPONSE
+}
+
 audit_effective_nginx() {
     sudo nginx -T 2>&1 | sudo python3 \
         "$RELEASE/scripts/configure_production_nginx.py" \
@@ -5468,10 +5515,11 @@ if [ ! -d "$RELEASE/sidecars" ] && [ -d "$PREVIOUS/sidecars" ]; then
     cp -a "$PREVIOUS/sidecars" "$RELEASE/sidecars"
 fi
 
-python3 - "$RELEASE/.env" "$VERSION" "$COMMIT" "$RELEASE_ID" "$CANDIDATE_PORT" "$CANDIDATE_BACKEND_ALIAS" "$ROTATE_JWT" <<'PY'
+python3 - "$RELEASE/.env" "$VERSION" "$COMMIT" "$RELEASE_ID" "$CANDIDATE_PORT" "$CANDIDATE_BACKEND_ALIAS" "$ROTATE_JWT" "$PUBLIC_URL" <<'PY'
 from pathlib import Path
 import secrets
 import sys
+from urllib.parse import urlsplit
 import uuid
 
 path = Path(sys.argv[1])
@@ -5550,6 +5598,67 @@ updates = {
 if sys.argv[7] == "1":
     updates["JWT_SECRET_KEY"] = secrets.token_urlsafe(64)
 lines = path.read_text(encoding="utf-8").splitlines()
+
+
+def read_env_value(key: str) -> str:
+    for line in lines:
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        candidate_key, raw_value = line.split("=", 1)
+        if candidate_key.strip() != key:
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
+def normalize_origin(value: str, *, source: str, allow_empty: bool = False) -> str:
+    value = value.strip()
+    if not value and allow_empty:
+        return ""
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or parsed.username
+        or parsed.password
+        or not parsed.hostname
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SystemExit(f"invalid {source} origin")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SystemExit(f"invalid {source} origin") from exc
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower().rstrip(".")
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+canonical_origin = normalize_origin(
+    read_env_value("PUBLIC_BASE_URL"),
+    source="PUBLIC_BASE_URL",
+    allow_empty=True,
+)
+configured_aliases = read_env_value("PUBLIC_BASE_URL_ALIASES").split(",")
+configured_aliases.append(sys.argv[8])
+normalized_aliases: list[str] = []
+for index, raw_alias in enumerate(configured_aliases, start=1):
+    if not raw_alias.strip():
+        continue
+    alias = normalize_origin(raw_alias, source=f"PUBLIC_BASE_URL_ALIASES[{index}]")
+    if alias != canonical_origin and alias not in normalized_aliases:
+        normalized_aliases.append(alias)
+updates["PUBLIC_BASE_URL_ALIASES"] = ",".join(normalized_aliases)
+
 seen = set()
 out = []
 for line in lines:
@@ -6095,6 +6204,10 @@ if ! wait_for_local_release \
     "$CANDIDATE_PORT" "$VERSION" "$COMMIT" "$RELEASE_ID" 60; then
     abort_release "candidate slot did not expose expected release $VERSION/$COMMIT"
 fi
+if ! platform_root_resolution_is_neutral \
+    "http://127.0.0.1:${CANDIDATE_PORT}/api"; then
+    abort_release "candidate does not treat PUBLIC_URL as a tenant-neutral platform root"
+fi
 curl -fsS "http://127.0.0.1:${CANDIDATE_PORT}/api/version" | tee "$BACKUP/version.candidate.json"
 CANDIDATE_READY_FOR_FALLBACK=1
 
@@ -6192,6 +6305,9 @@ write_cutover_state nginx_reloaded "$CANDIDATE_SLOT" "$RELEASE_ID"
 echo "[remote] verifying public cutover identity"
 if ! wait_for_public_release "$VERSION" "$COMMIT" "$RELEASE_ID" 30; then
     abort_release "public cutover did not expose expected release $VERSION/$COMMIT"
+fi
+if ! platform_root_resolution_is_neutral "$PUBLIC_URL/api"; then
+    abort_release "public login root domain resolution is not tenant-neutral"
 fi
 printf '%s\n%s\n' "$PUBLIC_HEALTH" "$PUBLIC_VERSION"
 printf '%s\n' "$PUBLIC_HEALTH" > "$BACKUP/health.public.json"

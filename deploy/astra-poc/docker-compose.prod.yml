@@ -54,6 +54,7 @@ services:
       ALLOW_UNVERIFIED_LOCAL_SIGNUP: "false"
       CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      PUBLIC_BASE_URL_ALIASES: ${PUBLIC_BASE_URL_ALIASES:-}
       # Checkout and WeChat notify stay on the payment origin even when the
       # product is also served from opc.reeftotem.ai.
       PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-https://opc.rama-server.com}

@@ -232,6 +232,74 @@ def test_provider_egress_proxy_is_explicitly_propagated_to_every_backend_path():
     assert ".Values.backend.env.httpProxy" in helm_backend
 
 
+def test_public_platform_aliases_are_propagated_and_release_pinned(tmp_path: Path):
+    compose_contracts = {
+        "docker-compose.yml": 1,
+        "deploy/docker-compose.yml": 1,
+        "deploy/docker-compose-multi.yml": 2,
+        # The production worker inherits the anchored backend environment.
+        "deploy/astra-poc/docker-compose.prod.yml": 1,
+    }
+    for relative_path, expected_count in compose_contracts.items():
+        compose = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert compose.count("PUBLIC_BASE_URL_ALIASES: ${PUBLIC_BASE_URL_ALIASES:-}") == expected_count
+
+    for env_example in (ROOT / ".env.example", ROOT / "deploy/.env.example"):
+        assert "PUBLIC_BASE_URL_ALIASES=" in env_example.read_text(encoding="utf-8")
+
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+    marker = (
+        'python3 - "$RELEASE/.env" "$VERSION" "$COMMIT" "$RELEASE_ID" '
+        '"$CANDIDATE_PORT" "$CANDIDATE_BACKEND_ALIAS" "$ROTATE_JWT" '
+        '"$PUBLIC_URL" <<\'PY\'\n'
+    )
+    source_start = script.index(marker) + len(marker)
+    source_end = script.index("\nPY\n", source_start)
+    rewrite_source = script[source_start:source_end]
+    candidate_env = tmp_path / "candidate.env"
+    candidate_env.write_text(
+        '\n'.join(
+            (
+                'PUBLIC_BASE_URL="https://opc.rama-server.com"',
+                'PUBLIC_BASE_URL_ALIASES="https://legacy.example.test"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    rewritten = _run_embedded_python(
+        rewrite_source,
+        str(candidate_env),
+        "1.12.2",
+        "a" * 40,
+        "release-test",
+        "3009",
+        "candidate-backend",
+        "0",
+        "https://OPC.REEFTOTEM.AI/",
+    )
+
+    assert rewritten.returncode == 0, rewritten.stderr
+    rewritten_values = {
+        line.split("=", 1)[0]: line.split("=", 1)[1].strip().strip('"')
+        for line in candidate_env.read_text(encoding="utf-8").splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    }
+    assert rewritten_values["PUBLIC_BASE_URL"] == "https://opc.rama-server.com"
+    assert rewritten_values["PUBLIC_BASE_URL_ALIASES"] == (
+        "https://legacy.example.test,https://opc.reeftotem.ai"
+    )
+    assert "platform_root_resolution_is_neutral" in script
+    assert (
+        "candidate does not treat PUBLIC_URL as a tenant-neutral platform root"
+        in script
+    )
+    assert "public login root domain resolution is not tenant-neutral" in script
+
+
 def test_wechat_pay_env_is_propagated_on_backend_compose_paths():
     production = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
         encoding="utf-8"

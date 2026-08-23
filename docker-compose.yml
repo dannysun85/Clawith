@@ -70,6 +70,7 @@ services:
       # Required when deployed behind a reverse proxy (e.g. Nginx, Cloudflare).
       # If not set, the server infers the URL from the incoming request host.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      PUBLIC_BASE_URL_ALIASES: ${PUBLIC_BASE_URL_ALIASES:-}
       PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-}
       BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}
       BILLING_USD_CNY_RATE: ${BILLING_USD_CNY_RATE:-7}

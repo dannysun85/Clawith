@@ -280,6 +280,10 @@ class Settings(BaseSettings):
     FEISHU_APP_SECRET: str = ""
     FEISHU_REDIRECT_URI: str = ""
     PUBLIC_BASE_URL: str = ""
+    # Additional public product origins that must remain tenant-neutral on the
+    # login page. Comma-separated full origins; unlike PUBLIC_BASE_URL these
+    # aliases are never used to construct callbacks or user-facing links.
+    PUBLIC_BASE_URL_ALIASES: str = ""
     # Dedicated origin for real-money checkout and payment callbacks. Empty
     # falls back to PUBLIC_BASE_URL so a product can be served on extra hosts
     # (for example opc.reeftotem.ai) while WeChat Pay stays on the merchant

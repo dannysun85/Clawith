@@ -270,6 +270,52 @@ async def test_resolve_platform_root_domain_returns_empty_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_platform_root_alias_returns_empty_success(monkeypatch):
+    """Every explicitly configured product origin stays tenant-neutral."""
+    monkeypatch.setattr(
+        tenants_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            PUBLIC_BASE_URL="https://opc.rama-server.com",
+            PUBLIC_BASE_URL_ALIASES=(
+                "https://opc.reeftotem.ai, https://preview.example.test:8443/"
+            ),
+        ),
+    )
+
+    assert await tenants_api.resolve_tenant_by_domain(
+        domain="OPC.REEFTOTEM.AI.",
+        db=RecordingDB(),
+    ) is None
+    assert await tenants_api.resolve_tenant_by_domain(
+        domain="preview.example.test:8443",
+        db=RecordingDB(),
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_unknown_domain_still_fails_closed_with_platform_aliases(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        tenants_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            PUBLIC_BASE_URL="https://opc.rama-server.com",
+            PUBLIC_BASE_URL_ALIASES="https://opc.reeftotem.ai",
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await tenants_api.resolve_tenant_by_domain(
+            domain="unknown.example.test",
+            db=RecordingDB(responses=[DummyResult()]),
+        )
+
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_get_tenant_sso_base_url_toggle():
     """Verify that get_tenant_sso_base_url respects the sso_redirect_enabled kwarg."""
     tenant = SimpleNamespace(
