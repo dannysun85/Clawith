@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { createRandomUUID } from '../src/utils/randomUUID.ts';
@@ -33,4 +36,26 @@ test('fails explicitly when no secure random source exists', () => {
     () => createRandomUUID(null),
     /secure random source is unavailable/i,
   );
+});
+
+test('frontend call sites use the compatibility helper instead of crypto.randomUUID', () => {
+  const srcRoot = fileURLToPath(new URL('../src', import.meta.url));
+  const unsupportedCallSites = [];
+
+  function inspectDirectory(directory) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        inspectDirectory(path);
+      } else if (/\.(?:ts|tsx)$/.test(entry.name)) {
+        const source = readFileSync(path, 'utf8');
+        if (/\bcrypto\.randomUUID\s*\(/.test(source)) {
+          unsupportedCallSites.push(path.slice(srcRoot.length + 1));
+        }
+      }
+    }
+  }
+
+  inspectDirectory(srcRoot);
+  assert.deepEqual(unsupportedCallSites, []);
 });

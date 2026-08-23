@@ -6,6 +6,7 @@ import { buildWorkspaceDownloadUrl } from '../utils/authTransport';
 import { reportClientIssue } from './productionIssueReporter';
 import type { AgentChannelEndpoint } from '../utils/agentChannelSetup';
 import { AppError, normalizeUnknownError, parseHttpError, parseHttpErrorResponse } from './apiError';
+import { createRandomUUID } from '../utils/randomUUID';
 
 export { ApiError, AppError } from './apiError';
 export type { ApiErrorContext, AppErrorContext, ErrorSource } from './apiError';
@@ -464,7 +465,7 @@ export const governanceApi = {
     createOrganizationInvitation: (
         tenantId: string,
         data: { email: string; role: 'member' | 'org_admin'; expires_in_days: number },
-        idempotencyKey = crypto.randomUUID(),
+        idempotencyKey = createRandomUUID(),
     ) => request<OrganizationInvitation>(`/governance/organizations/${tenantId}/invitations`, {
         method: 'POST',
         headers: { 'Idempotency-Key': idempotencyKey },
@@ -474,7 +475,7 @@ export const governanceApi = {
     resendOrganizationInvitation: (
         tenantId: string,
         invitationId: string,
-        idempotencyKey = crypto.randomUUID(),
+        idempotencyKey = createRandomUUID(),
     ) => request<OrganizationInvitation>(`/governance/organizations/${tenantId}/invitations/${invitationId}/resend`, {
         method: 'POST',
         headers: { 'Idempotency-Key': idempotencyKey },

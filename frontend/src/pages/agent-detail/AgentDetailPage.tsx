@@ -33,6 +33,7 @@ import { useAppStore } from '../../stores';
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
+import { createRandomUUID } from '../../utils/randomUUID';
 import {
     attachmentStorageBasename,
     parsePersistedChatAttachments,
@@ -4547,7 +4548,7 @@ export default function AgentDetailPage() {
     };
 
     const dispatchChatMessage = (socket: WebSocket, runtimeKey: SessionRuntimeKey, payload: PendingChatMessage) => {
-        const clientMessageId = crypto.randomUUID();
+        const clientMessageId = createRandomUUID();
         setIsWaiting(true);
         setIsStreaming(false);
         setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false });

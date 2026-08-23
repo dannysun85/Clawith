@@ -33,6 +33,7 @@ import {
     deliverableApprovalStatusMessage,
     deliverableNextAction,
 } from '../../utils/deliverables';
+import { createRandomUUID } from '../../utils/randomUUID';
 import type { SaasTier } from '../TierSelector';
 
 
@@ -198,7 +199,7 @@ export function DeliverableLauncher({
     const [error, setError] = useState('');
     const [preflight, setPreflight] = useState<DeliverablePreflight | null>(null);
     const [showAdvanced, setShowAdvanced] = useState(false);
-    const [clientRequestId, setClientRequestId] = useState(() => crypto.randomUUID());
+    const [clientRequestId, setClientRequestId] = useState(createRandomUUID);
 
     const selectedWorkflow = useMemo(
         () => workflows.find((workflow) => workflow.work_type === selectedType),
@@ -281,7 +282,7 @@ export function DeliverableLauncher({
         setShowAdvanced(
             Object.keys(initialSpecOverrides || {}).some((key) => optionalFieldKeys.has(key)),
         );
-        setClientRequestId(crypto.randomUUID());
+        setClientRequestId(createRandomUUID());
         setOpen(true);
     }, [
         autoOpenKey,
@@ -348,7 +349,7 @@ export function DeliverableLauncher({
         setSpec(initialSpec(workflow));
         setError('');
         setPreflight(null);
-        setClientRequestId(crypto.randomUUID());
+        setClientRequestId(createRandomUUID());
     };
 
     const updateField = (key: string, value: string | number) => {
@@ -501,7 +502,7 @@ export function DeliverableLauncher({
             };
             onCreated(requestWithPreflight, result.launchable);
             setOpen(false);
-            setClientRequestId(crypto.randomUUID());
+            setClientRequestId(createRandomUUID());
             toast.success(
                 !result.available
                     ? (isZh ? '工作说明已保存；当前没有可用线路，未启动生成' : 'Brief saved; no execution route is available yet, so generation was not started')
@@ -925,7 +926,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     const [videoPreviewError, setVideoPreviewError] = useState(false);
     const detailsTriggerRef = useRef<HTMLButtonElement>(null);
     const detailsDrawerRef = useRef<HTMLElement>(null);
-    const approvalActionIdRef = useRef(crypto.randomUUID());
+    const approvalActionIdRef = useRef(createRandomUUID());
     const revisionActionRef = useRef<{ fingerprint: string; id: string } | null>(null);
     const artifacts = latestArtifacts(request);
     const previewArtifact = [...artifacts]
@@ -1313,7 +1314,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         }
         const fingerprint = JSON.stringify([instruction, revisionTargets]);
         if (revisionActionRef.current?.fingerprint !== fingerprint) {
-            revisionActionRef.current = { fingerprint, id: crypto.randomUUID() };
+            revisionActionRef.current = { fingerprint, id: createRandomUUID() };
         }
         setActing('request_changes');
         try {
@@ -1355,7 +1356,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     };
 
     useEffect(() => {
-        approvalActionIdRef.current = crypto.randomUUID();
+        approvalActionIdRef.current = createRandomUUID();
         revisionActionRef.current = null;
     }, [request.id, request.version]);
 
@@ -1465,7 +1466,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         setQualityReviewError('');
         try {
             const review = await deliverableApi.createQualityReview(request.id, {
-                client_review_id: crypto.randomUUID(),
+                client_review_id: createRandomUUID(),
                 expected_request_version: request.version,
                 reviewer_user_ids: selectedReviewerIds,
             });

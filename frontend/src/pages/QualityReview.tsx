@@ -16,6 +16,7 @@ import {
     deliverableApi,
     type DeliverableQualityReview,
 } from '../services/api';
+import { createRandomUUID } from '../utils/randomUUID';
 
 
 type GateDraft = Record<string, { passed: boolean | null; evidence: string }>;
@@ -98,7 +99,7 @@ export default function QualityReview() {
     const [humanEvidence, setHumanEvidence] = useState<EvidenceDraft>({});
     const [notes, setNotes] = useState('');
     const [submitting, setSubmitting] = useState(false);
-    const [clientSubmissionId] = useState(() => crypto.randomUUID());
+    const [clientSubmissionId] = useState(createRandomUUID);
     const [evidenceKind, setEvidenceKind] = useState<'ocr' | 'frame_ocr'>('ocr');
     const [evidenceSource, setEvidenceSource] = useState('');
     const [evidenceFindings, setEvidenceFindings] = useState('');
@@ -197,7 +198,7 @@ export default function QualityReview() {
         setAddingEvidence(true);
         try {
             const updated = await deliverableApi.addQualityReviewEvidence(review.id, {
-                client_evidence_id: crypto.randomUUID(),
+                client_evidence_id: createRandomUUID(),
                 expected_version: review.version,
                 kind: evidenceKind,
                 status: 'complete',

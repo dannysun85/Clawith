@@ -7,6 +7,7 @@ import { fetchJson, enterpriseApi } from '../services/api';
 import { MODALITIES } from '../constants/modalities';
 import PlansTab from './enterprise-settings/tabs/PlansTab';
 import AccountManagement from './AccountManagement';
+import { createRandomUUID } from '../utils/randomUUID';
 
 const SAAS_TIERS = ['lite', 'pro', 'ultra'];
 const LLM_ROUTE_MODALITIES = ['text', 'image', 'video'];
@@ -1210,7 +1211,7 @@ function ManualOrdersTab() {
             reason: '',
             rollbackOfDecisionId,
             confirmed: false,
-            idempotencyKey: `manual-order-${crypto.randomUUID()}`,
+            idempotencyKey: `manual-order-${createRandomUUID()}`,
         });
     };
 
