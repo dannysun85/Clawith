@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and combine API/browser subscription smoke evidence."""
+"""Validate and combine API/browser production business-flow evidence."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ API_CHECKS = {
     "tenant_me_ok",
     "tenant_scope_ok",
     "tenant_billing_manage_capability_ok",
+    "billing_manual_semantics_ok",
     "member_login_ok",
     "member_personal_usage_ok",
     "member_sensitive_billing_denied_ok",
@@ -26,6 +27,15 @@ API_CHECKS = {
     "client_orders_ok",
     "client_credit_packs_ok",
     "work_executor_preflight_ok",
+    "work_task_executed_ok",
+    "work_task_output_marker_ok",
+    "work_task_create_idempotency_ok",
+    "work_task_result_review_ok",
+    "group_persistence_ok",
+    "group_member_visibility_ok",
+    "group_message_idempotency_ok",
+    "workforce_topology_refresh_ok",
+    "credits_exactly_once_ok",
     "platform_admin_login_ok",
     "saas_ledger_reconciliation_ok",
     "saas_payment_reconciliation_ok",
@@ -39,6 +49,13 @@ UI_CHECKS = {
     "ui_subscription_summary_api_ok",
     "ui_subscription_balance_rendered_ok",
     "ui_subscription_page_ok",
+    "ui_work_task_visible_ok",
+    "ui_group_persistence_ok",
+    "ui_workforce_topology_ok",
+    "ui_direct_chat_round_trip_ok",
+    "ui_direct_chat_recovery_ok",
+    "ui_post_chat_credits_settled_ok",
+    "ui_no_console_error_ok",
     "ui_no_server_error_ok",
 }
 
@@ -51,7 +68,7 @@ def read_evidence(path_value: str, expected_kind: str) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if (
         not isinstance(payload, dict)
-        or payload.get("evidence_schema_version") != 2
+        or payload.get("evidence_schema_version") != 3
         or payload.get("evidence_kind") != expected_kind
     ):
         raise ValueError(f"wrong evidence schema: {path.name}")
@@ -79,6 +96,121 @@ def read_reconciliation_summary(
     return {checked_field: checked, "issue_count": 0}
 
 
+def read_api_business_flow(payload: dict[str, Any]) -> dict[str, Any]:
+    flow = payload.get("business_flow")
+    if not isinstance(flow, dict) or set(flow) != {"work", "group", "topology", "credits"}:
+        raise ValueError("unsafe API business-flow evidence")
+    expected_work = {
+        "execution_status": "completed",
+        "output_marker_verified": True,
+        "create_replayed": True,
+        "result_review_status": "approved",
+        "review_replayed": True,
+    }
+    if flow.get("work") != expected_work:
+        raise ValueError("Work business-flow evidence is incomplete")
+    group = flow.get("group")
+    if (
+        not isinstance(group, dict)
+        or set(group)
+        != {"member_count", "owner_message_persisted", "member_visibility", "message_replayed"}
+        or type(group.get("member_count")) is not int
+        or group["member_count"] < 2
+        or any(
+            group.get(key) is not True
+            for key in ("owner_message_persisted", "member_visibility", "message_replayed")
+        )
+    ):
+        raise ValueError("Group business-flow evidence is incomplete")
+    topology = flow.get("topology")
+    if (
+        not isinstance(topology, dict)
+        or set(topology) != {"node_count", "assistant_visible", "completed_work_visible"}
+        or type(topology.get("node_count")) is not int
+        or topology["node_count"] < 1
+        or topology.get("assistant_visible") is not True
+        or topology.get("completed_work_visible") is not True
+    ):
+        raise ValueError("topology business-flow evidence is incomplete")
+    credits = flow.get("credits")
+    if (
+        not isinstance(credits, dict)
+        or set(credits)
+        != {
+            "consumed_delta",
+            "transaction_delta",
+            "reserved_before",
+            "reserved_after",
+            "replay_balance_delta",
+            "replay_transaction_delta",
+        }
+        or any(type(credits.get(key)) is not int for key in credits)
+        or credits["consumed_delta"] <= 0
+        or credits["transaction_delta"] <= 0
+        or any(
+            credits[key] != 0
+            for key in (
+                "reserved_before",
+                "reserved_after",
+                "replay_balance_delta",
+                "replay_transaction_delta",
+            )
+        )
+    ):
+        raise ValueError("Credits exactly-once evidence is incomplete")
+    return {
+        "work": expected_work,
+        "group": dict(group),
+        "topology": dict(topology),
+        "credits": dict(credits),
+    }
+
+
+def read_ui_business_flow(payload: dict[str, Any]) -> dict[str, Any]:
+    flow = payload.get("business_flow")
+    if not isinstance(flow, dict) or set(flow) != {
+        "work",
+        "group",
+        "topology",
+        "direct_chat",
+        "credits",
+    }:
+        raise ValueError("unsafe UI business-flow evidence")
+    if flow.get("work") != {"task_visible": True}:
+        raise ValueError("UI Work evidence is incomplete")
+    if flow.get("group") != {"group_visible": True, "message_restored": True}:
+        raise ValueError("UI Group evidence is incomplete")
+    if flow.get("topology") != {"completed_work_visible": True}:
+        raise ValueError("UI topology evidence is incomplete")
+    direct_chat = flow.get("direct_chat")
+    if (
+        not isinstance(direct_chat, dict)
+        or set(direct_chat)
+        != {"round_trip", "durable_after_reload", "message_count", "assistant_count"}
+        or direct_chat.get("round_trip") is not True
+        or direct_chat.get("durable_after_reload") is not True
+        or type(direct_chat.get("message_count")) is not int
+        or direct_chat["message_count"] < 2
+        or type(direct_chat.get("assistant_count")) is not int
+        or direct_chat["assistant_count"] < 1
+    ):
+        raise ValueError("UI Direct Chat evidence is incomplete")
+    credits = flow.get("credits")
+    if credits != {
+        "settled_after_chat": True,
+        "reserved_after": 0,
+        "consumed_delta_positive": True,
+    }:
+        raise ValueError("UI post-chat Credits evidence is incomplete")
+    return {
+        "work": dict(flow["work"]),
+        "group": dict(flow["group"]),
+        "topology": dict(flow["topology"]),
+        "direct_chat": dict(direct_chat),
+        "credits": dict(credits),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-evidence", required=True)
@@ -93,8 +225,8 @@ def main() -> int:
     parser.add_argument("--browser-image-id", required=True)
     args = parser.parse_args()
 
-    api = read_evidence(args.api_evidence, "subscription_api")
-    ui = read_evidence(args.ui_evidence, "subscription_browser")
+    api = read_evidence(args.api_evidence, "release_business_api")
+    ui = read_evidence(args.ui_evidence, "release_business_browser")
     expected_identity = {
         "version": args.expected_version,
         "commit": args.expected_commit,
@@ -133,6 +265,18 @@ def main() -> int:
     if not UI_CHECKS.issubset(ui_checks):
         raise ValueError("UI evidence is missing required checks")
 
+    billing_mode = api.get("billing_mode")
+    if billing_mode != {
+        "provider": "manual",
+        "status": "manual",
+        "checkout_enabled": True,
+        "native_payment_enabled": False,
+        "webhook_ready": False,
+    }:
+        raise ValueError("billing mode evidence does not match production manual semantics")
+    api_business_flow = read_api_business_flow(api)
+    ui_business_flow = read_ui_business_flow(ui)
+
     work_executor_preflight = api.get("work_executor_preflight")
     if work_executor_preflight != {
         "capability_status": "available",
@@ -159,8 +303,8 @@ def main() -> int:
     )
 
     combined = {
-        "evidence_schema_version": 2,
-        "evidence_kind": "subscription_composite",
+        "evidence_schema_version": 3,
+        "evidence_kind": "release_business_composite",
         "ok": True,
         "api_base": args.api_base.rstrip("/"),
         "frontend_url": args.frontend_url.rstrip("/"),
@@ -172,11 +316,17 @@ def main() -> int:
         },
         "checks": sorted(api_checks | ui_checks),
         "subscription_summary": api_summary,
+        "billing_mode": billing_mode,
+        "business_flow": {
+            "api": api_business_flow,
+            "ui": ui_business_flow,
+        },
         "work_executor_preflight": work_executor_preflight,
         "ui": {
             "final_path": ui.get("final_path"),
             "browser_target": ui.get("browser_target"),
             "subscription_summary": ui.get("subscription_summary"),
+            "business_flow": ui_business_flow,
         },
         "saas_ledger_reconciliation": ledger_reconciliation,
         "saas_payment_reconciliation": payment_reconciliation,

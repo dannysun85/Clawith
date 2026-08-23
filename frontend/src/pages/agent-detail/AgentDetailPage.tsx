@@ -7752,6 +7752,7 @@ export default function AgentDetailPage() {
                     activeTab === 'chat' && (
                         <div
                             className="agent-chat-shell"
+                            data-testid="direct-chat-shell"
                             style={{
                                 display: 'flex',
                                 gap: 0,
@@ -7823,6 +7824,7 @@ export default function AgentDetailPage() {
                                                 type="button"
                                                 onClick={createNewSession}
                                                 className="new-session-btn"
+                                                data-testid="direct-chat-new-session"
                                             >
                                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden style={{ display: 'block', flexShrink: 0 }}>
                                                     <line x1="12" y1="5" x2="12" y2="19" />
@@ -8644,6 +8646,7 @@ export default function AgentDetailPage() {
                                                         <textarea
                                                             ref={chatInputRef}
                                                             className="chat-input"
+                                                            data-testid="direct-chat-input"
                                                             disabled={chatInputDisabled}
                                                             value={chatInput}
                                                             onChange={e => {
@@ -8783,6 +8786,7 @@ export default function AgentDetailPage() {
                                                             <button
                                                                 type="button"
                                                                 className="btn btn-primary chat-composer-send"
+                                                                data-testid="direct-chat-send"
                                                                 onClick={sendChatMsg}
                                                                 disabled={
                                                                     chatInputDisabled

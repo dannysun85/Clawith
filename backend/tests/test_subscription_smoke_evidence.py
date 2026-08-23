@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -51,8 +52,8 @@ def test_smoke_credentials_require_an_exact_regular_json_file(tmp_path):
 
 def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
     return {
-        "evidence_schema_version": 2,
-        "evidence_kind": "subscription_api",
+        "evidence_schema_version": 3,
+        "evidence_kind": "release_business_api",
         "ok": True,
         "api_base": "http://127.0.0.1:3009/api",
         "frontend_url": "http://127.0.0.1:3009",
@@ -68,6 +69,7 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "tenant_me_ok",
             "tenant_scope_ok",
             "tenant_billing_manage_capability_ok",
+            "billing_manual_semantics_ok",
             "member_login_ok",
             "member_personal_usage_ok",
             "member_sensitive_billing_denied_ok",
@@ -77,6 +79,15 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "client_orders_ok",
             "client_credit_packs_ok",
             "work_executor_preflight_ok",
+            "work_task_executed_ok",
+            "work_task_output_marker_ok",
+            "work_task_create_idempotency_ok",
+            "work_task_result_review_ok",
+            "group_persistence_ok",
+            "group_member_visibility_ok",
+            "group_message_idempotency_ok",
+            "workforce_topology_refresh_ok",
+            "credits_exactly_once_ok",
             "platform_admin_login_ok",
             "saas_ledger_reconciliation_ok",
             "saas_payment_reconciliation_ok",
@@ -88,6 +99,41 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "balance": 100,
             "available_balance": 90,
             "reserved": 10,
+        },
+        "billing_mode": {
+            "provider": "manual",
+            "status": "manual",
+            "checkout_enabled": True,
+            "native_payment_enabled": False,
+            "webhook_ready": False,
+        },
+        "business_flow": {
+            "work": {
+                "execution_status": "completed",
+                "output_marker_verified": True,
+                "create_replayed": True,
+                "result_review_status": "approved",
+                "review_replayed": True,
+            },
+            "group": {
+                "member_count": 2,
+                "owner_message_persisted": True,
+                "member_visibility": True,
+                "message_replayed": True,
+            },
+            "topology": {
+                "node_count": 1,
+                "assistant_visible": True,
+                "completed_work_visible": True,
+            },
+            "credits": {
+                "consumed_delta": 4,
+                "transaction_delta": 1,
+                "reserved_before": 0,
+                "reserved_after": 0,
+                "replay_balance_delta": 0,
+                "replay_transaction_delta": 0,
+            },
         },
         "work_executor_preflight": {
             "capability_status": "available",
@@ -106,8 +152,8 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
 
 def _ui_evidence(commit: str, release_id: str, nonce: str) -> dict:
     return {
-        "evidence_schema_version": 2,
-        "evidence_kind": "subscription_browser",
+        "evidence_schema_version": 3,
+        "evidence_kind": "release_business_browser",
         "ok": True,
         "frontend_url": "http://127.0.0.1:3009",
         "browser_target": "isolated_candidate_frontend_network",
@@ -125,6 +171,13 @@ def _ui_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "ui_subscription_summary_api_ok",
             "ui_subscription_balance_rendered_ok",
             "ui_subscription_page_ok",
+            "ui_work_task_visible_ok",
+            "ui_group_persistence_ok",
+            "ui_workforce_topology_ok",
+            "ui_direct_chat_round_trip_ok",
+            "ui_direct_chat_recovery_ok",
+            "ui_post_chat_credits_settled_ok",
+            "ui_no_console_error_ok",
             "ui_no_server_error_ok",
         ],
         "subscription_summary": {
@@ -132,6 +185,22 @@ def _ui_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "balance": 100,
             "available_balance": 90,
             "reserved": 10,
+        },
+        "business_flow": {
+            "work": {"task_visible": True},
+            "group": {"group_visible": True, "message_restored": True},
+            "topology": {"completed_work_visible": True},
+            "direct_chat": {
+                "round_trip": True,
+                "durable_after_reload": True,
+                "message_count": 2,
+                "assistant_count": 1,
+            },
+            "credits": {
+                "settled_after_chat": True,
+                "reserved_after": 0,
+                "consumed_delta_positive": True,
+            },
         },
     }
 
@@ -158,7 +227,7 @@ def _merge(tmp_path: Path, api: dict, ui: dict, *, bundle: str | None = None):
             "--expected-commit",
             "a" * 40,
             "--expected-release-id",
-            "release-v2",
+            "release-v3",
             "--evidence-nonce",
             "1" * 32,
             "--runner-bundle-sha256",
@@ -174,7 +243,7 @@ def _merge(tmp_path: Path, api: dict, ui: dict, *, bundle: str | None = None):
 
 def test_composite_smoke_evidence_requires_matching_api_and_browser_proof(tmp_path):
     commit = "a" * 40
-    release_id = "release-v2"
+    release_id = "release-v3"
     nonce = "1" * 32
     api = _api_evidence(commit, release_id, nonce)
     ui = _ui_evidence(commit, release_id, nonce)
@@ -182,7 +251,7 @@ def test_composite_smoke_evidence_requires_matching_api_and_browser_proof(tmp_pa
     valid = _merge(tmp_path, api, ui)
     assert valid.returncode == 0, valid.stderr
     combined = json.loads(valid.stdout)
-    assert combined["evidence_kind"] == "subscription_composite"
+    assert combined["evidence_kind"] == "release_business_composite"
     assert combined["release_identity"]["release_id"] == release_id
     assert combined["ui"]["final_path"] == "/account/subscription"
     assert combined["saas_ledger_reconciliation"] == {
@@ -219,6 +288,36 @@ def test_composite_smoke_evidence_requires_matching_api_and_browser_proof(tmp_pa
     assert mismatched_summary.returncode != 0
     malformed_bundle = _merge(tmp_path, api, ui, bundle="sha256:short")
     assert malformed_bundle.returncode != 0
+    duplicate_credit_charge = _merge(
+        tmp_path,
+        {
+            **api,
+            "business_flow": {
+                **api["business_flow"],
+                "credits": {
+                    **api["business_flow"]["credits"],
+                    "replay_transaction_delta": 1,
+                },
+            },
+        },
+        ui,
+    )
+    assert duplicate_credit_charge.returncode != 0
+    missing_chat_recovery = _merge(
+        tmp_path,
+        api,
+        {
+            **ui,
+            "business_flow": {
+                **ui["business_flow"],
+                "direct_chat": {
+                    **ui["business_flow"]["direct_chat"],
+                    "durable_after_reload": False,
+                },
+            },
+        },
+    )
+    assert missing_chat_recovery.returncode != 0
 
     unsafe_issue_rows = _merge(
         tmp_path,
@@ -260,6 +359,84 @@ def test_api_reconciliation_gate_fails_closed_without_leaking_issue_rows():
         checked_field="checked_orders",
         stage="saas_payment_reconciliation",
     ) == {"checked_orders": 0, "issue_count": 0}
+
+
+def test_manual_billing_and_credit_snapshots_are_fail_closed_and_identity_free():
+    runner = _load_api_runner()
+    assert runner.summarize_manual_billing_config(
+        {
+            "provider": "manual",
+            "status": "manual",
+            "checkout_enabled": True,
+            "native_payment_enabled": False,
+            "webhook_ready": False,
+            "next_action": "private operator copy is intentionally excluded",
+        }
+    ) == {
+        "provider": "manual",
+        "status": "manual",
+        "checkout_enabled": True,
+        "native_payment_enabled": False,
+        "webhook_ready": False,
+    }
+
+    with pytest.raises(runner.SmokeFailure, match="billing_manual_semantics"):
+        runner.summarize_manual_billing_config(
+            {
+                "provider": "wechat",
+                "status": "misconfigured",
+                "checkout_enabled": False,
+                "native_payment_enabled": False,
+                "webhook_ready": False,
+            }
+        )
+
+    private_transaction_id = "22222222-2222-4222-8222-222222222222"
+    snapshot = runner._credit_snapshot(
+        {
+            "balance": 99,
+            "available_balance": 99,
+            "reserved": 0,
+            "consumed_credits": 1,
+        },
+        [{"id": private_transaction_id, "actor_label": "private-user"}],
+        stage="credits",
+    )
+    assert snapshot["transaction_count"] == 1
+    assert private_transaction_id not in repr(snapshot)
+    assert "private-user" not in repr(snapshot)
+
+
+def test_credit_snapshot_reader_paginates_the_complete_ledger(monkeypatch):
+    runner = _load_api_runner()
+    transaction_ids = [str(uuid.uuid4()) for _ in range(101)]
+    requested_paths: list[str] = []
+
+    def fake_call_api(method, api_base, path, data=None, token=None, **kwargs):
+        del method, api_base, data, token, kwargs
+        requested_paths.append(path)
+        if path == "/subscription/summary":
+            return 200, {
+                "balance": 99,
+                "available_balance": 99,
+                "reserved": 0,
+                "consumed_credits": 1,
+            }
+        if "page=1" in path:
+            return 200, [{"id": value} for value in transaction_ids[:100]]
+        if "page=2" in path:
+            return 200, [{"id": transaction_ids[100]}]
+        raise AssertionError(f"unexpected request: {path}")
+
+    monkeypatch.setattr(runner, "call_api", fake_call_api)
+    snapshot = runner._read_credit_snapshot("http://candidate/api", "token", stage="credits")
+
+    assert snapshot["transaction_count"] == 101
+    assert requested_paths == [
+        "/subscription/summary",
+        "/subscription/credit-transactions?page=1&limit=100",
+        "/subscription/credit-transactions?page=2&limit=100",
+    ]
 
 
 def test_work_executor_preflight_gate_requires_available_without_leaking_agent_ids():

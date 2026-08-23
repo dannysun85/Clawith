@@ -159,7 +159,7 @@ async def test_work_retry_uses_a_new_idempotent_runtime_attempt_identity() -> No
     assert command.payload["owner_change_request"] == (
         "补齐五家设计伙伴逐家的负责人和失败退出条件。"
     )
-    assert "Astra 产品入口目录（astra-product-ia-1.12.1-r1" in command.goal
+    assert "Astra 产品入口目录（astra-product-ia-1.12.2-r1" in command.goal
     assert "公司管理 → 企业知识与集成 → 组织同步" in command.goal
     assert "报告中心" not in command.goal
 

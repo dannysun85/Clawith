@@ -9,7 +9,7 @@ RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 COPY subscription_browser_smoke.mjs browser_launch_selftest.mjs browser_assertions.mjs ./
 
-LABEL ai.reeftotem.astra.browser-smoke-schema="2"
+LABEL ai.reeftotem.astra.browser-smoke-schema="3"
 
 USER pwuser
 ENTRYPOINT ["node", "/opt/astra-browser-smoke/subscription_browser_smoke.mjs"]

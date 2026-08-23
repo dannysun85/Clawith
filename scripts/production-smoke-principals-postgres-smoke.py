@@ -276,12 +276,12 @@ async def main() -> None:
             manager.provision(
                 credentials,
                 operation_id=provision_operation,
-                release_version="1.12.1",
+                release_version="1.12.2",
             ),
             manager.provision(
                 credentials,
                 operation_id=provision_operation,
-                release_version="1.12.1",
+                release_version="1.12.2",
             ),
         )
         if sorted(result["status"] for result in concurrent) != [
@@ -296,7 +296,7 @@ async def main() -> None:
         replay = await manager.provision(
             credentials,
             operation_id=provision_operation,
-            release_version="1.12.1",
+            release_version="1.12.2",
         )
         if replay["status"] != "already_applied":
             raise RuntimeError("release_smoke_replay_not_detected")
@@ -306,7 +306,7 @@ async def main() -> None:
         deactivated = await manager.deactivate_platform(
             credentials,
             operation_id=deactivate_operation,
-            release_version="1.12.1",
+            release_version="1.12.2",
         )
         if deactivated["status"] != "applied":
             raise RuntimeError("release_smoke_platform_deactivation_failed")
@@ -315,7 +315,7 @@ async def main() -> None:
         reprovisioned = await manager.provision(
             credentials,
             operation_id=reprovision_operation,
-            release_version="1.12.1",
+            release_version="1.12.2",
         )
         if reprovisioned["status"] != "applied":
             raise RuntimeError("release_smoke_platform_reprovision_failed")

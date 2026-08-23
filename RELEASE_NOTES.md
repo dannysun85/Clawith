@@ -1,3 +1,35 @@
+# v1.12.2 — Production Business-Flow Release Gate
+
+## Release acceptance
+
+- The formal blue-green deployment now executes a real, synthetic Release QA
+  commercial workflow on the isolated candidate before public traffic moves:
+  owner/member permission boundaries, manual billing truth, a personal-assistant
+  Work task, immutable owner review, collaboration Group persistence, employee
+  topology refresh, and a browser-driven Direct Chat round trip with reload
+  recovery.
+- Work creation and result review are replayed with the same client request IDs.
+  The gate rejects a duplicate Task, duplicate review, additional Credits
+  transaction, changed balance, or unsettled reservation.
+- Browser evidence is bound to schema 3, the candidate release identity, the
+  pinned isolated Playwright image, and the exact runner bundle digest. Any
+  task failure, missing output marker, topology mismatch, Group visibility
+  failure, chat timeout, browser console error, 5xx response, or Credits drift
+  aborts before cutover.
+- The workflow runs only in the dedicated synthetic Release QA tenant. Evidence
+  contains counts, booleans, hashes, and release identity; it excludes account
+  passwords, user/Agent IDs, message bodies, and provider secrets.
+
+## Release boundary
+
+- Production billing remains the truthful `manual` workflow. WeChat Native is
+  not enabled or claimed by this release; it still requires complete merchant
+  configuration and a separately authorized real-payment acceptance.
+- CEO autonomous coordination, creative deliverables v2, Code/AgentBay,
+  Heartbeat, automatic OKR collection, legacy schedules, Douyin direct
+  publishing, and managed creative quality review remain disabled external
+  gates. This patch does not silently enable them.
+
 # v1.12.1 — Integrated Work Acceptance and Release Identity
 
 ## Integrated local candidate

@@ -1197,7 +1197,7 @@ candidate_business_evidence_valid {release_id} 3009
     assert tampered.returncode != 0
 
 
-def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_path):
+def test_v3_candidate_evidence_binds_full_business_flow_to_candidate_slot(tmp_path):
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     browser_helpers = _shell_function_source(
         script,
@@ -1209,7 +1209,7 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
         "candidate_business_evidence_valid",
         "write_atomic_symlink",
     )
-    release_id = "candidate-release-v2"
+    release_id = "candidate-release-v3"
     commit = "b" * 40
     release = _write_test_release(tmp_path, release_id, commit=commit)
     browser_dir = release / "deploy/browser-smoke"
@@ -1226,7 +1226,7 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
     )
     for name in bundle_names:
         (browser_dir / name).write_text(
-            "2\n" if name == "EVIDENCE_SCHEMA" else f"fixture:{name}\n",
+            "3\n" if name == "EVIDENCE_SCHEMA" else f"fixture:{name}\n",
             encoding="utf-8",
         )
     bundle_digest = hashlib.sha256()
@@ -1242,12 +1242,23 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
         "tenant_login_ok",
         "tenant_me_ok",
         "tenant_scope_ok",
+        "tenant_billing_manage_capability_ok",
+        "billing_manual_semantics_ok",
         "client_plans_ok",
         "client_subscription_summary_ok",
         "client_credit_transactions_ok",
         "client_orders_ok",
         "client_credit_packs_ok",
         "work_executor_preflight_ok",
+        "work_task_executed_ok",
+        "work_task_output_marker_ok",
+        "work_task_create_idempotency_ok",
+        "work_task_result_review_ok",
+        "group_persistence_ok",
+        "group_member_visibility_ok",
+        "group_message_idempotency_ok",
+        "workforce_topology_refresh_ok",
+        "credits_exactly_once_ok",
         "platform_admin_login_ok",
         "saas_ledger_reconciliation_ok",
         "saas_payment_reconciliation_ok",
@@ -1259,11 +1270,18 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
         "ui_subscription_summary_api_ok",
         "ui_subscription_balance_rendered_ok",
         "ui_subscription_page_ok",
+        "ui_work_task_visible_ok",
+        "ui_group_persistence_ok",
+        "ui_workforce_topology_ok",
+        "ui_direct_chat_round_trip_ok",
+        "ui_direct_chat_recovery_ok",
+        "ui_post_chat_credits_settled_ok",
+        "ui_no_console_error_ok",
         "ui_no_server_error_ok",
     ]
     payload = {
-        "evidence_schema_version": 2,
-        "evidence_kind": "subscription_composite",
+        "evidence_schema_version": 3,
+        "evidence_kind": "release_business_composite",
         "ok": True,
         "api_base": "http://127.0.0.1:3009/api",
         "frontend_url": "http://127.0.0.1:3009",
@@ -1288,6 +1306,59 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
             "capability_status": "available",
             "reason_count": 0,
         },
+        "billing_mode": {
+            "provider": "manual",
+            "status": "manual",
+            "checkout_enabled": True,
+            "native_payment_enabled": False,
+            "webhook_ready": False,
+        },
+        "business_flow": {
+            "api": {
+                "work": {
+                    "execution_status": "completed",
+                    "output_marker_verified": True,
+                    "create_replayed": True,
+                    "result_review_status": "approved",
+                    "review_replayed": True,
+                },
+                "group": {
+                    "member_count": 2,
+                    "owner_message_persisted": True,
+                    "member_visibility": True,
+                    "message_replayed": True,
+                },
+                "topology": {
+                    "node_count": 1,
+                    "assistant_visible": True,
+                    "completed_work_visible": True,
+                },
+                "credits": {
+                    "consumed_delta": 4,
+                    "transaction_delta": 1,
+                    "reserved_before": 0,
+                    "reserved_after": 0,
+                    "replay_balance_delta": 0,
+                    "replay_transaction_delta": 0,
+                },
+            },
+            "ui": {
+                "work": {"task_visible": True},
+                "group": {"group_visible": True, "message_restored": True},
+                "topology": {"completed_work_visible": True},
+                "direct_chat": {
+                    "round_trip": True,
+                    "durable_after_reload": True,
+                    "message_count": 2,
+                    "assistant_count": 1,
+                },
+                "credits": {
+                    "settled_after_chat": True,
+                    "reserved_after": 0,
+                    "consumed_delta_positive": True,
+                },
+            },
+        },
         "saas_ledger_reconciliation": {
             "checked_tenants": 2,
             "issue_count": 0,
@@ -1309,7 +1380,7 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
     def write_evidence(value: dict) -> None:
         evidence.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
         digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
-        marker.write_text(f"smoke-v2:{digest}\n", encoding="utf-8")
+        marker.write_text(f"smoke-v3:{digest}\n", encoding="utf-8")
 
     write_evidence(payload)
     child_env = {
@@ -1355,6 +1426,19 @@ candidate_business_evidence_valid {release_id} 3009
                 "runner_bundle_sha256": f"sha256:{'3' * 64}",
             },
         },
+        {
+            **payload,
+            "business_flow": {
+                **payload["business_flow"],
+                "api": {
+                    **payload["business_flow"]["api"],
+                    "credits": {
+                        **payload["business_flow"]["api"]["credits"],
+                        "replay_transaction_delta": 1,
+                    },
+                },
+            },
+        },
     ]
     for invalid in invalid_payloads:
         write_evidence(invalid)
@@ -1369,7 +1453,7 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
 
     assert "@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48" in dockerfile
     assert "USER pwuser" in dockerfile
-    assert 'browser-smoke-schema="2"' in dockerfile
+    assert 'browser-smoke-schema="3"' in dockerfile
     for contract in (
         "--internal",
         "--read-only",
@@ -1394,6 +1478,10 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert "subscription-available-credits-value" in browser_runner
     assert "subscription-available-credits-reserved" in browser_runner
     assert "waitForExactText" in browser_runner
+    assert "ui_direct_chat_round_trip_ok" in browser_runner
+    assert "ui_direct_chat_recovery_ok" in browser_runner
+    assert "ui_group_persistence_ok" in browser_runner
+    assert "ui_workforce_topology_ok" in browser_runner
     assert "await Promise.all" in browser_runner
     assert '"body": body' not in api_runner
     assert "body[:200]" not in api_runner

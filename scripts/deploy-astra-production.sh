@@ -733,11 +733,11 @@ print(f"sha256:{digest.hexdigest()}")
 PY_BROWSER_BUNDLE_DIGEST
 }
 
-browser_smoke_requires_v2() {
+browser_smoke_requires_v3() {
     local release="$1"
     [ -f "$release/deploy/browser-smoke/EVIDENCE_SCHEMA" ] && \
         [ ! -L "$release/deploy/browser-smoke/EVIDENCE_SCHEMA" ] && \
-        [ "$(tr -d '[:space:]' < "$release/deploy/browser-smoke/EVIDENCE_SCHEMA")" = "2" ]
+        [ "$(tr -d '[:space:]' < "$release/deploy/browser-smoke/EVIDENCE_SCHEMA")" = "3" ]
 }
 
 prepare_browser_smoke_runtime_root() {
@@ -844,7 +844,7 @@ ensure_browser_smoke_image() {
     local host_gid
     local label
 
-    browser_smoke_requires_v2 "$target_release" || return 1
+    browser_smoke_requires_v3 "$target_release" || return 1
     browser_smoke_bundle_digest "$target_release" >/dev/null || return 1
     command -v timeout >/dev/null 2>&1 || return 1
     host_uid="$(id -u)" || return 1
@@ -1778,7 +1778,7 @@ run_candidate_business_smoke() {
     local canonical_frontend_url="http://127.0.0.1:${target_port}"
 
     [ "$RUN_REMOTE_SMOKE" = "1" ] || return 1
-    browser_smoke_requires_v2 "$target_release" || return 1
+    browser_smoke_requires_v3 "$target_release" || return 1
     [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || return 1
     for runner in \
         subscription_production_smoke.py merge_subscription_smoke_evidence.py; do
@@ -1886,7 +1886,7 @@ PY_BROWSER_CREDENTIALS
         cleanup_browser_smoke_runtime
         return 1
     }
-    if ! timeout --signal=TERM --kill-after=10s 150s \
+    if ! timeout --signal=TERM --kill-after=10s 420s \
         docker run --rm \
         --name "$BROWSER_SMOKE_CONTAINER" \
         --label "ai.reeftotem.astra.browser-smoke-release=$target_release_id" \
@@ -1948,8 +1948,8 @@ candidate_business_evidence_valid() {
     local runner_bundle_sha256="none"
 
     [ -d "$target_release" ] && [ ! -L "$target_release" ] || return 1
-    if browser_smoke_requires_v2 "$target_release"; then
-        evidence_mode="v2"
+    if browser_smoke_requires_v3 "$target_release"; then
+        evidence_mode="v3"
         runner_bundle_sha256="$(browser_smoke_bundle_digest "$target_release")" || return 1
     fi
     python3 - \
@@ -1992,7 +1992,7 @@ kind, separator, digest = value.partition(":")
 if separator != ":" or not re.fullmatch(r"[0-9a-f]{64}", digest):
     raise SystemExit(1)
 
-if kind in {"smoke", "smoke-v2"}:
+if kind in {"smoke", "smoke-v3"}:
     evidence = backup / "subscription-smoke.candidate.json"
     if not evidence.is_file() or evidence.is_symlink():
         raise SystemExit(1)
@@ -2000,18 +2000,29 @@ if kind in {"smoke", "smoke-v2"}:
     if hashlib.sha256(raw).hexdigest() != digest:
         raise SystemExit(1)
     payload = json.loads(raw)
-    if evidence_mode == "v2":
+    if evidence_mode == "v3":
         required_checks = {
             "candidate_release_identity_ok",
             "tenant_login_ok",
             "tenant_me_ok",
             "tenant_scope_ok",
+            "tenant_billing_manage_capability_ok",
+            "billing_manual_semantics_ok",
             "client_plans_ok",
             "client_subscription_summary_ok",
             "client_credit_transactions_ok",
             "client_orders_ok",
             "client_credit_packs_ok",
             "work_executor_preflight_ok",
+            "work_task_executed_ok",
+            "work_task_output_marker_ok",
+            "work_task_create_idempotency_ok",
+            "work_task_result_review_ok",
+            "group_persistence_ok",
+            "group_member_visibility_ok",
+            "group_message_idempotency_ok",
+            "workforce_topology_refresh_ok",
+            "credits_exactly_once_ok",
             "platform_admin_login_ok",
             "saas_ledger_reconciliation_ok",
             "saas_payment_reconciliation_ok",
@@ -2023,15 +2034,22 @@ if kind in {"smoke", "smoke-v2"}:
             "ui_subscription_summary_api_ok",
             "ui_subscription_balance_rendered_ok",
             "ui_subscription_page_ok",
+            "ui_work_task_visible_ok",
+            "ui_group_persistence_ok",
+            "ui_workforce_topology_ok",
+            "ui_direct_chat_round_trip_ok",
+            "ui_direct_chat_recovery_ok",
+            "ui_post_chat_credits_settled_ok",
+            "ui_no_console_error_ok",
             "ui_no_server_error_ok",
         }
         expected_api_base = f"http://127.0.0.1:{candidate_port}/api"
         expected_frontend_url = f"http://127.0.0.1:{candidate_port}"
-        if kind != "smoke-v2":
+        if kind != "smoke-v3":
             raise SystemExit(1)
         if (
-            payload.get("evidence_schema_version") != 2
-            or payload.get("evidence_kind") != "subscription_composite"
+            payload.get("evidence_schema_version") != 3
+            or payload.get("evidence_kind") != "release_business_composite"
             or payload.get("ok") is not True
             or payload.get("api_base") != expected_api_base
             or payload.get("frontend_url") != expected_frontend_url
@@ -2064,6 +2082,87 @@ if kind in {"smoke", "smoke-v2"}:
             "capability_status": "available",
             "reason_count": 0,
         }:
+            raise SystemExit(1)
+        if payload.get("billing_mode") != {
+            "provider": "manual",
+            "status": "manual",
+            "checkout_enabled": True,
+            "native_payment_enabled": False,
+            "webhook_ready": False,
+        }:
+            raise SystemExit(1)
+        business_flow = payload.get("business_flow")
+        api_flow = business_flow.get("api") if isinstance(business_flow, dict) else None
+        ui_flow = business_flow.get("ui") if isinstance(business_flow, dict) else None
+        if not isinstance(api_flow, dict) or not isinstance(ui_flow, dict):
+            raise SystemExit(1)
+        if api_flow.get("work") != {
+            "execution_status": "completed",
+            "output_marker_verified": True,
+            "create_replayed": True,
+            "result_review_status": "approved",
+            "review_replayed": True,
+        }:
+            raise SystemExit(1)
+        api_group = api_flow.get("group")
+        api_topology = api_flow.get("topology")
+        api_credits = api_flow.get("credits")
+        if (
+            not isinstance(api_group, dict)
+            or not isinstance(api_group.get("member_count"), int)
+            or isinstance(api_group.get("member_count"), bool)
+            or api_group["member_count"] < 2
+            or api_group.get("owner_message_persisted") is not True
+            or api_group.get("member_visibility") is not True
+            or api_group.get("message_replayed") is not True
+            or not isinstance(api_topology, dict)
+            or api_topology.get("assistant_visible") is not True
+            or api_topology.get("completed_work_visible") is not True
+            or not isinstance(api_topology.get("node_count"), int)
+            or isinstance(api_topology.get("node_count"), bool)
+            or api_topology["node_count"] < 1
+            or not isinstance(api_credits, dict)
+            or not isinstance(api_credits.get("consumed_delta"), int)
+            or isinstance(api_credits.get("consumed_delta"), bool)
+            or api_credits["consumed_delta"] <= 0
+            or not isinstance(api_credits.get("transaction_delta"), int)
+            or isinstance(api_credits.get("transaction_delta"), bool)
+            or api_credits["transaction_delta"] <= 0
+            or any(
+                api_credits.get(key) != 0
+                for key in (
+                    "reserved_before",
+                    "reserved_after",
+                    "replay_balance_delta",
+                    "replay_transaction_delta",
+                )
+            )
+        ):
+            raise SystemExit(1)
+        if (
+            ui_flow.get("work") != {"task_visible": True}
+            or ui_flow.get("group") != {"group_visible": True, "message_restored": True}
+            or ui_flow.get("topology") != {"completed_work_visible": True}
+            or ui_flow.get("credits")
+            != {
+                "settled_after_chat": True,
+                "reserved_after": 0,
+                "consumed_delta_positive": True,
+            }
+        ):
+            raise SystemExit(1)
+        direct_chat = ui_flow.get("direct_chat")
+        if (
+            not isinstance(direct_chat, dict)
+            or direct_chat.get("round_trip") is not True
+            or direct_chat.get("durable_after_reload") is not True
+            or not isinstance(direct_chat.get("message_count"), int)
+            or isinstance(direct_chat.get("message_count"), bool)
+            or direct_chat["message_count"] < 2
+            or not isinstance(direct_chat.get("assistant_count"), int)
+            or isinstance(direct_chat.get("assistant_count"), bool)
+            or direct_chat["assistant_count"] < 1
+        ):
             raise SystemExit(1)
         for key, checked_field in (
             ("saas_ledger_reconciliation", "checked_tenants"),
@@ -2114,7 +2213,7 @@ elif kind == "break-glass":
         raise SystemExit(1)
     if hashlib.sha256(approval.read_bytes()).hexdigest() != digest:
         raise SystemExit(1)
-    if evidence_mode == "v2":
+    if evidence_mode == "v3":
         fields = {}
         for line in approval.read_text(encoding="utf-8").splitlines():
             if line and not line.lstrip().startswith("#") and "=" in line:
@@ -2151,7 +2250,7 @@ regenerate_candidate_business_evidence() {
         echo "recovery smoke credential file is missing or unsafe" >&2
         return 1
     fi
-    if ! browser_smoke_requires_v2 "$target_release"; then
+    if ! browser_smoke_requires_v3 "$target_release"; then
         echo "legacy recovery evidence cannot be regenerated without its original verified artifact" >&2
         return 1
     fi
@@ -2180,7 +2279,7 @@ regenerate_candidate_business_evidence() {
         sha256sum "$target_backup/subscription-smoke.candidate.json" | awk '{print $1}'
     )" || return 1
     write_atomic_line "$target_backup/candidate-business-verification" \
-        "smoke-v2:${evidence_sha256}" || return 1
+        "smoke-v3:${evidence_sha256}" || return 1
     echo "authenticated recovery API/browser smoke passed"
     candidate_business_evidence_valid "$target_release_id" "$target_port"
 }
@@ -4969,7 +5068,7 @@ if [ "$RECOVERY_REQUIRED" = "1" ] && [ "$RUN_REMOTE_SMOKE" = "1" ]; then
         echo "cannot resolve the browser-gated recovery release" >&2
         exit 1
     }
-    if browser_smoke_requires_v2 "$RECOVERY_BROWSER_RELEASE" && \
+    if browser_smoke_requires_v3 "$RECOVERY_BROWSER_RELEASE" && \
         ! ensure_browser_smoke_image \
             "$RECOVERY_BROWSER_RELEASE" "$RECOVERY_TARGET_RELEASE_ID"; then
         echo "recovery release browser smoke image failed its launch preflight" >&2
@@ -5818,7 +5917,7 @@ if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
         sha256sum "$BACKUP/subscription-smoke.candidate.json" | awk '{print $1}'
     )"
     write_atomic_line "$BACKUP/candidate-business-verification" \
-        "smoke-v2:${CANDIDATE_SMOKE_SHA256}"
+        "smoke-v3:${CANDIDATE_SMOKE_SHA256}"
     echo "[remote] candidate API/browser smoke passed"
 else
     write_atomic_line "$BACKUP/candidate-business-verification" \
