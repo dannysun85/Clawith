@@ -2485,8 +2485,12 @@ regenerate_candidate_business_evidence() {
     )" || return 1
     write_atomic_line "$target_backup/candidate-business-verification" \
         "smoke-v3:${evidence_sha256}" || return 1
+    if ! candidate_business_evidence_valid "$target_release_id" "$target_port"; then
+        echo "authenticated recovery smoke produced invalid durable business evidence" >&2
+        return 1
+    fi
     echo "authenticated recovery API/browser smoke passed"
-    candidate_business_evidence_valid "$target_release_id" "$target_port"
+    return 0
 }
 
 recover_candidate_business_evidence_with_smoke_principals() {
@@ -2532,6 +2536,7 @@ recover_candidate_business_evidence_with_smoke_principals() {
     fi
     [ "$smoke_status" = "0" ] || return 1
     RECOVERY_SMOKE_LIFECYCLE_CONSUMED=1
+    return 0
 }
 
 write_atomic_symlink() {
@@ -5185,7 +5190,15 @@ prepare_browser_smoke_runtime_root || {
 
 mkdir -p "$RELEASE" "$BACKUP"
 tar -xzf "$PACKAGE" -C "$RELEASE"
+write_atomic_line "$RELEASE/VERSION" "$VERSION"
+write_atomic_line "$RELEASE/COMMIT" "$COMMIT"
 write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"
+
+# Recovery can intentionally consume this archive only as reviewed QA tooling
+# for an older immutable application candidate. Publish the archive identity
+# before recovery so schema-v3 evidence can bind the exact tooling commit and
+# package digest without making this a runnable release: canonical release
+# validation still requires the environment and compose files.
 
 # Build the digest-pinned browser gate before any recovery, service, Nginx,
 # database, or traffic mutation. A missing registry artifact or incompatible
@@ -5664,8 +5677,6 @@ if ! identity_integrity_preflight \
     abort_release "production identity integrity preflight failed before maintenance"
 fi
 
-printf '%s\n' "$VERSION" > "$RELEASE/VERSION"
-printf '%s\n' "$COMMIT" > "$RELEASE/COMMIT"
 printf '%s\n' "$RELEASE_BASE_COMMIT" > "$RELEASE/BASE_COMMIT"
 printf '%s\n' "$PREVIOUS" > "$RELEASE/PREVIOUS_RELEASE"
 

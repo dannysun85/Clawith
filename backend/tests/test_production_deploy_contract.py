@@ -1503,6 +1503,10 @@ candidate_business_evidence_valid {release_id} 3009
         }
     )
     assert verify().returncode == 0
+    (prior_qa_release / "COMMIT").unlink()
+    assert verify().returncode != 0
+    (prior_qa_release / "COMMIT").write_text(f"{commit}\n", encoding="utf-8")
+    assert verify().returncode == 0
     write_evidence(payload)
     invalid_payloads = [
         {**payload, "frontend_url": "http://127.0.0.1:3008"},
@@ -1640,6 +1644,49 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     recovery = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', current_preflight)
     maintenance = script.index('echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"')
     assert current_preflight < recovery < maintenance
+
+
+def test_recovery_qa_tooling_identity_is_published_before_recovery():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    extraction = script.index('tar -xzf "$PACKAGE" -C "$RELEASE"')
+    version_identity = script.index(
+        'write_atomic_line "$RELEASE/VERSION" "$VERSION"', extraction
+    )
+    commit_identity = script.index(
+        'write_atomic_line "$RELEASE/COMMIT" "$COMMIT"', extraction
+    )
+    package_identity = script.index(
+        'write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"', extraction
+    )
+    browser_preflight = script.index(
+        'ensure_browser_smoke_image "$RELEASE" "$RELEASE_ID"', package_identity
+    )
+    recovery = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', browser_preflight)
+
+    assert extraction < version_identity < browser_preflight
+    assert extraction < commit_identity < browser_preflight
+    assert extraction < package_identity < browser_preflight < recovery
+    assert 'printf \'%s\\n\' "$VERSION" > "$RELEASE/VERSION"' not in script
+    assert 'printf \'%s\\n\' "$COMMIT" > "$RELEASE/COMMIT"' not in script
+
+    regenerate = _shell_function_source(
+        script,
+        "regenerate_candidate_business_evidence",
+        "recover_candidate_business_evidence_with_smoke_principals",
+    )
+    validation = regenerate.index(
+        'candidate_business_evidence_valid "$target_release_id" "$target_port"'
+    )
+    success = regenerate.index('echo "authenticated recovery API/browser smoke passed"')
+    assert validation < success
+
+    recovery_lifecycle = _shell_function_source(
+        script,
+        "recover_candidate_business_evidence_with_smoke_principals",
+        "write_atomic_symlink",
+    )
+    assert "RECOVERY_SMOKE_LIFECYCLE_CONSUMED=1\n    return 0" in recovery_lifecycle
 
 
 def test_browser_smoke_runtime_cleans_stale_credentials_and_rejects_symlinks(tmp_path):
