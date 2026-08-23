@@ -1559,6 +1559,9 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
         encoding="utf-8"
     ).strip()
     browser_runner = (ROOT / "deploy/browser-smoke/subscription_browser_smoke.mjs").read_text(encoding="utf-8")
+    browser_selftest = (ROOT / "deploy/browser-smoke/browser_launch_selftest.mjs").read_text(
+        encoding="utf-8"
+    )
 
     assert "@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48" in dockerfile
     assert "USER pwuser" in dockerfile
@@ -1584,6 +1587,8 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert "credentials.SMOKE_TENANT_PASSWORD" in browser_runner
     assert "credentials.SMOKE_TENANT_ID" in browser_runner
     assert "frontendOrigin === 'http://candidate-frontend:3000'" in browser_runner
+    assert "channel: 'chromium'" in browser_runner
+    assert "channel: 'chromium'" in browser_selftest
     assert '--unsafely-treat-insecure-origin-as-secure=${frontendOrigin}' in browser_runner
     assert "secureContextParity.is_secure_context === true" in browser_runner
     assert "secureContextParity.random_uuid_available === true" in browser_runner

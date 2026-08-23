@@ -284,6 +284,7 @@ async function run() {
   // while production is HTTPS-only. Scope Chromium's secure-context parity to
   // that exact isolated origin so secure Web APIs behave as they do publicly.
   const browser = await chromium.launch({
+    channel: 'chromium',
     headless: true,
     args: [`--unsafely-treat-insecure-origin-as-secure=${frontendOrigin}`],
   });

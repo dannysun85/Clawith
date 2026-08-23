@@ -17,7 +17,7 @@ await waitForExactText(
 if (delayedReads !== 3) process.exit(1);
 
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ channel: 'chromium', headless: true });
 try {
   const page = await browser.newPage();
   await page.goto('data:text/html,<title>Astra browser gate</title>');
