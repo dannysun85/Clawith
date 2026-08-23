@@ -19,7 +19,10 @@
 - Recovery evidence records the application candidate and QA-tooling identities
   separately. A nonterminal cutover accepts only the reviewed release notes,
   deployment gate, smoke runners, and their regression tests as a tooling-only
-  delta; application or frontend changes fail closed.
+  delta; application or frontend changes fail closed. Recovery executes the
+  exact QA-tooling browser bundle against the immutable application candidate,
+  and the Work browser gate selects the product's “Recently completed” view
+  before asserting a completed task.
 - The workflow runs only in the dedicated synthetic Release QA tenant. Evidence
   contains counts, booleans, hashes, and release identity; it excludes account
   passwords, user/Agent IDs, message bodies, and provider secrets.

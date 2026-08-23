@@ -422,6 +422,7 @@ allowed = {
     "RELEASE_NOTES.md",
     "backend/tests/test_production_deploy_contract.py",
     "backend/tests/test_subscription_smoke_evidence.py",
+    "deploy/browser-smoke/subscription_browser_smoke.mjs",
     "scripts/deploy-astra-production.sh",
     "scripts/merge_subscription_smoke_evidence.py",
     "scripts/subscription_production_smoke.py",
@@ -1879,8 +1880,10 @@ run_candidate_business_smoke() {
     local target_commit="$5"
     local target_port="$6"
     local output="$7"
+    local qa_browser_release="${8:-$target_release}"
+    local qa_browser_release_id="${9:-$target_release_id}"
     local target_backup="$APP_ROOT/backups/$target_release_id"
-    local image="astra-browser-smoke:${target_release_id}"
+    local image="astra-browser-smoke:${qa_browser_release_id}"
     local frontend_id
     local frontend_health=""
     local api_evidence
@@ -1895,14 +1898,14 @@ run_candidate_business_smoke() {
     local canonical_frontend_url="http://127.0.0.1:${target_port}"
 
     [ "$RUN_REMOTE_SMOKE" = "1" ] || return 1
-    browser_smoke_requires_v3 "$target_release" || return 1
+    browser_smoke_requires_v3 "$qa_browser_release" || return 1
     [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || return 1
     for runner in \
         subscription_production_smoke.py merge_subscription_smoke_evidence.py; do
         [ -f "$RELEASE/scripts/$runner" ] && \
             [ ! -L "$RELEASE/scripts/$runner" ] || return 1
     done
-    runner_bundle_digest="$(browser_smoke_bundle_digest "$target_release")" || return 1
+    runner_bundle_digest="$(browser_smoke_bundle_digest "$qa_browser_release")" || return 1
     browser_image_id="$(docker image inspect --format '{{.Id}}' "$image")" || return 1
     case "$runner_bundle_digest" in sha256:*) ;; *) return 1 ;; esac
     case "$browser_image_id" in sha256:*) ;; *) return 1 ;; esac
@@ -1993,6 +1996,7 @@ PY_BROWSER_CREDENTIALS
     docker network create \
         --internal \
         --label "ai.reeftotem.astra.browser-smoke-release=$target_release_id" \
+        --label "ai.reeftotem.astra.browser-smoke-tooling-release=$qa_browser_release_id" \
         "$BROWSER_SMOKE_NETWORK" >/dev/null || {
         cleanup_browser_smoke_runtime
         return 1
@@ -2012,7 +2016,7 @@ PY_BROWSER_CREDENTIALS
         --read-only \
         --cap-drop ALL \
         --security-opt no-new-privileges:true \
-        --security-opt "seccomp=$target_release/deploy/browser-smoke/seccomp_profile.json" \
+        --security-opt "seccomp=$qa_browser_release/deploy/browser-smoke/seccomp_profile.json" \
         --pids-limit 256 \
         --ulimit nofile=1024:1024 \
         --memory 1g \
@@ -2069,11 +2073,13 @@ candidate_business_evidence_valid() {
     local qa_tooling_release_id="${RELEASE_ID:-none}"
     local qa_tooling_commit="${COMMIT:-none}"
     local qa_tooling_package_sha256="${PACKAGE_SHA256:-none}"
+    local qa_tooling_release="$APP_ROOT/releases/$qa_tooling_release_id"
 
     [ -d "$target_release" ] && [ ! -L "$target_release" ] || return 1
     if browser_smoke_requires_v3 "$target_release"; then
         evidence_mode="v3"
-        runner_bundle_sha256="$(browser_smoke_bundle_digest "$target_release")" || return 1
+        browser_smoke_requires_v3 "$qa_tooling_release" || return 1
+        runner_bundle_sha256="$(browser_smoke_bundle_digest "$qa_tooling_release")" || return 1
     fi
     python3 - \
         "$APP_ROOT" "$release_id" "$candidate_port" "$evidence_mode" \
@@ -2464,7 +2470,7 @@ regenerate_candidate_business_evidence() {
     if ! run_candidate_business_smoke \
         "$target_release" "$target_project" "$target_release_id" \
         "$target_version" "$target_commit" "$target_port" \
-        "$temporary_evidence"; then
+        "$temporary_evidence" "$RELEASE" "$RELEASE_ID"; then
         rm -f "$temporary_evidence"
         echo "authenticated API/browser recovery smoke failed" >&2
         return 1
@@ -5290,10 +5296,12 @@ if [ "$RECOVERY_REQUIRED" = "1" ] && [ "$RUN_REMOTE_SMOKE" = "1" ]; then
         echo "cannot resolve the browser-gated recovery release" >&2
         exit 1
     }
-    if browser_smoke_requires_v3 "$RECOVERY_BROWSER_RELEASE" && \
-        ! ensure_browser_smoke_image \
-            "$RECOVERY_BROWSER_RELEASE" "$RECOVERY_TARGET_RELEASE_ID"; then
-        echo "recovery release browser smoke image failed its launch preflight" >&2
+    if ! browser_smoke_requires_v3 "$RECOVERY_BROWSER_RELEASE"; then
+        echo "recovery release does not support schema-v3 browser evidence" >&2
+        exit 1
+    fi
+    if ! browser_smoke_requires_v3 "$RELEASE" || [ "$BROWSER_SMOKE_READY" != "1" ]; then
+        echo "recovery QA-tooling browser smoke image failed its launch preflight" >&2
         exit 1
     fi
 fi
@@ -6123,7 +6131,8 @@ if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
     )" || abort_release "cannot allocate candidate smoke evidence"
     if ! run_candidate_business_smoke \
         "$RELEASE" "$CANDIDATE_PROJECT" "$RELEASE_ID" \
-        "$VERSION" "$COMMIT" "$CANDIDATE_PORT" "$CANDIDATE_SMOKE_TEMP"; then
+        "$VERSION" "$COMMIT" "$CANDIDATE_PORT" "$CANDIDATE_SMOKE_TEMP" \
+        "$RELEASE" "$RELEASE_ID"; then
         rm -f "$CANDIDATE_SMOKE_TEMP"
         abort_release "authenticated candidate API/browser smoke failed"
     fi
@@ -6291,6 +6300,7 @@ allowed = {
     "RELEASE_NOTES.md",
     "backend/tests/test_production_deploy_contract.py",
     "backend/tests/test_subscription_smoke_evidence.py",
+    "deploy/browser-smoke/subscription_browser_smoke.mjs",
     "scripts/deploy-astra-production.sh",
     "scripts/merge_subscription_smoke_evidence.py",
     "scripts/subscription_production_smoke.py",

@@ -1014,6 +1014,7 @@ def test_recovered_release_result_is_identity_bound_and_checks_runtime_equivalen
     assert '"scripts/subscription_production_smoke.py"' in script
     assert '"scripts/merge_subscription_smoke_evidence.py"' in script
     assert '"backend/tests/test_subscription_smoke_evidence.py"' in script
+    assert '"deploy/browser-smoke/subscription_browser_smoke.mjs"' in script
 
 
 @pytest.mark.parametrize(
@@ -1060,6 +1061,7 @@ def test_recovered_release_result_parser_accepts_identity_bound_payload():
         (
             "RELEASE_NOTES.md\n"
             "scripts/deploy-astra-production.sh\n"
+            "deploy/browser-smoke/subscription_browser_smoke.mjs\n"
             "scripts/subscription_production_smoke.py\n"
             "scripts/merge_subscription_smoke_evidence.py\n"
             "backend/tests/test_subscription_smoke_evidence.py",
@@ -1087,6 +1089,7 @@ def test_recovered_candidate_diff_guard_is_fail_closed(changed_files, expected_s
         (
             "RELEASE_NOTES.md\n"
             "scripts/deploy-astra-production.sh\n"
+            "deploy/browser-smoke/subscription_browser_smoke.mjs\n"
             "scripts/subscription_production_smoke.py\n"
             "scripts/merge_subscription_smoke_evidence.py\n"
             "backend/tests/test_production_deploy_contract.py\n"
@@ -1600,10 +1603,16 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
         'recovery candidate changed after the local QA tooling diff gate'
     )
     recovery_browser = script.index(
-        'ensure_browser_smoke_image \\\n'
-        '            "$RECOVERY_BROWSER_RELEASE" "$RECOVERY_TARGET_RELEASE_ID"'
+        'recovery QA-tooling browser smoke image failed its launch preflight'
     )
     assert recovery_guard < recovery_browser
+    completed_tab = browser_runner.index("name: /最近完成|Recently completed/i")
+    completed_task = browser_runner.index("getByText(taskTitle, { exact: true })")
+    assert completed_tab < completed_task
+    assert 'local qa_browser_release="${8:-$target_release}"' in script
+    assert 'local image="astra-browser-smoke:${qa_browser_release_id}"' in script
+    assert 'browser_smoke_bundle_digest "$qa_browser_release"' in script
+    assert 'browser_smoke_bundle_digest "$qa_tooling_release"' in script
     assert "await Promise.all" in browser_runner
     assert '"body": body' not in api_runner
     assert "body[:200]" not in api_runner

@@ -377,7 +377,12 @@ async function run() {
     const groupMarker = `${evidencePrefix}-GROUP-MESSAGE`;
 
     await page.goto(`${frontendUrl}/work`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.getByText(workMarker, { exact: false }).first().waitFor({
+    const completedWorkTab = page.getByRole('tab', {
+      name: /最近完成|Recently completed/i,
+    });
+    await completedWorkTab.waitFor({ state: 'visible', timeout: 30_000 });
+    await completedWorkTab.click();
+    await page.getByText(taskTitle, { exact: true }).first().waitFor({
       state: 'visible',
       timeout: 30_000,
     });
