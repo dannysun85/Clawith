@@ -40,6 +40,16 @@ def estimate_token_usage_from_chars(total_chars: int) -> TokenUsage:
     return TokenUsage(total_tokens=tokens, estimated_tokens=tokens)
 
 
+_KNOWN_CACHE_USAGE_KEYS = frozenset({
+    "cached_tokens",
+    "cache_read_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_tokens",
+    "cache_creation_input_tokens",
+    "cachedContentTokenCount",
+})
+
+
 def _int_token(value) -> int:
     try:
         return int(value or 0)
@@ -47,14 +57,61 @@ def _int_token(value) -> int:
         return 0
 
 
-def _token_counter(source: dict, *keys: str) -> int:
-    return sum(_int_token(source.get(key)) for key in keys)
+def _parse_token_count(value) -> int | None:
+    """Parse a token counter without treating booleans as 1/0."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _cache_token_counter(source: dict, *keys: str) -> int:
+    total = 0
+    for key in keys:
+        if key not in source:
+            continue
+        parsed = _parse_token_count(source.get(key))
+        if parsed is None:
+            logger.warning(
+                "[Token Cache] Unparseable usage field {} type={}",
+                key,
+                type(source.get(key)).__name__,
+            )
+            continue
+        total += parsed
+    return total
+
+
+def _warn_unmapped_cache_usage_fields(usage: dict, *, path: str = "usage") -> None:
+    """Fail closed on unknown cache counters by recording them instead of dropping them."""
+    for key, value in usage.items():
+        if not isinstance(key, str):
+            continue
+        next_path = f"{path}.{key}"
+        if isinstance(value, dict):
+            _warn_unmapped_cache_usage_fields(value, path=next_path)
+            continue
+        lowered = key.lower()
+        if "cache" not in lowered:
+            continue
+        if key in _KNOWN_CACHE_USAGE_KEYS:
+            continue
+        # Provider-controlled field names may contain customer data. Record the
+        # contract violation without echoing the raw key/path into operations logs.
+        logger.warning("[Token Cache] Unmapped cache usage field detected")
 
 
 def extract_token_usage(usage: dict | None) -> TokenUsage | None:
     """Extract normalized token usage, including prompt-cache counters when available."""
     if not usage:
         return None
+
+    _warn_unmapped_cache_usage_fields(usage)
 
     # OpenAI compatible:
     # {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N,
@@ -68,25 +125,25 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             )
             if isinstance(details, dict)
         ]
-        cache_read_tokens = _token_counter(
+        cache_read_tokens = _cache_token_counter(
             usage,
             "cached_tokens",
             "cache_read_tokens",
             "cache_read_input_tokens",
         )
-        cache_creation = _token_counter(
+        cache_creation = _cache_token_counter(
             usage,
             "cache_creation_tokens",
             "cache_creation_input_tokens",
         )
         for details in detail_sources:
-            cache_read_tokens += _token_counter(
+            cache_read_tokens += _cache_token_counter(
                 details,
                 "cached_tokens",
                 "cache_read_tokens",
                 "cache_read_input_tokens",
             )
-            cache_creation += _token_counter(
+            cache_creation += _cache_token_counter(
                 details,
                 "cache_creation_tokens",
                 "cache_creation_input_tokens",
@@ -111,12 +168,12 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
     # {"input_tokens": N, "output_tokens": N,
     #  "cache_creation_input_tokens": N, "cache_read_input_tokens": N}
     if "input_tokens" in usage or "output_tokens" in usage:
-        cache_creation = _token_counter(usage, "cache_creation_input_tokens", "cache_creation_tokens")
-        cache_read = _token_counter(usage, "cache_read_input_tokens", "cache_read_tokens", "cached_tokens")
+        cache_creation = _cache_token_counter(usage, "cache_creation_input_tokens", "cache_creation_tokens")
+        cache_read = _cache_token_counter(usage, "cache_read_input_tokens", "cache_read_tokens", "cached_tokens")
         details = usage.get("prompt_tokens_details")
         if isinstance(details, dict):
-            cache_creation += _token_counter(details, "cache_creation_input_tokens", "cache_creation_tokens")
-            cache_read += _token_counter(details, "cached_tokens", "cache_read_input_tokens", "cache_read_tokens")
+            cache_creation += _cache_token_counter(details, "cache_creation_input_tokens", "cache_creation_tokens")
+            cache_read += _cache_token_counter(details, "cached_tokens", "cache_read_input_tokens", "cache_read_tokens")
         if cache_creation or cache_read:
             logger.info(f"[Token Cache] Anthropic Native Hit -> Created: {cache_creation}, Read: {cache_read} tokens")
         input_tokens = _int_token(usage.get("input_tokens", 0))

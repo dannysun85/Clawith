@@ -1,6 +1,7 @@
 """Tests for MiniMax-specific error classification and credential failover."""
 
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -147,6 +148,7 @@ def test_minimax_payload_uses_only_documented_chat_parameters():
     assert "max_tokens" not in payload
     assert "parallel_tool_calls" not in payload
     assert "thinking" not in payload
+    assert "cache_control" not in json.dumps(payload)
     assert [message["role"] for message in payload["messages"]] == ["system", "user"]
 
 

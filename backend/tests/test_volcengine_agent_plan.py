@@ -198,6 +198,7 @@ def test_agent_plan_text_and_tts_contracts_use_official_gateways():
         base_url=DEFAULT_BASE_URL,
     )
     assert isinstance(client, AnthropicClient)
+    assert client.supports_prefix_cache is True
     assert client.base_url == DEFAULT_TEXT_BASE_URL
     assert get_provider_base_url("volcengine_agent_plan", DEFAULT_BASE_URL) == DEFAULT_TEXT_BASE_URL
 

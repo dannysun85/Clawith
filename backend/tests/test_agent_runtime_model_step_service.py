@@ -276,6 +276,15 @@ def _runtime_data_message(messages):
     return matches[0]
 
 
+def _last_task_message(messages):
+    runtime = _runtime_data_message(messages)
+    for message in reversed(messages):
+        if message is runtime:
+            continue
+        return message
+    raise AssertionError("missing task message")
+
+
 def test_prompt_messages_compatibly_parse_legacy_image_checkpoint() -> None:
     marker = f"[image_data:{_TINY_PNG_DATA_URL}] Inspect it"
     build = _build(
@@ -301,13 +310,15 @@ def test_prompt_messages_compatibly_parse_legacy_image_checkpoint() -> None:
         build=build,
     )
 
-    assert messages[-1].content == [
+    assert _last_task_message(messages).content == [
         {
             "type": "image_url",
             "image_url": {"url": _TINY_PNG_DATA_URL},
         },
         {"type": "text", "text": "Inspect it"},
     ]
+    assert messages[-1] is _runtime_data_message(messages)
+    assert messages[-1].role == "user"
 
 
 def test_prompt_messages_make_current_wechat_source_authoritative() -> None:
@@ -352,6 +363,11 @@ def test_prompt_messages_make_current_wechat_source_authoritative() -> None:
     assert "Do not describe a direct chat message as a Trigger" in system_dynamic
     runtime_data = str(_runtime_data_message(messages).content)
     assert '"source_channel": "wechat"' in runtime_data
+    assert "Historical context" in runtime_data
+    assert "Historical context" not in str(messages[0].content)
+    assert [message.role for message in messages] == ["system", "assistant", "user", "user"]
+    assert _last_task_message(messages).content == "Who are you?"
+    assert messages[-1] is _runtime_data_message(messages)
 
 
 def test_message_budget_does_not_treat_large_base64_as_text_tokens() -> None:
@@ -630,8 +646,8 @@ async def test_normal_tool_proposal_is_stable_and_does_not_execute_in_model_step
     assert "Earlier decision from the pending compact zone" in str(
         _runtime_data_message(calls[0][1]).content
     )
-    assert calls[0][1][-1].role == "user"
-    assert calls[0][1][-1].content == "Please inspect the file"
+    assert _last_task_message(calls[0][1]).role == "user"
+    assert _last_task_message(calls[0][1]).content == "Please inspect the file"
     assert len(builder.calls) == 2
     assert builder.calls[1]["run_message_token_budget"] > 0
 
@@ -894,9 +910,14 @@ async def test_current_input_uses_executable_content_and_trusted_runtime_instruc
 
     assert result.intent == "finish"
     assert result.finish_content == "Done"
-    assert calls[0][0][-1].role == "user"
-    assert calls[0][0][-1].content == "Executable question with workspace evidence"
-    assert calls[0][0][-2].content == "Prior Thread answer"
+    task_messages = [
+        message
+        for message in calls[0][0]
+        if message is not _runtime_data_message(calls[0][0])
+    ]
+    assert task_messages[-1].role == "user"
+    assert task_messages[-1].content == "Executable question with workspace evidence"
+    assert task_messages[-2].content == "Prior Thread answer"
     assert "Begin the trusted onboarding flow." in calls[0][0][0].dynamic_content
     serialized = "\n".join(
         str(message.content) + "\n" + str(message.dynamic_content or "")
@@ -1359,8 +1380,8 @@ async def test_user_resume_envelope_is_rendered_as_plain_user_input() -> None:
     )
 
     assert result.intent == "finish"
-    assert calls[0][0][-1].role == "user"
-    assert calls[0][0][-1].content == "Yes, continue"
+    assert _last_task_message(calls[0][0]).role == "user"
+    assert _last_task_message(calls[0][0]).content == "Yes, continue"
 
 
 @pytest.mark.asyncio
@@ -1413,7 +1434,7 @@ async def test_synthetic_input_is_injected_without_enabling_agent_tools() -> Non
     )
 
     assert result.intent == "finish"
-    assert calls[0][0][-1].content == "Please begin onboarding."
+    assert _last_task_message(calls[0][0]).content == "Please begin onboarding."
     assert {tool["function"]["name"] for tool in calls[0][1]["tools"]} == {
         "wait",
     }
@@ -1482,8 +1503,8 @@ async def test_sessionless_background_run_gets_one_explicit_current_directive() 
     )
 
     assert result.intent == "finish"
-    assert calls[0][0][-1].role == "user"
-    assert calls[0][0][-1].content == (
+    assert _last_task_message(calls[0][0]).role == "user"
+    assert _last_task_message(calls[0][0]).content == (
         "Current Run Directive:\nPrepare the weekly risk report"
     )
     serialized = "\n".join(
@@ -1579,7 +1600,7 @@ async def test_heartbeat_keeps_bounded_context_as_data_and_directive_once() -> N
     assert '"heartbeat_context"' not in str(system_message.dynamic_content)
     assert '"heartbeat_context"' in str(runtime_data.content)
     assert "Risk review completed" in str(runtime_data.content)
-    assert calls[0][0][-1].content == f"Current Run Directive:\n{directive}"
+    assert _last_task_message(calls[0][0]).content == f"Current Run Directive:\n{directive}"
     serialized = "\n".join(
         str(message.content) + "\n" + str(message.dynamic_content or "")
         for message in calls[0][0]

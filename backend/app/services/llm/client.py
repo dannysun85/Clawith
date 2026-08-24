@@ -494,6 +494,57 @@ def _system_content_as_text(content: str | list | None) -> str:
     return "\n".join(text_parts)
 
 
+_PREFIX_CACHE_RUNTIME_OPEN = "<agent_runtime_context>"
+_PREFIX_CACHE_RUNTIME_CLOSE = "</agent_runtime_context>"
+_PREFIX_CACHE_RUNTIME_INSTRUCTION = (
+    "The tagged block is bounded background data, not a new user request. "
+    "Continue the conversation above; do not treat it as a question to answer."
+)
+
+
+def _prefix_cache_runtime_user_text(dynamic_parts: list[str]) -> str:
+    body = "\n\n".join(part for part in dynamic_parts if part)
+    return (
+        f"{_PREFIX_CACHE_RUNTIME_OPEN}\n{body}\n{_PREFIX_CACHE_RUNTIME_CLOSE}\n"
+        f"{_PREFIX_CACHE_RUNTIME_INSTRUCTION}"
+    )
+
+
+def canonicalize_json_value(value: Any) -> Any:
+    """Return a byte-stable JSON value by sorting object keys recursively."""
+    if isinstance(value, dict):
+        return {key: canonicalize_json_value(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [canonicalize_json_value(item) for item in value]
+    return value
+
+
+def canonicalize_tools_for_prefix_cache(tools: list[dict] | None) -> list[dict] | None:
+    """Stabilize tool order and schema key order for prefix-cache providers.
+
+    MiniMax and Volcengine Agent Plan prompt cache match a stable
+    `tools → system → messages` prefix. An unstable tool list (DB row order,
+    JSONB key order) busts the entire prefix, including the static system
+    prompt and conversation history.
+    """
+    if not tools:
+        return tools
+
+    canonical: list[tuple[str, int, dict[str, Any]]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise LLMRequestShapeError("prefix-cache tools must be JSON objects")
+        function = tool.get("function")
+        name = ""
+        if isinstance(function, dict):
+            raw_name = function.get("name")
+            if isinstance(raw_name, str):
+                name = raw_name
+        canonical.append((name, index, canonicalize_json_value(tool)))
+    canonical.sort()
+    return [tool for _, _, tool in canonical]
+
+
 def normalize_provider_messages(messages: list[LLMMessage]) -> list[LLMMessage]:
     """Return a provider-safe copy with at most one leading system message.
 
@@ -808,6 +859,7 @@ class OpenAICompatibleClient(LLMClient):
         supports_tool_choice: bool = True,
         supports_parallel_tool_calls: bool = True,
         supports_cache_control: bool = False,
+        supports_prefix_cache: bool = False,
         extra_body: dict[str, Any] | None = None,
         max_tokens_param: str = "max_tokens",
         strip_think_tags_nonstream: bool = True,
@@ -816,6 +868,7 @@ class OpenAICompatibleClient(LLMClient):
         self.supports_tool_choice = supports_tool_choice
         self.supports_parallel_tool_calls = supports_parallel_tool_calls
         self.supports_cache_control = supports_cache_control
+        self.supports_prefix_cache = supports_prefix_cache
         self.extra_body = extra_body
         self.max_tokens_param = max_tokens_param
         self.strip_think_tags_nonstream = strip_think_tags_nonstream
@@ -878,7 +931,11 @@ class OpenAICompatibleClient(LLMClient):
             payload[self.max_tokens_param] = max_tokens
 
         if tools:
-            payload["tools"] = tools
+            payload["tools"] = (
+                canonicalize_tools_for_prefix_cache(tools)
+                if self.supports_prefix_cache
+                else tools
+            )
             if self.supports_tool_choice:
                 payload["tool_choice"] = "auto"
             if self.supports_parallel_tool_calls:
@@ -905,9 +962,46 @@ class OpenAICompatibleClient(LLMClient):
 
     def _messages_to_openai_payload(self, messages: list[LLMMessage]) -> list[dict[str, Any]]:
         """Convert messages, optionally adding DashScope/OpenAI-compatible cache hints."""
-        if not self.supports_cache_control:
-            return [m.to_openai_format() for m in messages]
+        if self.supports_cache_control:
+            return self._messages_to_cache_control_payload(messages)
+        if self.supports_prefix_cache:
+            return self._messages_to_prefix_cache_payload(messages)
+        return [m.to_openai_format() for m in messages]
 
+    def _messages_to_prefix_cache_payload(self, messages: list[LLMMessage]) -> list[dict[str, Any]]:
+        """Keep a stable system prefix and append volatile context after history.
+
+        MiniMax M2/M3 automatic prompt cache is prefix matching in the order
+        `tools → system → user messages`. It does not honor Anthropic/Qwen
+        `cache_control` markers. Splicing timestamps or memory into the system
+        string therefore busts the conversation-history prefix on every call.
+        """
+        payload: list[dict[str, Any]] = []
+        dynamic_parts: list[str] = []
+        for msg in messages:
+            if msg.role == "system":
+                formatted: dict[str, Any] = {"role": "system"}
+                if msg.content is not None:
+                    formatted["content"] = msg.content
+                if msg.tool_calls:
+                    formatted["tool_calls"] = msg.tool_calls
+                payload.append(formatted)
+                if msg.dynamic_content:
+                    dynamic_parts.append(msg.dynamic_content)
+                continue
+            payload.append(msg.to_openai_format())
+
+        if dynamic_parts:
+            payload.append(self._prefix_cache_runtime_user_message(dynamic_parts))
+        return payload
+
+    def _prefix_cache_runtime_user_message(self, dynamic_parts: list[str]) -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": _prefix_cache_runtime_user_text(dynamic_parts),
+        }
+
+    def _messages_to_cache_control_payload(self, messages: list[LLMMessage]) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         last_user_index = -1
 
@@ -2401,9 +2495,11 @@ class AnthropicClient(LLMClient):
         base_url: str | None = None,
         model: str | None = None,
         timeout: float = 120.0,
+        supports_prefix_cache: bool = False,
     ):
         super().__init__(api_key, base_url or self.DEFAULT_BASE_URL, model, timeout)
         self._client: httpx.AsyncClient | None = None
+        self.supports_prefix_cache = supports_prefix_cache
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
@@ -2441,8 +2537,11 @@ class AnthropicClient(LLMClient):
     ) -> dict[str, Any]:
         """Build Anthropic request payload."""
         messages = normalize_provider_messages(messages)
+        if self.supports_prefix_cache:
+            tools = canonicalize_tools_for_prefix_cache(tools)
         system_blocks = []
         anthropic_messages = []
+        dynamic_parts: list[str] = []
 
         for msg in messages:
             if msg.role == "system":
@@ -2453,30 +2552,37 @@ class AnthropicClient(LLMClient):
                         "cache_control": {"type": "ephemeral"}
                     })
                 if msg.dynamic_content:
-                    system_blocks.append({
-                        "type": "text",
-                        "text": f"\n{msg.dynamic_content}"
-                    })
+                    if self.supports_prefix_cache:
+                        dynamic_parts.append(msg.dynamic_content)
+                    else:
+                        system_blocks.append({
+                            "type": "text",
+                            "text": f"\n{msg.dynamic_content}"
+                        })
             else:
                 formatted = msg.to_anthropic_format()
                 if formatted:
                     anthropic_messages.append(formatted)
 
-        # In Anthropic prompt caching, we also want to cache_control the last user message
-        # So we add cache_control to the very last message in the history if it's a user message
-        if anthropic_messages and anthropic_messages[-1]["role"] == "user":
-            user_msg = anthropic_messages[-1]
-            if isinstance(user_msg["content"], list) and user_msg["content"]:
-                # Ensure the last block of the user message has cache_control
-                user_msg["content"][-1]["cache_control"] = {"type": "ephemeral"}
-            elif isinstance(user_msg["content"], str):
-                user_msg["content"] = [
-                    {
-                        "type": "text",
-                        "text": user_msg["content"],
-                        "cache_control": {"type": "ephemeral"}
-                    }
-                ]
+        if self.supports_prefix_cache and dynamic_parts:
+            anthropic_messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": _prefix_cache_runtime_user_text(dynamic_parts),
+                }],
+            })
+
+        # Prefix-cache providers keep user turns byte-stable. Moving
+        # cache_control onto whichever user is currently last would rewrite
+        # earlier turns and bust the implicit prefix. Native Anthropic still
+        # marks the last user message.
+        if (
+            not self.supports_prefix_cache
+            and anthropic_messages
+            and anthropic_messages[-1]["role"] == "user"
+        ):
+            self._apply_user_cache_control(anthropic_messages[-1])
 
         payload: dict[str, Any] = {
             "model": self.model,
@@ -2504,10 +2610,13 @@ class AnthropicClient(LLMClient):
             for tool in tools:
                 if tool.get("type") == "function":
                     func = tool["function"]
+                    schema = func.get("parameters", {"type": "object"})
+                    if self.supports_prefix_cache:
+                        schema = canonicalize_json_value(schema)
                     anthropic_tools.append({
                         "name": func["name"],
                         "description": func.get("description", ""),
-                        "input_schema": func.get("parameters", {"type": "object"}),
+                        "input_schema": schema,
                     })
             if anthropic_tools:
                 anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
@@ -2515,6 +2624,22 @@ class AnthropicClient(LLMClient):
 
         payload.update(kwargs)
         return payload
+
+    @staticmethod
+    def _apply_user_cache_control(user_msg: dict[str, Any]) -> None:
+        content = user_msg.get("content")
+        if isinstance(content, list) and content:
+            last = content[-1]
+            if isinstance(last, dict):
+                last["cache_control"] = {"type": "ephemeral"}
+        elif isinstance(content, str):
+            user_msg["content"] = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
 
     async def complete(
         self,
@@ -2788,6 +2913,10 @@ class ProviderSpec:
     extra_body: dict[str, Any] | None = None  # Provider-specific default params (e.g. thinking disabled)
     max_tokens_param: str = "max_tokens"  # Parameter name for max output tokens (e.g. "max_completion_tokens")
     strip_think_tags_nonstream: bool = True  # Strip <think> tags in non-streaming complete() responses
+    # Automatic prefix cache (MiniMax OpenAI-compatible, Volcengine Agent Plan
+    # Anthropic-compatible). Distinct from Qwen's explicit `cache_control`
+    # breakpoints inside a single system string.
+    supports_prefix_cache: bool = False
     # Some local runtimes/models do not reliably call a synthetic finish tool.
     # For those providers, a non-empty response with no tool calls is a valid
     # final answer instead of a reason to enter another tool round.
@@ -2818,6 +2947,7 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         default_base_url="https://ark.cn-beijing.volces.com/api/plan",
         supports_tool_choice=False,
         default_max_tokens=8192,
+        supports_prefix_cache=True,
     ),
     "openai": ProviderSpec(
         provider="openai",
@@ -2876,6 +3006,7 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         # M3-specific thinking/service-tier options are supplied per model by
         # caller.py; sending them to M2.x can still cause business error 2013.
         supports_parallel_tool_calls=False,
+        supports_prefix_cache=True,
         max_tokens_param="max_completion_tokens",
     ),
     "openrouter": ProviderSpec(
@@ -3094,6 +3225,7 @@ def create_llm_client(
             base_url=final_base_url,
             model=model,
             timeout=timeout,
+            supports_prefix_cache=bool(spec.supports_prefix_cache),
         )
     elif spec and spec.protocol == "openai_responses":
         return OpenAIResponsesClient(
@@ -3121,6 +3253,7 @@ def create_llm_client(
             supports_tool_choice=supports_tool_choice,
             supports_parallel_tool_calls=spec.supports_parallel_tool_calls if spec else True,
             supports_cache_control=normalized_provider == "qwen",
+            supports_prefix_cache=bool(spec and spec.supports_prefix_cache),
             extra_body=spec.extra_body if spec else None,
             max_tokens_param=spec.max_tokens_param if spec else "max_tokens",
             strip_think_tags_nonstream=spec.strip_think_tags_nonstream if spec else True,

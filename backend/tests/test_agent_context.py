@@ -214,6 +214,8 @@ async def test_base_prompt_starts_with_name_and_soul_and_never_injects_self_role
     assert "# Memory" in static
     assert "The release owner is Alice." not in static
     assert "The release owner is Alice." in dynamic
+    assert "## Current Time" in dynamic
+    assert "## Current Time" not in static
     assert "## Role" not in static
     assert "call `finish`" not in static
     assert "return the exact final answer as normal Assistant content" in static
